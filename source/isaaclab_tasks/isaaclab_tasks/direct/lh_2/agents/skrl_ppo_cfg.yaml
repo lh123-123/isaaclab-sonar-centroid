@@ -1,0 +1,84 @@
+# Isaac-Lh-2-Direct-v0 — SKRL PPO agent defaults
+#
+# Observation: flattened sonar (H×W) + tail [vx, vy, last_action] → high-dimensional vector.
+# Important:
+#   - This file uses a plain MLP on the full vector. For best sample efficiency on sonar,
+#     prefer RSL-RL + Lh2SonarCnnActorCritic (see rsl_rl_ppo_cfg.py / train_lh_2.sh).
+#   - After changing oceansim_sonar_cfg.height/width or policy_obs_mode, verify
+#     Lh2EnvCfg.observation_space matches agents/policy_dims.lh2_expected_policy_obs_dim().
+#
+# CLI: max_iterations overrides trainer.timesteps as timesteps = max_iterations * agent.rollouts
+#   (see scripts/reinforcement_learning/skrl/train.py).
+
+seed: 42
+
+models:
+  separate: false
+  policy:
+    class: GaussianMixin
+    clip_actions: false
+    clip_log_std: true
+    min_log_std: -20.0
+    max_log_std: 2.0
+    initial_log_std: 0.0
+    network:
+      - name: net
+        input: STATES
+        # Wider MLP for ~4k-dim observations; reduce if VRAM-limited.
+        layers: [512, 256, 128]
+        activations: elu
+    output: ACTIONS
+  value:
+    class: DeterministicMixin
+    clip_actions: false
+    network:
+      - name: net
+        input: STATES
+        layers: [512, 256, 128]
+        activations: elu
+    output: ONE
+
+memory:
+  class: RandomMemory
+  memory_size: -1
+
+agent:
+  class: PPO
+  # Match RSL-RL num_steps_per_env order-of-magnitude; increase with more GPU memory.
+  rollouts: 64
+  learning_epochs: 8
+  mini_batches: 4
+  discount_factor: 0.99
+  lambda: 0.95
+  learning_rate: 5.0e-5
+  learning_rate_scheduler: KLAdaptiveLR
+  learning_rate_scheduler_kwargs:
+    kl_threshold: 0.004
+  state_preprocessor: RunningStandardScaler
+  state_preprocessor_kwargs: null
+  value_preprocessor: RunningStandardScaler
+  value_preprocessor_kwargs: null
+  random_timesteps: 0
+  learning_starts: 0
+  grad_norm_clip: 0.5
+  ratio_clip: 0.2
+  value_clip: 0.2
+  clip_predicted_values: true
+  # Mild entropy to avoid premature collapse (RSL-RL uses entropy_coef ~0.006).
+  entropy_loss_scale: 0.006
+  value_loss_scale: 0.5
+  kl_threshold: 0.0
+  # Keep 1.0 so env reward scales match RSL-RL / TensorBoard.
+  rewards_shaper_scale: 1.0
+  time_limit_bootstrap: false
+  experiment:
+    directory: "lh2_sonar_direct"
+    experiment_name: ""
+    write_interval: auto
+    checkpoint_interval: auto
+
+trainer:
+  class: SequentialTrainer
+  # Overridden when passing --max_iterations to skrl/train.py
+  timesteps: 128000
+  environment_info: log

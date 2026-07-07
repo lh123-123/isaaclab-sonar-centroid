@@ -1,0 +1,23 @@
+---
+description: Only one Isaac Lab / Isaac Sim process in terminal at a time
+alwaysApply: true
+---
+
+# 单进程终端约定（Isaac Lab）
+
+## 约定
+
+- **同一时刻只允许一个** Isaac Lab / Isaac Sim 相关进程（训练、eval、debug、play）。
+- 不要并行启动多个 `isaaclab.sh -p ...`、多个 eval/debug 脚本，或 GUI + headless 各开一个。
+- 原因：GPU 显存、Omniverse kit 文件锁（`Disabling key-value database because another kit process is locking it`）、进程被 OOM kill。
+
+## Agent 行为
+
+1. 启动新任务前，用 `pgrep` 或 `./scripts/kill_isaac_lab_processes.sh` 确认无残留。
+2. **Never** 在后台再启第二个 Isaac Sim，除非用户明确要求且已 kill 旧进程。
+3. 用户说「先 kill」→ 运行 `./scripts/kill_isaac_lab_processes.sh`，确认干净后再启一个。
+
+## 脚本
+
+- 启动 guard：`scripts/lib/ensure_single_isaac_process.sh`（已被 sonar debug/eval 脚本 source）
+- 清理：`./scripts/kill_isaac_lab_processes.sh`

@@ -1,0 +1,69 @@
+seed: 42
+
+# I/O: Box(4) [u_norm, v_norm, valid, prev_vy_norm] → MLP 64-64 → Gaussian(1)
+# Action: Box(-1,1) → vy ∈ [-0.525, +0.525] m/s (robot max > ball peak 0.42 m/s)
+models:
+  separate: False
+  policy:
+    class: GaussianMixin
+    clip_actions: True
+    clip_log_std: True
+    min_log_std: -20.0
+    max_log_std: 2.0
+    initial_log_std: -1.0
+    network:
+      - name: net
+        input: STATES
+        layers: [64, 64]
+        activations: elu
+    output: ACTIONS
+  value:
+    class: DeterministicMixin
+    clip_actions: False
+    network:
+      - name: net
+        input: STATES
+        layers: [64, 64]
+        activations: elu
+    output: ONE
+
+memory:
+  class: RandomMemory
+  memory_size: -1
+
+agent:
+  class: PPO
+  rollouts: 64
+  learning_epochs: 8
+  mini_batches: 8
+  discount_factor: 0.95
+  lambda: 0.95
+  learning_rate: 3.0e-4
+  learning_rate_scheduler: KLAdaptiveLR
+  learning_rate_scheduler_kwargs:
+    kl_threshold: 0.008
+  state_preprocessor: RunningStandardScaler
+  state_preprocessor_kwargs: null
+  value_preprocessor: RunningStandardScaler
+  value_preprocessor_kwargs: null
+  random_timesteps: 0
+  learning_starts: 0
+  grad_norm_clip: 1.0
+  ratio_clip: 0.2
+  value_clip: 0.2
+  clip_predicted_values: True
+  entropy_loss_scale: 0.01
+  value_loss_scale: 2.0
+  kl_threshold: 0.0
+  rewards_shaper_scale: 0.1
+  time_limit_bootstrap: False
+  experiment:
+    directory: "sonar_centroid_track"
+    experiment_name: "continuous_ppo_sine_image"
+    write_interval: auto
+    checkpoint_interval: auto
+
+trainer:
+  class: SequentialTrainer
+  timesteps: 256000
+  environment_info: log
