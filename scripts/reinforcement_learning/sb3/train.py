@@ -26,6 +26,13 @@ parser.add_argument("--task", type=str, default=None, help="Name of the task.")
 parser.add_argument(
     "--agent", type=str, default="sb3_cfg_entry_point", help="Name of the RL agent configuration entry point."
 )
+parser.add_argument(
+    "--algorithm",
+    type=str,
+    default="PPO",
+    choices=["PPO", "SAC"],
+    help="RL algorithm (PPO or SAC).",
+)
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
 parser.add_argument("--log_interval", type=int, default=100_000, help="Log data every n timesteps.")
 parser.add_argument("--checkpoint", type=str, default=None, help="Continue the training from checkpoint.")
@@ -79,8 +86,9 @@ import random
 from datetime import datetime
 
 import omni
-from stable_baselines3 import PPO
+from stable_baselines3 import PPO, SAC
 from stable_baselines3.common.callbacks import CheckpointCallback, LogEveryNTimesteps
+from stable_baselines3.common.noise import NormalActionNoise
 from stable_baselines3.common.vec_env import VecNormalize
 
 from isaaclab.envs import (
@@ -111,9 +119,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # override configurations with non-hydra CLI arguments
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
     agent_cfg["seed"] = args_cli.seed if args_cli.seed is not None else agent_cfg["seed"]
-    # max iterations for training
+    # max iterations for training (PPO-style: iterations * n_steps * num_envs)
     if args_cli.max_iterations is not None:
-        agent_cfg["n_timesteps"] = args_cli.max_iterations * agent_cfg["n_steps"] * env_cfg.scene.num_envs
+        if "n_steps" in agent_cfg:
+            agent_cfg["n_timesteps"] = args_cli.max_iterations * agent_cfg["n_steps"] * env_cfg.scene.num_envs
+        else:
+            # SAC: treat max_iterations as total timesteps override
+            agent_cfg["n_timesteps"] = args_cli.max_iterations
 
     # set the environment seed
     # note: certain randomizations occur in the environment initialization so we set the seed here
@@ -193,12 +205,24 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         )
 
     # create agent from stable baselines
-    agent = PPO(policy_arch, env, verbose=1, tensorboard_log=log_dir, **agent_cfg)
+    algo = args_cli.algorithm.upper()
+    # Optional Holo-style action noise for SAC (σ=0.05 on 2D PID actions)
+    action_noise = None
+    if algo == "SAC" and agent_cfg.pop("use_action_noise", True):
+        action_dim = int(np.prod(env.action_space.shape))
+        noise_std = float(agent_cfg.pop("action_noise_std", 0.05))
+        action_noise = NormalActionNoise(mean=np.zeros(action_dim), sigma=np.ones(action_dim) * noise_std)
+        agent_cfg["action_noise"] = action_noise
+
+    algo_cls = {"PPO": PPO, "SAC": SAC}[algo]
+    agent = algo_cls(policy_arch, env, verbose=1, tensorboard_log=log_dir, **agent_cfg)
     if args_cli.checkpoint is not None:
         agent = agent.load(args_cli.checkpoint, env, print_system_info=True)
 
     # callbacks for agent
-    checkpoint_callback = CheckpointCallback(save_freq=1000, save_path=log_dir, name_prefix="model", verbose=2)
+    # SB3 counts total timesteps across envs; keep Holo-ish cadence (~1e5)
+    ckpt_every = max(10_000, int(n_timesteps // 20))
+    checkpoint_callback = CheckpointCallback(save_freq=ckpt_every, save_path=log_dir, name_prefix="model", verbose=2)
     callbacks = [checkpoint_callback, LogEveryNTimesteps(n_steps=args_cli.log_interval)]
 
     # train the agent

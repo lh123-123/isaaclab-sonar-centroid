@@ -1,0 +1,34 @@
+---
+description: Port Holo RL_AUV_tracking v0 to Isaac Lab — minimal changes
+alwaysApply: true
+---
+
+# Isaac-AUV-Tracking = Holo v0 搬迁（提速）
+
+## 原则
+
+- **目标**：把 HoloOcean `RL_AUV_tracking` **v0** 搬到 Isaac Lab，用并行仿真缩短墙钟训练时间。
+- **能不改就不改**：任务语义、观测、奖励、done、初始化、控制接口优先与 Holo v0 一致。
+- **允许例外（用户指定）**：
+  - **不要避障**（无障碍、无 LOS、无 rangefinder 障碍通道）。
+  - **追踪目标 = 小球**（不是第二艘 AUV；无双 AUV）。
+  - **不要海流**。
+- 缺的能力先看 **`isaac-auv-env`**（WarpAUV / 水动力 / 推进器）能否补；补不了的再问用户。
+
+## 训练
+
+- **只用 SB3 SAC**（对齐 Holo `sac_v0_fast`）：`./scripts/train_auv_tracking_sb3_sac.sh --num_envs 64 --headless`
+- 跑通 checkpoint：`logs/sb3/Isaac-AUV-Tracking-Direct-v0/2026-08-03_19-05-06/model.zip`
+- 不要用 skrl 训练本任务；相关日志/入口已清理，避免与 SB3 结果混淆。
+
+## 已对齐要点
+
+- reward / is_col / done-by-reward / episode≈200 / init a2t±π/5
+- workspace **±20** + `margin2wall=1`
+- belief init **t2b** polar `[0,2]` × `±π/2`
+- KF **state clip**（XY 工作区 + vel±3）
+- 目标速度：**cruise U[0.5,1.0]**，峰值 `×1.2`，`max_accel=1.0`（贴近 BlueROV 包络）
+
+## 底座差异（允许）
+
+- 平台 WarpAUV；Isaac 多 env；深度 z≈8 vs Holo fix_depth≈-15。

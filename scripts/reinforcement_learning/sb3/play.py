@@ -25,6 +25,13 @@ parser.add_argument("--task", type=str, default=None, help="Name of the task.")
 parser.add_argument(
     "--agent", type=str, default="sb3_cfg_entry_point", help="Name of the RL agent configuration entry point."
 )
+parser.add_argument(
+    "--algorithm",
+    type=str,
+    default="PPO",
+    choices=["PPO", "SAC"],
+    help="RL algorithm used to train the checkpoint (PPO or SAC).",
+)
 parser.add_argument("--checkpoint", type=str, default=None, help="Path to model checkpoint.")
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
 parser.add_argument(
@@ -67,7 +74,7 @@ import random
 import time
 import torch
 
-from stable_baselines3 import PPO
+from stable_baselines3 import PPO, SAC
 from stable_baselines3.common.vec_env import VecNormalize
 
 from isaaclab.envs import (
@@ -172,7 +179,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # create agent from stable baselines
     print(f"Loading checkpoint from: {checkpoint_path}")
-    agent = PPO.load(checkpoint_path, env, print_system_info=True)
+    algo_cls = {"PPO": PPO, "SAC": SAC}[args_cli.algorithm.upper()]
+    agent = algo_cls.load(checkpoint_path, env, print_system_info=True)
 
     dt = env.unwrapped.step_dt
 
