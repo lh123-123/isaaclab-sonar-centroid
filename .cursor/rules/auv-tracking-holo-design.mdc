@@ -28,6 +28,8 @@ alwaysApply: true
 - belief init **t2b** polar `[0,2]` × `±π/2`
 - KF **state clip**（XY 工作区 + vel±3）
 - 目标速度：**cruise U[0.5,1.0]**，峰值 `×1.2`，`max_accel=1.0`（贴近 BlueROV 包络）
+- KF **measurement**：OceanSim 声纳（cold-start 全局 → belief gate + intensity centroid + range bias），不再用几何 GT；obs/网络接口不变
+- 整合场景适配（r=0.35）：`skip_median_filter=True`、target reflectivity=2.0、gain↑、OceanSim `max_range=4m`（对齐 Holo sensor_range，避开远距杂波）
 
 ## 底座差异（允许）
 

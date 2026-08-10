@@ -56,8 +56,8 @@ AppLauncher.add_app_launcher_args(parser)
 # parse the arguments
 args_cli, hydra_args = parser.parse_known_args()
 
-# always enable cameras to record video
-if args_cli.video:
+# cameras required for video and for OceanSim sonar tasks (AUV tracking)
+if args_cli.video or (args_cli.task is not None and "AUV-Tracking" in args_cli.task):
     args_cli.enable_cameras = True
 
 # clear out sys.argv for Hydra

@@ -7,6 +7,10 @@
 
 Uses WarpAUV thruster geometry from :mod:`isaac-auv-env.thruster_dynamics` and a
 Moore-Penrose pseudoinverse (same wrench model as ``WarpAUVEnv._compute_dynamics``).
+
+Under thruster saturation, depth + attitude (Fz, Mx, My, Mz) are allocated first;
+surge/sway (Fx, Fy) are scaled into remaining PWM headroom so lateral/range demands
+cannot erase station-keeping in Z / attitude.
 """
 
 from __future__ import annotations
@@ -26,6 +30,11 @@ def _quat_apply(quat: torch.Tensor, vec: torch.Tensor) -> torch.Tensor:
 
 # 缓存推进器几何，避免每次 env 创建时重复 import/print
 _ALLOC_CACHE: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+
+# DoF priority: heave first; attitude optional. Fx/Fy fill leftover PWM.
+_PRIORITY_HEAVE = (2,)  # Fz
+_PRIORITY_ATT = (3, 4, 5)  # Mx, My, Mz
+_SECONDARY_XY = (0, 1)  # Fx, Fy
 
 
 def build_thruster_allocation_matrix(
@@ -54,11 +63,48 @@ def build_thruster_allocation_matrix(
     return b_mat, b_pinv
 
 
+def _max_secondary_scale(u_pri: torch.Tensor, u_sec: torch.Tensor, clamp: float) -> torch.Tensor:
+    """Per-env scale in [0, 1] so ``|u_pri + s * u_sec| <= clamp`` on all channels."""
+    eps = 1.0e-6
+    # Positive u_sec: s <= (clamp - u_pri) / u_sec
+    # Negative u_sec: s <= (-clamp - u_pri) / u_sec
+    room_hi = (clamp - u_pri) / u_sec.clamp(min=eps)
+    room_lo = (-clamp - u_pri) / u_sec.clamp(max=-eps)
+    lim = torch.where(u_sec > eps, room_hi, torch.where(u_sec < -eps, room_lo, torch.ones_like(u_sec)))
+    # Already over clamp from priority alone → no secondary budget on that channel.
+    lim = torch.where(lim < 0.0, torch.zeros_like(lim), lim)
+    return lim.amin(dim=-1, keepdim=True).clamp(0.0, 1.0)
+
+
 def allocate_thrusters(
     wrench_b: torch.Tensor,
     b_pinv: torch.Tensor,
     clamp: float = 1.0,
+    *,
+    priority: bool = True,
+    priority_attitude: bool = True,
 ) -> torch.Tensor:
-    """Map desired body wrench ``(N, 6)`` to PWM ``(N, 6)`` via ``u = wrench @ B_pinv.T``."""
-    pwm = wrench_b @ b_pinv.T
-    return torch.clamp(pwm, -clamp, clamp)
+    """Map desired body wrench ``(N, 6)`` to PWM ``(N, 6)``.
+
+    When ``priority=True`` (default), allocate heave (+ optional attitude) first,
+    then scale surge/sway into leftover thruster headroom. Without priority, plain
+    pinv + clamp (legacy) can starve depth when horizontal residual saturates.
+    """
+    if not priority:
+        return torch.clamp(wrench_b @ b_pinv.T, -clamp, clamp)
+
+    pri_dofs = _PRIORITY_HEAVE + (_PRIORITY_ATT if priority_attitude else ())
+    w_pri = torch.zeros_like(wrench_b)
+    w_sec = torch.zeros_like(wrench_b)
+    for i in pri_dofs:
+        w_pri[:, i] = wrench_b[:, i]
+    for i in _SECONDARY_XY:
+        w_sec[:, i] = wrench_b[:, i]
+    if not priority_attitude:
+        for i in _PRIORITY_ATT:
+            w_sec[:, i] = wrench_b[:, i]
+
+    u_pri = torch.clamp(w_pri @ b_pinv.T, -clamp, clamp)
+    u_sec = w_sec @ b_pinv.T
+    scale = _max_secondary_scale(u_pri, u_sec, clamp)
+    return torch.clamp(u_pri + scale * u_sec, -clamp, clamp)

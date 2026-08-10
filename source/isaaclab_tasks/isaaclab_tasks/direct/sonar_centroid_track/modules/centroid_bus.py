@@ -32,6 +32,46 @@ class CentroidFrame:
             return None
         return self.p_sonar.norm()
 
+    @property
+    def sonar_d_row_px(self) -> float | None:
+        """Green minus yellow row (px); positive → detected farther than teach."""
+        if self.p_sonar is None:
+            return None
+        return float(self.p_sonar.row)
+
+    def sonar_range_abs_m(
+        self,
+        *,
+        min_range: float,
+        max_range: float,
+        polar_height: int,
+    ) -> float | None:
+        if self.p_sonar_abs is None:
+            return None
+        from .coordinates import polar_row_to_range_m
+
+        return polar_row_to_range_m(
+            self.p_sonar_abs.row,
+            min_range=min_range,
+            max_range=max_range,
+            polar_height=polar_height,
+        )
+
+    def sonar_d_range_m(
+        self,
+        *,
+        range_ref_m: float,
+        min_range: float,
+        max_range: float,
+        polar_height: int,
+    ) -> float | None:
+        rng = self.sonar_range_abs_m(
+            min_range=min_range, max_range=max_range, polar_height=polar_height
+        )
+        if rng is None:
+            return None
+        return rng - float(range_ref_m)
+
     def summary(self) -> str:
         def _fmt(p: PolarPoint | None) -> str:
             return "None" if p is None else f"({p.col:.1f},{p.row:.1f})"

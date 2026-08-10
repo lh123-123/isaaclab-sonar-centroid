@@ -85,9 +85,14 @@ class BaseController:
         wrench: torch.Tensor,
         thruster_gain: torch.Tensor | None = None,
         thruster_bias: torch.Tensor | None = None,
+        *,
+        priority: bool = True,
+        priority_attitude: bool = True,
     ) -> torch.Tensor:
-        """Map body wrench to bounded thruster PWM."""
-        u = allocate_thrusters(wrench, self._b_pinv)
+        """Map body wrench to bounded thruster PWM (heave prioritized; attitude optional)."""
+        u = allocate_thrusters(
+            wrench, self._b_pinv, priority=priority, priority_attitude=priority_attitude
+        )
         if thruster_gain is not None:
             u = u * thruster_gain
         if thruster_bias is not None:

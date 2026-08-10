@@ -59,3 +59,45 @@ gym.register(
         "skrl_cfg_entry_point": _PPO,
     },
 )
+
+_AUV_ENV = f"{__name__}.sonar_centroid_track_auv_env:SonarCentroidTrackAUVEnv"
+
+gym.register(
+    id="Isaac-SonarCentroidTrack-AUV-Debug-Direct-v0",
+    entry_point=_AUV_ENV,
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.sonar_centroid_track_auv_env_cfg:SonarCentroidTrackAUVDebugCfg",
+        "skrl_cfg_entry_point": _PPO,
+    },
+)
+
+gym.register(
+    id="Isaac-SonarCentroidTrack-AUV-PControl-Direct-v0",
+    entry_point=_AUV_ENV,
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.sonar_centroid_track_auv_env_cfg:SonarCentroidTrackAUVMotionDebugCfg",
+        "skrl_cfg_entry_point": _PPO,
+    },
+)
+
+gym.register(
+    id="Isaac-SonarCentroidTrack-AUV-Residual-PPO-Direct-v0",
+    entry_point=_AUV_ENV,
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.sonar_centroid_track_auv_env_cfg:SonarCentroidTrackAUVResidualPpoCfg",
+        "skrl_cfg_entry_point": f"{agents.__name__}:skrl_ppo_continuous_auv_cfg.yaml",
+    },
+)
+
+gym.register(
+    id="Isaac-SonarCentroidTrack-AUV-Residual-Eval-Direct-v0",
+    entry_point=_AUV_ENV,
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.sonar_centroid_track_auv_env_cfg:SonarCentroidTrackAUVResidualEvalCfg",
+        "skrl_cfg_entry_point": f"{agents.__name__}:skrl_ppo_continuous_auv_cfg.yaml",
+    },
+)

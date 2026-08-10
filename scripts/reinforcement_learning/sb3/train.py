@@ -48,8 +48,8 @@ parser.add_argument(
 AppLauncher.add_app_launcher_args(parser)
 # parse the arguments
 args_cli, hydra_args = parser.parse_known_args()
-# always enable cameras to record video
-if args_cli.video:
+# cameras required for video and for OceanSim sonar tasks (AUV tracking)
+if args_cli.video or (args_cli.task is not None and "AUV-Tracking" in args_cli.task):
     args_cli.enable_cameras = True
 
 # clear out sys.argv for Hydra
@@ -206,32 +206,59 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # create agent from stable baselines
     algo = args_cli.algorithm.upper()
-    # Optional Holo-style action noise for SAC (σ=0.05 on 2D PID actions)
+    # Optional Holo-style action noise for SAC (σ=0.05 on 2D PID actions).
+    # Use per-action shape (act_dim,) so it broadcasts to (num_envs, act_dim) — never bake in num_envs.
+    use_action_noise = bool(agent_cfg.pop("use_action_noise", True))
+    noise_std = float(agent_cfg.pop("action_noise_std", 0.05))
+    act_shape = tuple(int(x) for x in env.action_space.shape)
+    act_dim = int(act_shape[-1]) if act_shape else 1
+
+    def _make_action_noise() -> NormalActionNoise:
+        return NormalActionNoise(mean=np.zeros(act_dim), sigma=np.ones(act_dim) * noise_std)
+
     action_noise = None
-    if algo == "SAC" and agent_cfg.pop("use_action_noise", True):
-        action_dim = int(np.prod(env.action_space.shape))
-        noise_std = float(agent_cfg.pop("action_noise_std", 0.05))
-        action_noise = NormalActionNoise(mean=np.zeros(action_dim), sigma=np.ones(action_dim) * noise_std)
+    if algo == "SAC" and use_action_noise:
+        action_noise = _make_action_noise()
         agent_cfg["action_noise"] = action_noise
 
     algo_cls = {"PPO": PPO, "SAC": SAC}[algo]
-    agent = algo_cls(policy_arch, env, verbose=1, tensorboard_log=log_dir, **agent_cfg)
-    if args_cli.checkpoint is not None:
-        agent = agent.load(args_cli.checkpoint, env, print_system_info=True)
+    resume_training = args_cli.checkpoint is not None
+    if resume_training:
+        print(f"[INFO] Resuming weights from: {args_cli.checkpoint}")
+        agent = algo_cls.load(args_cli.checkpoint, env=env, print_system_info=True)
+        # Keep TB / ckpts in this run's log_dir (not the old run folder).
+        agent.tensorboard_log = log_dir
+        # Old runs may have saved action_noise as (old_num_envs, act_dim), e.g. (32,2) vs (16,2).
+        if algo == "SAC" and use_action_noise:
+            agent.action_noise = _make_action_noise()
+            print(f"[INFO] Rebuilt action_noise for num_envs={env.num_envs}, act_dim={act_dim}")
+        print(f"[INFO] Loaded num_timesteps={getattr(agent, 'num_timesteps', '?')} → continue to {n_timesteps}")
+    else:
+        agent = algo_cls(policy_arch, env, verbose=1, tensorboard_log=log_dir, **agent_cfg)
 
     # callbacks for agent
-    # SB3 counts total timesteps across envs; keep Holo-ish cadence (~1e5)
-    ckpt_every = max(10_000, int(n_timesteps // 20))
+    # CheckpointCallback.save_freq counts VecEnv steps (1 call ≈ num_envs transitions).
+    # Without dividing by num_envs, e.g. 3e6//20=1.5e5 with 32 envs ⇒ first ckpt at 4.8e6
+    # (never reached) — so a crash leaves no model.zip.
+    num_envs = int(env.num_envs)
+    ckpt_transitions = max(50_000, int(n_timesteps // 20))  # ~every 5% of the run
+    ckpt_every = max(1, ckpt_transitions // num_envs)
+    print(
+        f"[INFO] Checkpoint every {ckpt_every} VecEnv steps "
+        f"(≈{ckpt_every * num_envs} transitions, {num_envs} envs)"
+    )
     checkpoint_callback = CheckpointCallback(save_freq=ckpt_every, save_path=log_dir, name_prefix="model", verbose=2)
     callbacks = [checkpoint_callback, LogEveryNTimesteps(n_steps=args_cli.log_interval)]
 
     # train the agent
+    # reset_num_timesteps=False: keep counter so learn() stops at total n_timesteps (true resume).
     with contextlib.suppress(KeyboardInterrupt):
         agent.learn(
             total_timesteps=n_timesteps,
             callback=callbacks,
             progress_bar=True,
             log_interval=None,
+            reset_num_timesteps=not resume_training,
         )
     # save the final model
     agent.save(os.path.join(log_dir, "model"))

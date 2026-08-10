@@ -70,6 +70,9 @@ class SonarCentroidTrackEnvCfg(DirectRLEnvCfg):
     spawn_yaw_range_deg: float = 0.0
 
     sonar_mount_offset_local: tuple[float, float, float] = SONAR_MOUNT_OFFSET_LOCAL
+    sonar_mount_rpy_deg: tuple[float, float, float] | None = None
+    sonar_mount_visual: bool = False
+    sonar_housing_offset_local: tuple[float, float, float] = (0.0, 0.0, 0.0)
     oceansim_sonar_cfg: OceanSimSonarSensorCfg = OCEANSIM_SONAR_CFG
 
     skip_median_filter: bool = True
@@ -115,6 +118,9 @@ class SonarCentroidTrackEnvCfg(DirectRLEnvCfg):
     centroid_debug_interval: int = 20
     print_policy_obs_debug: bool = False
     policy_obs_debug_interval: int = 10
+
+    # WarpAUV integration (see sonar_centroid_track_auv_env.py).
+    auv_physics_mode: bool = False
 
 
 @configclass

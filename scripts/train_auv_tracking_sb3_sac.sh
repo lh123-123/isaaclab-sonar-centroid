@@ -16,4 +16,5 @@ cd "$(dirname "$0")/.."
   --agent sb3_cfg_entry_point \
   --algorithm SAC \
   --log_interval 20000 \
+  --enable_cameras \
   "$@"

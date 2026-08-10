@@ -4,6 +4,9 @@ Open-water belief tracking (HoloOcean v0 core, without obstacles).
 Physics from isaac-auv-env WarpAUV; agent control matches HoloOcean PID:
   RL action [a_v, a_ω] ∈ [-1,1] → cmd_vel [v, ω] → PID → 6 PWM.
 Observation: [r_b, alpha_b, log_det_cov, observed] (4D)
+
+KF measurement: OceanSim sonar (belief-gated polar intensity centroid + range bias),
+not geometric GT. Policy obs / action / reward interfaces unchanged.
 """
 
 from __future__ import annotations
@@ -19,6 +22,7 @@ from .batch_lqr import BatchHoloTargetMotion
 from .batch_pid import BatchPIDController
 from .kalman_filter_batch import BatchKalmanFilter, BatchUnscentedKalmanFilter
 from .rigid_body_hydrodynamics import HydrodynamicForceModels
+from .sonar_meas import body_polar_from_xy, detect_centroid_polar
 from .thruster_dynamics import DynamicsFirstOrder, ConversionFunctionBasic, get_thruster_com_and_orientations
 
 import isaaclab.sim as sim_utils
@@ -30,6 +34,21 @@ from isaaclab.sim import SimulationCfg
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 from isaaclab.utils import configclass
 from isaaclab.utils.math import euler_xyz_from_quat, quat_apply, quat_from_euler_xyz, sample_uniform
+
+from isaaclab_tasks.direct.nonar2.oceansim_sonar_sensor_cfg import OceanSimSonarSensorCfg
+from isaaclab_tasks.direct.sonar_centroid_track.auv_platform import (
+    AUV_SONAR_HOUSING_OFFSET_LOCAL,
+    AUV_SONAR_MOUNT_OFFSET_LOCAL,
+    AUV_SONAR_MOUNT_VISUAL,
+)
+from isaaclab_tasks.direct.sonar_centroid_track.modules.sonar_gt import SonarGtDetector
+from isaaclab_tasks.direct.sonar_centroid_track.modules.sonar_pipeline import PolarSonarPipeline
+from isaaclab_tasks.direct.sonar_flow_hover.modules.geometry import sonar_pos_w
+from isaaclab_tasks.direct.sonar_flow_hover.shared_platform import (
+    OCEANSIM_SONAR_CFG,
+    OceanSimSonarSensor,
+    mount_oceansim_sonar_on_robots,
+)
 
 
 @configclass
@@ -92,10 +111,46 @@ class AUVTrackingEnvCfg(DirectRLEnvCfg):
     target_waypoint_reach_dist = 0.3  # RRT_2d tick threshold
     target_rrt_step_size = 2.0
     target_tau_vel = 0.7  # first-order lag ≈ ROV inertia
+    # Episode target-motion schedule (from reset):
+    #   0–3s  冷启动: cruise 0→target_speed + leash
+    #   3–5s  easy:   full cruise + leash
+    #   5s+   正常:   free RRT, no leash
+    target_soft_start_s = 3.0
+    target_easy_s = 5.0
+    target_leash_range = 3.2  # < sensor_range=4; leave margin for FOV / lag
     sensor_range = 4.0
     sensor_fov_deg = 100.0
     sensor_r_sd = 0.2
     sensor_b_sd = 0.01
+    # OceanSim FLS → KF measurement (adapted for r=0.35 tracking sphere).
+    # Cap sonar max_range to Holo sensor_range (4 m): far bins were latching clutter (~6 m).
+    # height = (max_range - min_range) / range_res = (4.0 - 0.5) / 0.05 = 70.
+    oceansim_sonar_cfg: OceanSimSonarSensorCfg = OCEANSIM_SONAR_CFG.replace(
+        max_range=4.0,
+        height=70,
+        intensity_gain=1.8,
+        attenuation=0.05,
+    )
+    sonar_mount_offset_local: tuple[float, float, float] = AUV_SONAR_MOUNT_OFFSET_LOCAL
+    sonar_housing_offset_local: tuple[float, float, float] = AUV_SONAR_HOUSING_OFFSET_LOCAL
+    sonar_mount_visual: bool = AUV_SONAR_MOUNT_VISUAL
+    sonar_mount_rpy_deg: tuple[float, float, float] | None = None
+    skip_median_filter: bool = True
+    sonar_warmup_frames: int = 4
+    sonar_prior_gate_deg: float = 20.0
+    # Acoustic surface → sphere center. Debug used 0.29 m on r=0.5 m; scale for r=0.35 m.
+    sonar_range_bias_m: float = 0.20
+    sonar_range_window_m: float = 0.8
+    sonar_threshold_ratio: float = 0.25
+    sonar_min_pixels: int = 2
+    # Reject weak polar peaks (play clutter ~0.37; true ball ~0.69). 0 → disabled.
+    sonar_min_peak: float = 0.45
+    # OceanSim reflectivity semantic on Target mesh (default unlabelled=1.0).
+    sonar_target_reflectivity: float = 2.0
+    # After first lock: reject peaks far from KF prior (stops max-range clutter latch).
+    sonar_consist_range_m: float = 1.5
+    # Before first good hit in episode: allow ungated detect inside Holo FOV/range.
+    sonar_cold_start_ungated: bool = True
     target_init_cov = 50.0
     target_init_dist_min = 1.0
     target_init_dist_max = 4.0
@@ -140,7 +195,33 @@ class AUVTrackingEnv(DirectRLEnv):
     cfg: AUVTrackingEnvCfg
 
     def __init__(self, cfg: AUVTrackingEnvCfg, render_mode: str | None = None, **kwargs):
+        n_envs = cfg.scene.num_envs
+        # Device may be finalized inside DirectRLEnv; use cfg hint then refresh after super.
+        dev = getattr(cfg.sim, "device", "cuda:0")
+        self.pipeline = PolarSonarPipeline(cfg, n_envs, dev)
+        self.gt = SonarGtDetector(
+            threshold_ratio=float(cfg.sonar_threshold_ratio),
+            min_pixels=int(cfg.sonar_min_pixels),
+            polar_width=int(cfg.oceansim_sonar_cfg.width),
+        )
+        ox, oy, oz = cfg.sonar_mount_offset_local
+        self._sonar_mount_offset_b = (
+            torch.tensor((ox, oy, oz), device=dev, dtype=torch.float32).unsqueeze(0).repeat(n_envs, 1)
+        )
+        self._sonar_warmed = False
+        self._sonar_locked = torch.zeros(n_envs, dtype=torch.bool, device=dev)
+
         super().__init__(cfg, render_mode, **kwargs)
+        self._sonar_locked = self._sonar_locked.to(self.device)
+
+        # Align buffers with env device after AppLauncher / DirectRLEnv set it.
+        self.pipeline.device = self.device
+        self.pipeline.sonar_image = self.pipeline.sonar_image.to(self.device)
+        self.pipeline.polar_image = self.pipeline.polar_image.to(self.device)
+        self._sonar_mount_offset_b = self._sonar_mount_offset_b.to(self.device)
+        self.pipeline.warmup(self.oceansim_sonar, self.sim, n_frames=int(self.cfg.sonar_warmup_frames))
+        self._sonar_warmed = True
+
         # RL action [a_v, a_ω]; low-level PWM from PID
         self._actions = torch.zeros(self.num_envs, 2, device=self.device)
         self._prev_actions = torch.zeros(self.num_envs, 2, device=self.device)
@@ -195,6 +276,9 @@ class AUVTrackingEnv(DirectRLEnv):
             rrt_step_size=self.cfg.target_rrt_step_size,
             tau_vel=self.cfg.target_tau_vel,
             max_speed=self.cfg.target_max_speed,
+            soft_start_s=float(self.cfg.target_soft_start_s),
+            easy_s=float(self.cfg.target_easy_s),
+            leash_range=float(self.cfg.target_leash_range),
             workspace_half_xy=(float(self.cfg.max_auv_x), float(self.cfg.max_auv_y)),
             workspace_margin=float(self.cfg.margin2wall),
         )
@@ -233,6 +317,55 @@ class AUVTrackingEnv(DirectRLEnv):
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
         light_cfg.func("/World/Light", light_cfg)
 
+        self.oceansim_sonar = OceanSimSonarSensor(
+            self.cfg.oceansim_sonar_cfg,
+            num_envs=self.num_envs,
+            device=self.device,
+        )
+        mount_oceansim_sonar_on_robots(
+            self.oceansim_sonar,
+            num_envs=self.num_envs,
+            sonar_mount_offset_local=self.cfg.sonar_mount_offset_local,
+            sim=self.sim,
+            sonar_mount_rpy_deg=getattr(self.cfg, "sonar_mount_rpy_deg", None),
+            sonar_mount_visual=bool(getattr(self.cfg, "sonar_mount_visual", False)),
+            sonar_housing_offset_local=getattr(self.cfg, "sonar_housing_offset_local", None),
+        )
+        self._apply_target_reflectivity()
+
+    def _apply_target_reflectivity(self) -> None:
+        """Tag Target meshes with OceanSim reflectivity semantic (boost small-sphere SNR)."""
+        refl = float(getattr(self.cfg, "sonar_target_reflectivity", 0.0))
+        if refl <= 0.0:
+            return
+        try:
+            from isaacsim.core.utils.prims import get_prim_at_path
+            from isaacsim.core.utils.semantics import add_update_semantics
+            from pxr import Usd, UsdGeom
+        except ImportError:
+            return
+        label = f"{refl:g}"
+        for i in range(self.num_envs):
+            root_path = f"/World/envs/env_{i}/Target"
+            try:
+                root = get_prim_at_path(root_path)
+            except Exception:
+                continue
+            if root is None or not root.IsValid():
+                continue
+            mesh_prims = [
+                prim
+                for prim in Usd.PrimRange(root)
+                if prim.IsA(UsdGeom.Mesh) or prim.GetTypeName() in ("Mesh", "Sphere")
+            ]
+            if not mesh_prims:
+                mesh_prims = [root]
+            for prim in mesh_prims:
+                try:
+                    add_update_semantics(prim=prim, type_label="reflectivity", semantic_label=label)
+                except Exception:
+                    pass
+
     def _sync_target_entity(self, env_ids: torch.Tensor | None = None) -> None:
         """Write LQR kinematic state onto the visible sphere (world frame)."""
         if env_ids is None:
@@ -254,20 +387,92 @@ class AUVTrackingEnv(DirectRLEnv):
         _, _, agent_yaw = euler_xyz_from_quat(self._robot.data.root_quat_w)
         return agent_pos, agent_yaw
 
+    def _sonar_pose_xy_yaw(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Sonar mount XY + robot yaw (body frame of measurement)."""
+        sonar_pw = sonar_pos_w(
+            self._robot.data.root_pos_w,
+            self._robot.data.root_quat_w,
+            self._sonar_mount_offset_b,
+        )
+        _, _, yaw = euler_xyz_from_quat(self._robot.data.root_quat_w)
+        return sonar_pw[:, :2], yaw
+
+    def _ensure_sonar(self) -> None:
+        if not self._sonar_warmed:
+            self.pipeline.warmup(self.oceansim_sonar, self.sim, n_frames=int(self.cfg.sonar_warmup_frames))
+            self._sonar_warmed = True
+        self.pipeline.ensure_updated(self.common_step_counter, self.oceansim_sonar, self.sim)
+
+    def _detect_sonar_polar(
+        self,
+        *,
+        prior_azimuth: torch.Tensor | None,
+        prior_range: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        ocfg = self.cfg.oceansim_sonar_cfg
+        return detect_centroid_polar(
+            self.pipeline.polar_image,
+            self.gt,
+            prior_azimuth=prior_azimuth,
+            prior_range=prior_range,
+            prior_gate_deg=float(self.cfg.sonar_prior_gate_deg),
+            hori_fov_deg=float(ocfg.hori_fov),
+            min_range=float(ocfg.min_range),
+            max_range=float(ocfg.max_range),
+            range_window_m=float(self.cfg.sonar_range_window_m),
+            detect_max_range=float(self.cfg.sensor_range),
+        )
+
     def _update_belief(self, env_ids: torch.Tensor | None = None) -> None:
-        """Observe target and KF-update (v0 observe_and_update_belief). No predict."""
-        agent_pos, agent_yaw = self._agent_pose_2d()
+        """Sonar measure (r,α) → KF update. No predict (Holo order)."""
         if env_ids is None:
             env_ids = self._robot._ALL_INDICES
 
-        z, r, alpha = self.kf.get_observation(self._target_pos, agent_pos, agent_yaw)
-        # Holo: r <= sensor_r (inclusive)
-        observed = (r <= self.cfg.sensor_range) & (torch.abs(alpha) <= self._fov_half)
+        self._ensure_sonar()
+        sonar_xy, yaw = self._sonar_pose_xy_yaw()
+
+        # Gate from current KF state (prior for this step after last predict).
+        az_pred, r_pred = body_polar_from_xy(self.kf.state[:, :2], sonar_xy, yaw)
+        range_bias = float(self.cfg.sonar_range_bias_m)
+        r_roi = torch.clamp(r_pred - range_bias, min=1.0e-3)
+
+        # Cold start: belief t2b init can be far from agent view → gated ROI misses / latches clutter.
+        # Until first accepted hit, use ungated detect (same idea as sonar_centroid debug).
+        cold = ~self._sonar_locked
+        if bool(self.cfg.sonar_cold_start_ungated) and cold.any():
+            r_g, a_g, valid_g = self._detect_sonar_polar(prior_azimuth=None, prior_range=None)
+        else:
+            r_g = a_g = valid_g = None
+
+        r_s, a_s, valid = self._detect_sonar_polar(prior_azimuth=az_pred, prior_range=r_roi)
+        if r_g is not None:
+            r_s = torch.where(cold, r_g, r_s)
+            a_s = torch.where(cold, a_g, a_s)
+            valid = torch.where(cold, valid_g, valid)
+
+        r_corr = r_s + range_bias
+
+        # After lock: drop peaks inconsistent with KF prior (max-range clutter).
+        consist_r = float(self.cfg.sonar_consist_range_m)
+        gate_rad = math.radians(float(self.cfg.sonar_prior_gate_deg) * 1.5)
+        d_alpha = torch.atan2(torch.sin(a_s - az_pred), torch.cos(a_s - az_pred)).abs()
+        consistent = (torch.abs(r_corr - r_pred) <= consist_r) & (d_alpha <= gate_rad)
+        accept_geom = (valid > 0.5) & (r_corr <= self.cfg.sensor_range) & (torch.abs(a_s) <= self._fov_half)
+        # Weak polar floor ≈ clutter latch (~0.37); true ball returns are stronger.
+        min_peak = float(self.cfg.sonar_min_peak)
+        if min_peak > 0.0 and hasattr(self.pipeline, "polar_image"):
+            peak = self.pipeline.polar_image.amax(dim=(-2, -1))
+            accept_geom = accept_geom & (peak >= min_peak)
+        observed = accept_geom & (cold | consistent)
+
         self._observed[env_ids] = observed[env_ids]
+        # Unlock on miss so a clutter-locked prior cannot keep accepting weak peaks.
+        self._sonar_locked[env_ids] = observed[env_ids]
 
         obs_ids = env_ids[observed[env_ids]]
         if obs_ids.numel() > 0:
-            self.kf.update(z[obs_ids], agent_pos[obs_ids], agent_yaw[obs_ids], env_ids=obs_ids)
+            z = torch.stack([r_corr[obs_ids], a_s[obs_ids]], dim=-1)
+            self.kf.update(z, sonar_xy[obs_ids], yaw[obs_ids], env_ids=obs_ids)
 
     def _log_det_cov(self) -> torch.Tensor:
         # Symmetric jitter before det to avoid negative/NaN from roundoff
@@ -298,7 +503,11 @@ class AUVTrackingEnv(DirectRLEnv):
 
     def _apply_action(self) -> None:
         # Target at physics rate (Holo: RRT+LQR every sim tick inside RL step)
-        self._target_state[:] = self.target_motion.step(self._target_state, dt=float(self.cfg.sim.dt))
+        self._target_state[:] = self.target_motion.step(
+            self._target_state,
+            dt=float(self.cfg.sim.dt),
+            agent_xy=self._robot.data.root_pos_w[:, :2],
+        )
         self._target_pos[:] = self._target_state[:, 0:2]
         self._sync_target_entity()
         # PID at physics rate (like HoloOcean ticks_per_rl_step inner loop)
@@ -450,7 +659,12 @@ class AUVTrackingEnv(DirectRLEnv):
         self._target_pos[env_ids, 1] = ty
 
         centers = origins[:, :2]
-        self.target_motion.reset(env_ids, self._target_state[env_ids], centers)
+        self.target_motion.reset(
+            env_ids,
+            self._target_state[env_ids],
+            centers,
+            agent_xy=agent_pos,
+        )
         self._sync_target_entity(env_ids)
 
         # Holo belief init: polar offset from true target using target yaw (path heading)
@@ -465,6 +679,11 @@ class AUVTrackingEnv(DirectRLEnv):
         init_state[:, 1] = torch.clamp(init_state[:, 1], origins[:, 1] - half_y, origins[:, 1] + half_y)
         self.kf.reset(env_ids, init_state, self.cfg.target_init_cov)
         self.pid.reset(env_ids, depth_target=float(self.cfg.starting_depth))
+        if hasattr(self, "oceansim_sonar") and self.oceansim_sonar is not None:
+            env_ids_t = env_ids if isinstance(env_ids, torch.Tensor) else torch.as_tensor(env_ids, device=self.device)
+            self.oceansim_sonar.reset_envs(env_ids_t)
+            self.pipeline.invalidate_cache()
+        self._sonar_locked[env_ids] = False
         self._observed[env_ids] = False
         self._actions[env_ids] = 0.0
         self._prev_actions[env_ids] = 0.0
@@ -489,6 +708,11 @@ class AUVTrackingEnv(DirectRLEnv):
             ],
             dim=-1,
         )
+
+    def close(self) -> None:
+        if hasattr(self, "oceansim_sonar"):
+            self.oceansim_sonar.close()
+        super().close()
 
     def _compute_dynamics(self, actions) -> tuple[torch.Tensor, torch.Tensor]:
         thruster_forces = torch.zeros((self.num_envs, 6, 3), device=self.device, dtype=torch.float)

@@ -85,6 +85,7 @@ class SonarCentroidTrackEnv(DirectRLEnv):
             polar_width=int(cfg.oceansim_sonar_cfg.width),
             polar_height=int(cfg.oceansim_sonar_cfg.height),
             image_only=bool(getattr(cfg, "image_only_obs", False)),
+            include_range_obs=bool(getattr(cfg, "include_range_obs", False)),
             continuous_actions=self._continuous_actions,
         )
         self.term_checker = CentroidTerminationChecker(n_envs, dev)
@@ -103,6 +104,9 @@ class SonarCentroidTrackEnv(DirectRLEnv):
             self.actions = torch.full((n_envs,), ACTION_STAY, dtype=torch.long, device=dev)
             self._prev_actions = torch.full((n_envs,), ACTION_STAY, dtype=torch.long, device=dev)
         self._lateral_vy_override: torch.Tensor | None = None
+        self._lateral_sway_override: torch.Tensor | None = None
+        self._lateral_surge_override: torch.Tensor | None = None
+        self._lateral_heave_override: torch.Tensor | None = None
 
         ox, oy, oz = cfg.sonar_mount_offset_local
         self._sonar_mount_offset_b = (
@@ -118,6 +122,29 @@ class SonarCentroidTrackEnv(DirectRLEnv):
     def _ensure_pipeline(self) -> None:
         self.pipeline.ensure_updated(self.common_step_counter, self.oceansim_sonar, self.sim)
         self.tracker.bind_polar(self.pipeline.polar_image)
+
+    def _beam_prior_azimuth_rad(self) -> torch.Tensor | None:
+        """Optional azimuth gate center per env; override in AUV env for teach/beacon prior."""
+        return None
+
+    def beam_peak_range_meas_m(
+        self,
+        *,
+        peak_threshold: float | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Peak-intensity beam range (m) from native OceanSim beams, not image centroids."""
+        self._ensure_pipeline()
+        if peak_threshold is None:
+            peak_threshold = float(getattr(self.cfg, "sonar_beam_peak_threshold", 0.08))
+        from .modules.sonar_beam_range import peak_beam_range_from_beams
+
+        gate_deg = float(getattr(self.cfg, "sonar_beam_azimuth_gate_deg", 0.0))
+        return peak_beam_range_from_beams(
+            self.oceansim_sonar.get_beam_data(),
+            peak_threshold=peak_threshold,
+            prior_azimuth=self._beam_prior_azimuth_rad(),
+            prior_gate_deg=gate_deg,
+        )
 
     def get_centroid_frame(self, env_id: int = 0):
         self._ensure_pipeline()
@@ -154,6 +181,18 @@ class SonarCentroidTrackEnv(DirectRLEnv):
     def set_lateral_velocity_override(self, vy: torch.Tensor | None) -> None:
         """Debug/eval: bypass discrete actions and apply continuous body-Y velocity (m/s)."""
         self._lateral_vy_override = vy
+
+    def set_lateral_sway_override(self, sway_m: torch.Tensor | None) -> None:
+        """Debug/eval: command target lateral sway position directly (m)."""
+        self._lateral_sway_override = sway_m
+
+    def set_lateral_surge_override(self, surge_m: torch.Tensor | None) -> None:
+        """Debug/eval: command target surge (forward) offset from station (m)."""
+        self._lateral_surge_override = surge_m
+
+    def set_lateral_heave_override(self, heave_z_m: torch.Tensor | None) -> None:
+        """Debug/eval: command target world Z depth (m); None = hold station depth."""
+        self._lateral_heave_override = heave_z_m
 
     def set_displacement_offset(
         self,
@@ -380,6 +419,9 @@ class SonarCentroidTrackEnv(DirectRLEnv):
             num_envs=self.num_envs,
             sonar_mount_offset_local=self.cfg.sonar_mount_offset_local,
             sim=self.sim,
+            sonar_mount_rpy_deg=getattr(self.cfg, "sonar_mount_rpy_deg", None),
+            sonar_mount_visual=bool(getattr(self.cfg, "sonar_mount_visual", False)),
+            sonar_housing_offset_local=getattr(self.cfg, "sonar_housing_offset_local", None),
         )
 
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
@@ -454,11 +496,28 @@ class SonarCentroidTrackEnv(DirectRLEnv):
     def _get_observations(self) -> dict:
         self._ensure_pipeline()
         self.obs_builder.set_prev_action(self._prev_actions)
+        range_meas = range_valid = None
+        if bool(getattr(self.cfg, "include_range_obs", False)):
+            range_meas, _, _, range_valid = self.beam_peak_range_meas_m()
         obs = self.obs_builder.build(
             self.tracker,
             robot_sway_m=self._robot_sway_m(),
             target_dy_m=self._target_dy_m(),
             target_dy_vel_m=self._target_dy_vel_m(),
+            range_ref_gt_m=(
+                self.range_ref_setpoint_m()
+                if hasattr(self, "range_ref_setpoint_m")
+                else (
+                    self.range_ref_for_control_m()
+                    if hasattr(self, "range_ref_for_control_m")
+                    else getattr(self, "_range_ref_gt_m", None)
+                )
+            ),
+            min_range=float(self.cfg.oceansim_sonar_cfg.min_range),
+            max_range=float(self.cfg.oceansim_sonar_cfg.max_range),
+            range_accept_m=float(getattr(self.cfg, "range_accept_m", 0.5)),
+            sonar_range_meas_m=range_meas,
+            sonar_range_valid=range_valid,
         )
         if bool(getattr(self.cfg, "print_centroid_debug", False)):
             interval = int(getattr(self.cfg, "centroid_debug_interval", 20))
@@ -588,14 +647,15 @@ class SonarCentroidTrackEnv(DirectRLEnv):
         if self.oceansim_sonar is not None:
             self.oceansim_sonar.reset_envs(env_ids_t)
 
-        enforce_lateral_1d_kinematics(
-            self.robot,
-            self._station_origin_w,
-            self._fixed_robot_yaw_w,
-            env_ids_t,
-        )
-        if bool(getattr(self.cfg, "freeze_robot_pose", False)):
-            self._hold_robot(env_ids_t)
+        if not bool(getattr(self.cfg, "auv_physics_mode", False)):
+            enforce_lateral_1d_kinematics(
+                self.robot,
+                self._station_origin_w,
+                self._fixed_robot_yaw_w,
+                env_ids_t,
+            )
+            if bool(getattr(self.cfg, "freeze_robot_pose", False)):
+                self._hold_robot(env_ids_t)
 
         self._calibrate_fixed_point(env_ids_t)
 

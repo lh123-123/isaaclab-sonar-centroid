@@ -112,6 +112,9 @@ class BatchHoloTargetMotion:
         rrt_step_size: float = 2.0,
         tau_vel: float = 0.7,
         max_speed: float = 0.6,
+        soft_start_s: float = 3.0,
+        easy_s: float = 5.0,
+        leash_range: float = 3.2,
         max_path_points: int = 512,
         workspace_half_xy: tuple[float, float] = (20.0, 20.0),
         workspace_margin: float = 1.0,
@@ -123,6 +126,9 @@ class BatchHoloTargetMotion:
         self.rrt_step_size = float(rrt_step_size)
         self.tau_vel = float(tau_vel)
         self.max_speed = float(max_speed)
+        self.soft_start_s = float(soft_start_s)
+        self.easy_s = float(easy_s)
+        self.leash_range = float(leash_range)
         self.max_path_points = int(max_path_points)
         self.workspace_half_xy = workspace_half_xy
         self.workspace_margin = workspace_margin
@@ -132,6 +138,8 @@ class BatchHoloTargetMotion:
         self.path_len = torch.ones(num_envs, dtype=torch.long, device=device)
         self.path_idx = torch.zeros(num_envs, dtype=torch.long, device=device)
         self.yaw = torch.zeros(num_envs, device=device)
+        # Seconds since last reset (for cruise soft-start / easy leash)
+        self.age_s = torch.zeros(num_envs, device=device)
 
     def _bounds(self, env_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         hx = self.workspace_half_xy[0] - self.workspace_margin
@@ -140,9 +148,24 @@ class BatchHoloTargetMotion:
         hi = self.env_centers[env_ids] + torch.tensor([hx, hy], device=self.device)
         return lo, hi
 
-    def _sample_goals(self, env_ids: torch.Tensor, avoid_xy: torch.Tensor) -> torch.Tensor:
+    def _sample_goals(
+        self,
+        env_ids: torch.Tensor,
+        avoid_xy: torch.Tensor,
+        *,
+        near_xy: torch.Tensor | None = None,
+        near_radius: float | None = None,
+    ) -> torch.Tensor:
         lo, hi = self._bounds(env_ids)
-        u = torch.rand(env_ids.shape[0], 2, device=self.device)
+        n = env_ids.shape[0]
+        if near_xy is not None and near_radius is not None and near_radius > 1e-3:
+            # Easy phase: short hops inside leash disk around agent
+            ang = torch.rand(n, device=self.device) * (2 * math.pi)
+            rad = (0.4 + 0.6 * torch.rand(n, device=self.device)) * float(near_radius)
+            goal = near_xy + torch.stack([torch.cos(ang) * rad, torch.sin(ang) * rad], dim=-1)
+            goal = torch.max(torch.min(goal, hi), lo)
+            return goal
+        u = torch.rand(n, 2, device=self.device)
         goal = lo + u * (hi - lo)
         # Prefer goals not too close to current pos (encourage travel)
         dist = torch.norm(goal - avoid_xy, dim=-1)
@@ -162,9 +185,21 @@ class BatchHoloTargetMotion:
         self.path_len[env_id] = m
         self.path_idx[env_id] = 0
 
-    def _plan_envs(self, env_ids: torch.Tensor, start_xy: torch.Tensor) -> None:
+    def _plan_envs(
+        self,
+        env_ids: torch.Tensor,
+        start_xy: torch.Tensor,
+        *,
+        agent_xy: torch.Tensor | None = None,
+        leash: bool = False,
+    ) -> None:
         lo, hi = self._bounds(env_ids)
-        goals = self._sample_goals(env_ids, start_xy)
+        if leash and agent_xy is not None:
+            goals = self._sample_goals(
+                env_ids, start_xy, near_xy=agent_xy, near_radius=self.leash_range
+            )
+        else:
+            goals = self._sample_goals(env_ids, start_xy)
         starts_np = start_xy.detach().cpu().numpy()
         goals_np = goals.detach().cpu().numpy()
         lo_np = lo.detach().cpu().numpy()
@@ -185,19 +220,34 @@ class BatchHoloTargetMotion:
                 d = goals_np[i] - starts_np[i]
             self.yaw[env_id] = math.atan2(float(d[1]), float(d[0]))
 
-    def reset(self, env_ids: torch.Tensor, init_state: torch.Tensor, centers_xy: torch.Tensor) -> None:
+    def reset(
+        self,
+        env_ids: torch.Tensor,
+        init_state: torch.Tensor,
+        centers_xy: torch.Tensor,
+        agent_xy: torch.Tensor | None = None,
+    ) -> None:
         """Reset motion for envs. init_state: (N,4) [x,y,vx,vy] — vx,vy ignored (start at rest)."""
         self.env_centers[env_ids] = centers_xy
-        self._plan_envs(env_ids, init_state[:, :2])
+        self.age_s[env_ids] = 0.0
+        # Start in easy leash so the first path stays measurable
+        near = agent_xy if agent_xy is not None else init_state[:, :2]
+        self._plan_envs(env_ids, init_state[:, :2], agent_xy=near, leash=self.easy_s > 1e-6)
 
     def current_waypoint(self) -> torch.Tensor:
         idx = torch.minimum(self.path_idx, self.path_len - 1).clamp(min=0)
         return self.path[torch.arange(self.num_envs, device=self.device), idx]
 
-    def step(self, state: torch.Tensor, dt: float) -> torch.Tensor:
+    def step(
+        self,
+        state: torch.Tensor,
+        dt: float,
+        agent_xy: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Integrate one physics tick. state (N,4) → next (N,4)."""
         pos = state[:, :2]
         vel = state[:, 2:4]
+        easy = (self.easy_s > 1e-6) & (self.age_s < self.easy_s)
 
         # Advance waypoint indices (Holo: dis < 0.3 → next path point)
         wp = self.current_waypoint()
@@ -212,19 +262,47 @@ class BatchHoloTargetMotion:
         if exhausted.any():
             ids = exhausted.nonzero(as_tuple=False).squeeze(-1)
             self.path_idx[ids] = torch.clamp(self.path_len[ids] - 1, min=0)
-            self._plan_envs(ids, pos[ids])
+            if agent_xy is not None and easy.any():
+                easy_ids = ids[easy[ids]]
+                hard_ids = ids[~easy[ids]]
+                if easy_ids.numel() > 0:
+                    self._plan_envs(
+                        easy_ids, pos[easy_ids], agent_xy=agent_xy[easy_ids], leash=True
+                    )
+                if hard_ids.numel() > 0:
+                    self._plan_envs(hard_ids, pos[hard_ids], leash=False)
+            else:
+                self._plan_envs(ids, pos[ids], leash=False)
 
         wp = self.current_waypoint()
         diff = wp - pos
         dist = torch.norm(diff, dim=-1, keepdim=True).clamp(min=1e-6)
         dir_unit = diff / dist
-        v_des = dir_unit * self.cruise_speed
+        # Soft-start: desired cruise ramps 0 → cruise_speed over soft_start_s after reset
+        if self.soft_start_s > 1e-6:
+            ramp = (self.age_s / self.soft_start_s).clamp(0.0, 1.0)
+        else:
+            ramp = torch.ones(self.num_envs, device=self.device)
+        cruise = self.cruise_speed * ramp
+        v_des = dir_unit * cruise.unsqueeze(-1)
+
+        # Easy leash: if target drifts beyond leash_range from agent, pull back inward
+        if agent_xy is not None and easy.any():
+            rel = pos - agent_xy
+            dist_a = torch.norm(rel, dim=-1).clamp(min=1e-6)
+            too_far = easy & (dist_a > self.leash_range)
+            if too_far.any():
+                inward = -rel / dist_a.unsqueeze(-1) * cruise.unsqueeze(-1)
+                v_des = torch.where(too_far.unsqueeze(-1), inward, v_des)
 
         # First-order lag (ROV / LQR inertia stand-in)
         alpha = 1.0 - math.exp(-dt / max(self.tau_vel, 1e-3))
         vel_new = vel + (v_des - vel) * alpha
         spd = torch.norm(vel_new, dim=-1, keepdim=True).clamp(min=1e-6)
-        vel_new = vel_new * torch.clamp(self.max_speed / spd, max=1.0)
+        # Cap also scales with soft-start so peak does not jump early
+        max_spd = self.max_speed * ramp.unsqueeze(-1).clamp(min=1e-3)
+        vel_new = vel_new * torch.clamp(max_spd / spd, max=1.0)
+        self.age_s = self.age_s + float(dt)
 
         pos_new = pos + vel_new * dt
 
@@ -235,6 +313,14 @@ class BatchHoloTargetMotion:
         hi = self.env_centers + torch.tensor([hx, hy], device=self.device)
         pos_new[:, 0].clamp_(lo[:, 0], hi[:, 0])
         pos_new[:, 1].clamp_(lo[:, 1], hi[:, 1])
+
+        # Soft positional leash (prevents overshoot leaving the disk)
+        if agent_xy is not None and easy.any():
+            rel = pos_new - agent_xy
+            dist_a = torch.norm(rel, dim=-1).clamp(min=1e-6)
+            scale = torch.clamp(self.leash_range / dist_a, max=1.0)
+            scale = torch.where(easy, scale, torch.ones_like(scale))
+            pos_new = agent_xy + rel * scale.unsqueeze(-1)
 
         # Yaw along velocity / path
         moving = torch.norm(vel_new, dim=-1) > 1e-3

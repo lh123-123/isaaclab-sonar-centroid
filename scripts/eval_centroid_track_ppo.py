@@ -2,13 +2,14 @@
 # Copyright (c) 2022-2025, The Isaac Lab Project Developers.
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Headless eval for discrete PPO sonar centroid tracking checkpoint."""
+"""Eval PPO checkpoint (headless or GUI with 6D obs debug)."""
 
 from __future__ import annotations
 
 import argparse
 import os
 import sys
+import time
 
 from isaaclab.app import AppLauncher
 
@@ -25,10 +26,26 @@ parser.add_argument(
 parser.add_argument("--episodes", type=int, default=5)
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--algorithm", type=str, default="PPO")
+parser.add_argument("--step_sleep", type=float, default=0.0, help="Pause between steps (GUI).")
+parser.add_argument(
+    "--sonar_ui",
+    action=argparse.BooleanOptionalAction,
+    default=False,
+    help="Enable OceanSim sonar viewport UI.",
+)
+parser.add_argument(
+    "--obs_debug_interval",
+    type=int,
+    default=0,
+    help="Print 6D policy obs + step delta every N steps (0=off).",
+)
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
 args_cli.enable_cameras = True
-args_cli.headless = True
+if not args_cli.sonar_ui:
+    args_cli.headless = True
+else:
+    args_cli.sonar_ui = True
 sys.argv = [sys.argv[0]] + hydra_args
 
 app_launcher = AppLauncher(args_cli)
@@ -52,11 +69,25 @@ from isaaclab_rl.skrl import SkrlVecEnvWrapper
 from isaaclab_tasks.direct.sonar_centroid_track.modules.obs_correspondence import correspondence_report
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
+OBS6D_LABELS = ("u_norm", "v_norm", "valid", "d_range", "prev_dsway", "prev_dsurge")
+
+
+def _policy_obs(obs) -> torch.Tensor:
+    if isinstance(obs, dict):
+        return obs["policy"]
+    return obs
+
 
 @hydra_task_config(args_cli.task, "skrl_cfg_entry_point")
 def main(env_cfg, agent_cfg):
     env_cfg.scene.num_envs = 1
     env_cfg.seed = int(args_cli.seed)
+    env_cfg.debug_disable_lost_terminate = True
+    if "AUV-Residual" in args_cli.task:
+        # Full sine period for |d_col| comparison (training terminates on range drift).
+        env_cfg.range_accept_m = 999.0
+    if args_cli.sonar_ui and hasattr(env_cfg, "oceansim_sonar_cfg"):
+        env_cfg.oceansim_sonar_cfg.sonar_initialize_viewport = True
     agent_cfg["seed"] = int(args_cli.seed)
 
     env = gym.make(args_cli.task, cfg=env_cfg)
@@ -86,6 +117,7 @@ def main(env_cfg, agent_cfg):
     ep_success: list[bool] = []
     all_abs_dcol: list[float] = []
     all_u: list[float] = []
+    all_sway_err: list[float] = []
 
     n_ep = int(args_cli.episodes)
     print(f"\n=== PPO eval: {n_ep} episodes (max_len={max_ep}) ===\n", flush=True)
@@ -94,6 +126,8 @@ def main(env_cfg, agent_cfg):
     ep_r = 0.0
     ep_len = 0
     ep_idx = 0
+    prev_obs6d: list[float] | None = None
+    obs_interval = max(int(args_cli.obs_debug_interval), 0)
 
     while ep_idx < n_ep and simulation_app.is_running():
         with torch.inference_mode():
@@ -101,16 +135,57 @@ def main(env_cfg, agent_cfg):
             actions = outputs[-1].get("mean_actions", outputs[0])
 
         raw.ensure_tracking()
+        pa = raw._prev_actions[0]
+        prev_action = float(pa[0].item()) if pa.numel() > 1 else int(pa.item())
         rep = correspondence_report(
-            raw.tracker, env_id=0, prev_action=int(raw._prev_actions[0].item()), polar_width=w, polar_height=h
+            raw.tracker,
+            env_id=0,
+            prev_action=prev_action,
+            polar_width=w,
+            polar_height=h,
+            continuous_actions=pa.numel() > 1 or bool(getattr(raw.cfg, "continuous_actions", False)),
         )
         if rep["d_col_px"] is not None:
             all_abs_dcol.append(abs(rep["d_col_px"]))
             all_u.append(rep["u_norm"])
+        if hasattr(raw, "_robot_sway_m") and hasattr(raw, "_target_dy_m"):
+            sway_err = abs(float(raw._robot_sway_m()[0].item()) - float(raw._target_dy_m()[0].item()))
+            all_sway_err.append(sway_err)
+        else:
+            sway_err = float("nan")
 
         obs, reward, terminated, truncated, _ = env.step(actions)
         ep_r += float(reward[0].item())
         ep_len += 1
+
+        if obs_interval > 0 and ep_len % obs_interval == 0:
+            o6 = _policy_obs(obs)[0].detach().cpu().tolist()
+            d6 = [0.0] * len(o6) if prev_obs6d is None else [a - b for a, b in zip(o6, prev_obs6d)]
+            prev_obs6d = o6
+            env_act = raw.actions[0].detach().cpu().tolist()
+            dc = rep["d_col_px"]
+            dc_s = f"{dc:+.2f}" if dc is not None else "nan"
+            se_s = f"{sway_err:.3f}" if all_sway_err else "nan"
+            names = OBS6D_LABELS[: len(o6)]
+            obs_s = " ".join(f"{n}={v:+.4f}" for n, v in zip(names, o6))
+            dlt_s = " ".join(f"Δ{n}={v:+.4f}" for n, v in zip(names, d6))
+            act_s = (
+                f"act=({env_act[0]:+.3f},{env_act[1]:+.3f})" if len(env_act) >= 2 else f"act={env_act[0]:+.3f}"
+            )
+            # Station layer diagnostics (depth / attitude) — task should look like 1-DoF follow.
+            z_err = float(raw.robot.data.root_pos_w[0, 2].item() - raw._station_origin_w[0, 2].item())
+            from isaaclab.utils.math import euler_xyz_from_quat
+
+            r, p, _ = euler_xyz_from_quat(raw.robot.data.root_quat_w[0:1])
+            att_s = f"z_err={z_err:+.3f}m roll={float(r[0]):+.2f} pitch={float(p[0]):+.2f}"
+            print(
+                f"[obs6d] ep={ep_idx + 1} step={ep_len:4d}  {obs_s}  |  {dlt_s}  |  {act_s}  "
+                f"d_col={dc_s}px  sway_err={se_s}m  {att_s}",
+                flush=True,
+            )
+
+        if args_cli.step_sleep > 0.0:
+            time.sleep(float(args_cli.step_sleep))
 
         if bool(terminated[0].item()) or bool(truncated[0].item()):
             lost = bool(terminated[0].item())
@@ -127,6 +202,7 @@ def main(env_cfg, agent_cfg):
             ep_idx += 1
             ep_r = 0.0
             ep_len = 0
+            prev_obs6d = None
             if ep_idx < n_ep:
                 obs, _ = env.reset()
 
@@ -143,6 +219,9 @@ def main(env_cfg, agent_cfg):
             dc = np.array(all_abs_dcol)
             print(f"  |d_col| mean   : {dc.mean():.2f} px  p90={np.percentile(dc, 90):.2f}  max={dc.max():.2f}", flush=True)
             print(f"  |u_norm| mean  : {np.mean(np.abs(all_u)):.4f}", flush=True)
+        if all_sway_err:
+            se = np.array(all_sway_err)
+            print(f"  |sway−target| mean: {se.mean():.3f} m  max={se.max():.3f} m", flush=True)
         print(flush=True)
 
     simulation_app.close()
