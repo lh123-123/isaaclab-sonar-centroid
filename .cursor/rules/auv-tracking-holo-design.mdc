@@ -17,8 +17,9 @@ alwaysApply: true
 
 ## 训练
 
-- **只用 SB3 SAC**（对齐 Holo `sac_v0_fast`）：`./scripts/train_auv_tracking_sb3_sac.sh --num_envs 64 --headless`
-- 跑通 checkpoint：`logs/sb3/Isaac-AUV-Tracking-Direct-v0/2026-08-03_19-05-06/model.zip`
+- **Direct-v0（belief MLP）**：SB3 SAC，对齐 Holo `sac_v0_fast`：`./scripts/train_auv_tracking_sb3_sac.sh --num_envs 64 --headless`
+- **Direct-v1（vision SAC）**：Holo v1 非对称 — Actor=声呐 polar 图，Critic=belief state：`./scripts/train_auv_tracking_sb3_sac_v1.sh --num_envs 16 --headless`
+- 跑通 v0 checkpoint：`models/auv_tracking/v1_sonar_sb3_sac/model.zip`（任务仍是 Direct-v0）
 - 不要用 skrl 训练本任务；相关日志/入口已清理，避免与 SB3 结果混淆。
 
 ## 已对齐要点

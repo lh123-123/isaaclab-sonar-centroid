@@ -1,0 +1,32 @@
+seed: 66
+n_timesteps: 5000000
+policy: isaaclab_tasks.direct.isaac_auv_tracking.agents.custom_sac_policy.CustomSACPolicy
+learning_rate: 0.0001
+buffer_size: 100000
+learning_starts: 1000
+batch_size: 256
+tau: 0.005
+gamma: 0.99
+train_freq: 1
+gradient_steps: 1
+ent_coef: auto
+target_entropy: auto
+target_update_interval: 10
+normalize_input: false
+normalize_value: false
+use_action_noise: true
+action_noise_std: 0.05
+policy_kwargs:
+  net_arch:
+    pi:
+    - 512
+    - 256
+    - 256
+    qf:
+    - 512
+    - 256
+  features_extractor_class: isaaclab_tasks.direct.isaac_auv_tracking.agents.sonar_encoder.SonarEncoder
+  features_extractor_kwargs:
+    features_dim: 512
+    resnet_output_dim: 256
+device: cuda:0

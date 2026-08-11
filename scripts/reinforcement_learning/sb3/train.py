@@ -79,17 +79,40 @@ signal.signal(signal.SIGINT, cleanup_pbar)
 
 """Rest everything follows."""
 
+import importlib
 import gymnasium as gym
 import numpy as np
 import os
 import random
 from datetime import datetime
+from typing import Any
 
 import omni
 from stable_baselines3 import PPO, SAC
 from stable_baselines3.common.callbacks import CheckpointCallback, LogEveryNTimesteps
 from stable_baselines3.common.noise import NormalActionNoise
 from stable_baselines3.common.vec_env import VecNormalize
+
+
+def _resolve_sb3_class(spec: Any) -> Any:
+    """Resolve a class from an import path string (Holo SB3_trainer style)."""
+    if not isinstance(spec, str):
+        return spec
+    if "." not in spec:
+        return spec
+    module_path, class_name = spec.rsplit(".", 1)
+    return getattr(importlib.import_module(module_path), class_name)
+
+
+def _prepare_sb3_policy(agent_cfg: dict) -> tuple[Any, dict]:
+    """Pop policy + resolve features_extractor_class import paths in policy_kwargs."""
+    policy_arch = _resolve_sb3_class(agent_cfg.pop("policy"))
+    policy_kwargs = agent_cfg.get("policy_kwargs")
+    if isinstance(policy_kwargs, dict):
+        fe = policy_kwargs.get("features_extractor_class")
+        if isinstance(fe, str):
+            policy_kwargs["features_extractor_class"] = _resolve_sb3_class(fe)
+    return policy_arch, agent_cfg
 
 from isaaclab.envs import (
     DirectMARLEnv,
@@ -152,7 +175,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # post-process agent configuration
     agent_cfg = process_sb3_cfg(agent_cfg, env_cfg.scene.num_envs)
     # read configurations about the agent-training
-    policy_arch = agent_cfg.pop("policy")
+    policy_arch, agent_cfg = _prepare_sb3_policy(agent_cfg)
     n_timesteps = agent_cfg.pop("n_timesteps")
 
     # set the IO descriptors output directory if requested

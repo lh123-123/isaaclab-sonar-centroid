@@ -1,11 +1,14 @@
 # Isaac-AUV-Tracking SB3 SAC checkpoints
 
-| Tag | Meas | Checkpoint | Source run |
-|-----|------|------------|------------|
-| **v0** | Geometric GT `(r, α)` → KF | `v0_gt_sb3_sac/model.zip` | `logs/sb3/.../2026-08-03_19-05-06` |
-| **v1** | OceanSim sonar centroid → KF | `v1_sonar_sb3_sac/model.zip` | `logs/sb3/.../2026-08-09_11-00-22` @ 2,099,920 steps |
+| Tag | Task | Policy | Meas | Checkpoint |
+|-----|------|--------|------|------------|
+| **v0** | `Isaac-AUV-Tracking-Direct-v0` | MLP on belief | Geometric GT → KF | `v0_gt_sb3_sac/model.zip` |
+| **v1 (MLP)** | `Isaac-AUV-Tracking-Direct-v0` | MLP on belief | OceanSim sonar → KF | `v1_sonar_sb3_sac/model.zip` |
+| **v1 vision best** | `Isaac-AUV-Tracking-Direct-v1` | CustomSAC (Actor=sonar img) | OceanSim → KF + image | `v1_vision_sb3_sac_best/model.zip` |
 
-## Play (v1 example)
+**Naming:** folder `v1_sonar_sb3_sac` is still **Direct-v0** (MLP). Gym **`Isaac-AUV-Tracking-Direct-v1`** is vision SAC. See `v1_vision_sb3_sac_best/README.md` for why later steps underperformed the early peak.
+
+## Play (Direct-v0 sonar MLP)
 
 ```bash
 ./isaaclab.sh -p scripts/reinforcement_learning/sb3/play.py \
@@ -17,4 +20,12 @@
   --headless
 ```
 
-For GUI, drop `--headless`. AUV-Tracking auto-enables cameras for sonar.
+## Play (Direct-v1 vision best)
+
+```bash
+./isaaclab.sh -p scripts/play_auv_tracking_vision_v1.py \
+  --checkpoint models/auv_tracking/v1_vision_sb3_sac_best/model.zip \
+  --num_envs 1 --steps 400 --headless --enable_cameras
+```
+
+For GUI play of v0 MLP, use `sb3/play.py` and drop `--headless`.
