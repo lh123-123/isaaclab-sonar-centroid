@@ -21,6 +21,7 @@ from .assets.warpauv import WARPAUV_CFG
 from .batch_lqr import BatchHoloTargetMotion
 from .batch_pid import BatchPIDController
 from .kalman_filter_batch import BatchKalmanFilter, BatchUnscentedKalmanFilter
+from .ocean_current import clip_current_velocity, create_ocean_current_field
 from .rigid_body_hydrodynamics import HydrodynamicForceModels
 from .sonar_meas import body_polar_from_xy, detect_centroid_polar
 from .thruster_dynamics import DynamicsFirstOrder, ConversionFunctionBasic, get_thruster_com_and_orientations
@@ -49,6 +50,19 @@ from isaaclab_tasks.direct.sonar_flow_hover.shared_platform import (
     OceanSimSonarSensor,
     mount_oceansim_sonar_on_robots,
 )
+
+
+@configclass
+class OceanCurrentCfg:
+    """Optional ocean currents (default off = calm water). Holo-like water velocity API."""
+
+    enabled: bool = False
+    type: str = "uniform"  # uniform | vortex | sine_wave | random
+    strength: float = 0.3
+    level: str | None = None  # off|mild|medium|strong; None → use strength
+    affect_target: bool = False
+    clip_speed: float = 5.0
+    params: dict = {"direction": [1.0, 0.0, 0.0]}
 
 
 @configclass
@@ -190,6 +204,9 @@ class AUVTrackingEnvCfg(DirectRLEnvCfg):
     volume = 0.022747843530591776
     mass = 2.2701e01
 
+    # Ocean currents (default calm water). See docs/superpowers/specs/2026-08-18-auv-ocean-current-design.md
+    ocean_current: OceanCurrentCfg = OceanCurrentCfg()
+
 
 class AUVTrackingEnv(DirectRLEnv):
     cfg: AUVTrackingEnvCfg
@@ -221,6 +238,10 @@ class AUVTrackingEnv(DirectRLEnv):
         self._sonar_mount_offset_b = self._sonar_mount_offset_b.to(self.device)
         self.pipeline.warmup(self.oceansim_sonar, self.sim, n_frames=int(self.cfg.sonar_warmup_frames))
         self._sonar_warmed = True
+
+        # Ocean current buffer + optional field (Holo-like set_ocean_currents API)
+        self._ocean_current_vel = torch.zeros((self.num_envs, 3), device=self.device)
+        self._ocean_current_field = create_ocean_current_field(self.cfg.ocean_current)
 
         # RL action [a_v, a_ω]; low-level PWM from PID
         self._actions = torch.zeros(self.num_envs, 2, device=self.device)
@@ -502,11 +523,26 @@ class AUVTrackingEnv(DirectRLEnv):
         self._cmd_vel[:, 1] = self._actions[:, 1] * self.cfg.action_scale_w
 
     def _apply_action(self) -> None:
+        t = None
+        if self._ocean_current_field is not None:
+            t = self.episode_length_buf.to(dtype=torch.float32) * float(self.sim.cfg.dt)
+            v = self._ocean_current_field(self._robot.data.root_pos_w, t)
+            self.set_ocean_currents(None, v)
+
+        current_xy = None
+        if self._ocean_current_field is not None and self.cfg.ocean_current.affect_target:
+            tgt_pos = torch.zeros((self.num_envs, 3), device=self.device)
+            tgt_pos[:, :2] = self._target_state[:, :2]
+            tgt_pos[:, 2] = float(self.cfg.starting_depth)
+            v_tgt = self._ocean_current_field(tgt_pos, t)
+            current_xy = v_tgt[:, :2]
+
         # Target at physics rate (Holo: RRT+LQR every sim tick inside RL step)
         self._target_state[:] = self.target_motion.step(
             self._target_state,
             dt=float(self.cfg.sim.dt),
             agent_xy=self._robot.data.root_pos_w[:, :2],
+            current_vel_xy=current_xy,
         )
         self._target_pos[:] = self._target_state[:, 0:2]
         self._sync_target_entity()
@@ -689,6 +725,7 @@ class AUVTrackingEnv(DirectRLEnv):
         self._prev_actions[env_ids] = 0.0
         self._cmd_vel[env_ids] = 0.0
         self._pwm[env_ids] = 0.0
+        self._ocean_current_vel[env_ids] = 0.0
         self._needs_belief_refresh[env_ids] = True
         self._is_col[env_ids] = False
         self._cached_rew[env_ids] = 0.0
@@ -708,6 +745,30 @@ class AUVTrackingEnv(DirectRLEnv):
             ],
             dim=-1,
         )
+
+    def set_ocean_currents(
+        self,
+        env_ids: torch.Tensor | Sequence[int] | None,
+        velocity: torch.Tensor | Sequence[float],
+    ) -> None:
+        """Holo-like API: set world-frame water velocity [m/s] for selected envs."""
+        if env_ids is None:
+            env_ids = self._robot._ALL_INDICES
+        env_ids = torch.as_tensor(env_ids, device=self.device, dtype=torch.long).view(-1)
+        v = torch.as_tensor(velocity, device=self.device, dtype=torch.float32)
+        if v.ndim == 1:
+            v = v.view(1, 3).expand(env_ids.numel(), 3).clone()
+        if v.shape != (env_ids.numel(), 3):
+            raise ValueError(f"velocity shape {tuple(v.shape)} != ({env_ids.numel()}, 3)")
+        v = clip_current_velocity(v, float(self.cfg.ocean_current.clip_speed))
+        self._ocean_current_vel[env_ids] = v
+
+    def get_ocean_currents(self, env_ids: torch.Tensor | Sequence[int] | None = None) -> torch.Tensor:
+        """Return world-frame water velocity buffer [m/s] (clone)."""
+        if env_ids is None:
+            return self._ocean_current_vel.clone()
+        env_ids = torch.as_tensor(env_ids, device=self.device, dtype=torch.long).view(-1)
+        return self._ocean_current_vel[env_ids].clone()
 
     def close(self) -> None:
         if hasattr(self, "oceansim_sonar"):
@@ -740,9 +801,12 @@ class AUVTrackingEnv(DirectRLEnv):
             abs(self._gravity_mag),
             self.com_to_cob_offsets,
         )
+        lin_vel = self._robot.data.root_lin_vel_w
+        if self._ocean_current_field is not None or torch.any(self._ocean_current_vel != 0):
+            lin_vel = lin_vel - self._ocean_current_vel
         df, dt_, vf, vt_ = self.force_calc.calculate_density_and_viscosity_forces(
             self._robot.data.root_quat_w,
-            self._robot.data.root_lin_vel_w,
+            lin_vel,
             self._robot.data.root_ang_vel_w,
             self.inertia_tensors,
             self.inertia_tensors.mean(dim=1, keepdim=True),

@@ -12,7 +12,8 @@ alwaysApply: true
 - **允许例外（用户指定）**：
   - **不要避障**（无障碍、无 LOS、无 rangefinder 障碍通道）。
   - **追踪目标 = 小球**（不是第二艘 AUV；无双 AUV）。
-  - **不要海流**。
+  - **洋流（可选）**：默认关闭（平静水）。启用见 `AUVTrackingEnvCfg.ocean_current`；
+    Holo 同语义 `set_ocean_currents` + 相对速度进 WarpAUV 水动力；`affect_target` 默认 false。
 - 缺的能力先看 **`isaac-auv-env`**（WarpAUV / 水动力 / 推进器）能否补；补不了的再问用户。
 
 ## 训练
@@ -35,3 +36,4 @@ alwaysApply: true
 ## 底座差异（允许）
 
 - 平台 WarpAUV；Isaac 多 env；深度 z≈8 vs Holo fix_depth≈-15。
+- 洋流走现有密度/粘性力的 \(v_{\mathrm{rel}}\)，不是 Holo UE `OceanCurrentsCommand`。

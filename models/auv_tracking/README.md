@@ -8,6 +8,8 @@
 
 **Naming:** folder `v1_sonar_sb3_sac` is still **Direct-v0** (MLP). Gym **`Isaac-AUV-Tracking-Direct-v1`** is vision SAC. See `v1_vision_sb3_sac_best/README.md` for why later steps underperformed the early peak.
 
+Packaged checkpoints were trained in **calm water** (`ocean_current.enabled=false`, the default). Enabling currents changes dynamics without changing obs/network interfaces.
+
 ## Play (Direct-v0 sonar MLP)
 
 ```bash

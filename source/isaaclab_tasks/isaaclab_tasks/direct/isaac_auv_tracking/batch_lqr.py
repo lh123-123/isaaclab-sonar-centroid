@@ -243,6 +243,7 @@ class BatchHoloTargetMotion:
         state: torch.Tensor,
         dt: float,
         agent_xy: torch.Tensor | None = None,
+        current_vel_xy: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Integrate one physics tick. state (N,4) → next (N,4)."""
         pos = state[:, :2]
@@ -305,8 +306,10 @@ class BatchHoloTargetMotion:
         self.age_s = self.age_s + float(dt)
 
         pos_new = pos + vel_new * dt
+        if current_vel_xy is not None:
+            pos_new = pos_new + current_vel_xy * dt
 
-        # Workspace clamp
+        # Workspace clamp (after current overlay)
         hx = self.workspace_half_xy[0] - self.workspace_margin
         hy = self.workspace_half_xy[1] - self.workspace_margin
         lo = self.env_centers - torch.tensor([hx, hy], device=self.device)
