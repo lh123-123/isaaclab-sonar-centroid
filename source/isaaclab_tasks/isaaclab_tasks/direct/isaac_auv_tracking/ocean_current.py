@@ -152,9 +152,8 @@ def _random_field(pos_w: Tensor, t: Tensor | float, strength: float, params: dic
     device, dtype = pos_w.device, pos_w.dtype
     n = pos_w.shape[0]
     max_velocity = float(params.get("max_velocity", strength))
-    spatial_scale = float(params.get("spatial_scale", 10.0))
+    spatial_scale = float(params.get("spatial_scale", 5.0))
     temporal_scale = float(params.get("temporal_scale", 5.0))
-    correlation_length = float(params.get("correlation_length", 3.0))
     seed = float(params.get("seed", 0.0))
 
     t_vec = _time_tensor(t, n, device, dtype)
@@ -171,8 +170,7 @@ def _random_field(pos_w: Tensor, t: Tensor | float, strength: float, params: dic
         * torch.cos(t_vec / temporal_scale + 2.0)
     )
 
-    dist_factor = torch.exp(-pos_w[..., :2].norm(dim=-1) / correlation_length)
-    return torch.stack([dx, dy, dz], dim=-1) * dist_factor.unsqueeze(-1)
+    return torch.stack([dx, dy, dz], dim=-1)
 
 
 _FIELD_BUILDERS = {

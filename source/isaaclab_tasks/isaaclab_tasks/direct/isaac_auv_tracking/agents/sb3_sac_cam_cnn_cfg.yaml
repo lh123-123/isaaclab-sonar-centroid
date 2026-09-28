@@ -1,0 +1,51 @@
+# SPDX-License-Identifier: BSD-3-Clause
+# Direct-v3-cam SAC: stacked grayscale frames (K=4 -> 4ch, 64x64) through a mid-size CNN.
+# Hyperparams follow sb3_sac_flow_cfg.yaml; buffer_size is the only RAM-bound knob.
+#
+# SB3 allocates `buffer_size` steps *per environment* and keeps TWO copies (observations and
+# next_observations), so the footprint is
+#     buffer_size * num_envs * 2 * (frame_stack * 64 * 64) bytes
+#   = buffer_size * 8 * 2 * 16384 = 262 KB per unit of buffer_size.
+# num_envs=8 / buffer_size=15000  =>  120k transitions in 3.66 GiB (of ~9 GiB free).
+#
+# For scale: the older sonar-vision runs asked for buffer_size=100000 at 16 envs, i.e.
+# 1.6M transitions / 36.6 GiB, on a 15 GiB + 18.6 GiB swap machine. That only appeared to
+# work because numpy allocates with calloc and the run stopped at ~620k transitions, so
+# just 38% of the rows were ever paged in -- throughput measured 25 env-steps/s. Their
+# 100000 is therefore not a target to match. Grayscale (see cam_encoder) is what lets us
+# afford 6x their per-env depth in a sixth of the memory.
+
+seed: 66
+n_timesteps: 1000000
+policy: "stable_baselines3.sac.policies.SACPolicy"
+
+learning_rate: 0.0001
+buffer_size: 15000
+learning_starts: 1000
+batch_size: 256
+tau: 0.005
+gamma: 0.99
+train_freq: 1
+gradient_steps: 1
+ent_coef: "auto"
+target_entropy: "auto"
+target_update_interval: 10
+normalize_input: false
+normalize_value: false
+
+use_action_noise: true
+action_noise_std: 0.05
+
+policy_kwargs:
+  # One CNN shared by actor and both critics: half the forward cost and GPU memory.
+  share_features_extractor: true
+  net_arch:
+    pi: [512, 256, 256]
+    qf: [512, 256]
+  features_extractor_class: "isaaclab_tasks.direct.isaac_auv_tracking.agents.cam_encoder.MidCNNExtractor"
+  features_extractor_kwargs:
+    features_dim: 256
+  # NOTE: `normalize_images` is deliberately left at SB3's default (True). The extractor
+  # guards against being handed an already-normalised tensor, exactly like SonarEncoder.
+
+device: "cuda:0"

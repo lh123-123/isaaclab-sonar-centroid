@@ -5,7 +5,17 @@ import gymnasium as gym
 
 from . import agents
 from .auv_tracking_env import AUVTrackingEnv, AUVTrackingEnvCfg
+from .auv_tracking_flow_env import (
+    AUVTrackingFlowEnv,
+    AUVTrackingFlowEnvCfg,
+    AUVTrackingFlowImageEnv,
+    AUVTrackingFlowImageEnvCfg,
+    AUVTrackingFlowStateEnv,
+    AUVTrackingFlowStateEnvCfg,
+)
 from .auv_tracking_vision_env import AUVTrackingVisionEnv, AUVTrackingVisionEnvCfg
+from .auv_tracking_cam_env import AUVTrackingCamEnv, AUVTrackingCamEnvCfg
+from .auv_tracking_v4_cam_env import AUVTrackingV4CamEnv, AUVTrackingV4CamEnvCfg
 
 gym.register(
     id="Isaac-AUV-Tracking-Direct-v0",
@@ -26,5 +36,68 @@ gym.register(
     kwargs={
         "env_cfg_entry_point": AUVTrackingVisionEnvCfg,
         "sb3_cfg_entry_point": f"{agents.__name__}:sb3_sac_vision_cfg.yaml",
+        "sb3_symmetric_cnn_cfg_entry_point": f"{agents.__name__}:sb3_sac_vision_symmetric_cnn_cfg.yaml",
+        "sb3_hybrid_cnn_cfg_entry_point": f"{agents.__name__}:sb3_sac_vision_hybrid_cnn_cfg.yaml",
+        "sb3_gated_cnn_cfg_entry_point": f"{agents.__name__}:sb3_sac_vision_gated_cnn_cfg.yaml",
+        "sb3_asym_cnn_cfg_entry_point": f"{agents.__name__}:sb3_sac_vision_asym_cnn_cfg.yaml",
+    },
+)
+
+# Stacked polar residual + reference position; reward/done inherit v0
+gym.register(
+    id="Isaac-AUV-Tracking-Direct-v2",
+    entry_point="isaaclab_tasks.direct.isaac_auv_tracking:AUVTrackingFlowEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": AUVTrackingFlowEnvCfg,
+        "sb3_cfg_entry_point": f"{agents.__name__}:sb3_sac_flow_cfg.yaml",
+        "sb3_resnet_cfg_entry_point": f"{agents.__name__}:sb3_sac_flow_resnet_cfg.yaml",
+    },
+)
+
+# Ablation: state-only (no image, MLP policy)
+gym.register(
+    id="Isaac-AUV-Tracking-Direct-v2-state",
+    entry_point="isaaclab_tasks.direct.isaac_auv_tracking:AUVTrackingFlowStateEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": AUVTrackingFlowStateEnvCfg,
+        "sb3_cfg_entry_point": f"{agents.__name__}:sb3_sac_flow_state_cfg.yaml",
+    },
+)
+
+# Ablation: image-only (no state, CNN-only policy)
+gym.register(
+    id="Isaac-AUV-Tracking-Direct-v2-image",
+    entry_point="isaaclab_tasks.direct.isaac_auv_tracking:AUVTrackingFlowImageEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": AUVTrackingFlowImageEnvCfg,
+        "sb3_cfg_entry_point": f"{agents.__name__}:sb3_sac_flow_image_cfg.yaml",
+    },
+)
+
+# Direct-v3-cam: no sonar. Forward camera at the sonar mount pose, K=4 grayscale frame stack,
+# second WarpAUV as the target. KF measurement from geometric GT.
+gym.register(
+    id="Isaac-AUV-Tracking-Direct-v3-cam",
+    entry_point="isaaclab_tasks.direct.isaac_auv_tracking:AUVTrackingCamEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": AUVTrackingCamEnvCfg,
+        "sb3_cfg_entry_point": f"{agents.__name__}:sb3_sac_cam_cnn_cfg.yaml",
+    },
+)
+
+# Direct-v4-cam: a *copy* of Direct-v0 (kept intact) with only two changes -- the target is a
+# second WarpAUV (same BatchHoloTargetMotion, so the motion model is unchanged) and the sonar
+# is replaced by the forward camera (K=4 grayscale frames, KF from geometric GT).
+gym.register(
+    id="Isaac-AUV-Tracking-Direct-v4-cam",
+    entry_point="isaaclab_tasks.direct.isaac_auv_tracking:AUVTrackingV4CamEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": AUVTrackingV4CamEnvCfg,
+        "sb3_cfg_entry_point": f"{agents.__name__}:sb3_sac_v4_cam_cfg.yaml",
     },
 )

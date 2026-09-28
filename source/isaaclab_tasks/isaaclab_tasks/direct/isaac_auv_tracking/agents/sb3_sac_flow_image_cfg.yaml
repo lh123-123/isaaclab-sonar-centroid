@@ -1,0 +1,36 @@
+# SPDX-License-Identifier: BSD-3-Clause
+# Direct-v2 ablation: IMAGE-ONLY (no state vector, CNN-only policy).
+# All SAC / env hyperparams identical to sb3_sac_flow_cfg.yaml.
+
+seed: 66
+n_timesteps: 3000000
+policy: "stable_baselines3.sac.policies.SACPolicy"
+
+learning_rate: 0.0001
+buffer_size: 100000
+learning_starts: 1000
+batch_size: 256
+tau: 0.005
+gamma: 0.99
+train_freq: 1
+gradient_steps: 1
+ent_coef: "auto"
+target_entropy: "auto"
+target_update_interval: 10
+normalize_input: false
+normalize_value: false
+
+use_action_noise: true
+action_noise_std: 0.05
+
+policy_kwargs:
+  share_features_extractor: false
+  net_arch:
+    pi: [512, 256, 256]
+    qf: [512, 256]
+  features_extractor_class: "isaaclab_tasks.direct.isaac_auv_tracking.agents.sonar_encoder.CompactSonarEncoder"
+  features_extractor_kwargs:
+    features_dim: 512
+    resnet_output_dim: 256
+
+device: "cuda:0"

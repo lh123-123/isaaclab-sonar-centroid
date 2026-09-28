@@ -1,0 +1,1 @@
+/home/lh/miniconda3/envs/isaaclab/bin/python scripts/reinforcement_learning/sb3/train.py --task Isaac-AUV-Tracking-Direct-v4-cam --agent sb3_cfg_entry_point --algorithm SAC --log_interval 20000 --enable_cameras --num_envs 8 --headless

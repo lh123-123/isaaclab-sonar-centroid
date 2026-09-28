@@ -1,0 +1,64 @@
+{
+  "run": "logs/sb3/Isaac-AUV-Tracking-Direct-v4-cam/2026-09-24_19-57-01",
+  "task": "Isaac-AUV-Tracking-Direct-v4-cam",
+  "kf_measurement": "cam",
+  "protocol": "1 env, headless, deterministic, seed 66, 20 full episodes per checkpoint",
+  "checkpoints": {
+    "400000": {
+      "ep_ret_mean": 222.1184864729643,
+      "ep_ret_std": 362.44854580770857,
+      "ep_len_mean": 190.65,
+      "med_abs_bearing_deg": 31.566475692664508,
+      "mean_abs_bearing_deg": 39.62380373490593,
+      "mean_gt_r": 2.945337896862275,
+      "frac_r_gt3": 0.2079727248885392,
+      "lost_rate": 0.1880409126671912,
+      "da_mean": 0.651467999724372,
+      "da_p90": 1.7478868722915653,
+      "a_w_sat": 0.36611591922370834,
+      "elapsed_s": 426.2
+    },
+    "600000": {
+      "ep_ret_mean": 447.73917972445486,
+      "ep_ret_std": 293.4960439883483,
+      "ep_len_mean": 199.0,
+      "med_abs_bearing_deg": 31.307753249546302,
+      "mean_abs_bearing_deg": 28.00674133238106,
+      "mean_gt_r": 2.70739715347937,
+      "frac_r_gt3": 0.27738693467336684,
+      "lost_rate": 0.12537688442211056,
+      "da_mean": 0.5889249612701865,
+      "da_p90": 1.6469477534294128,
+      "a_w_sat": 0.14824120603015076,
+      "elapsed_s": 409.8
+    },
+    "800000": {
+      "ep_ret_mean": 569.2088896334171,
+      "ep_ret_std": 243.8250418938606,
+      "ep_len_mean": 199.0,
+      "med_abs_bearing_deg": 13.627210087642274,
+      "mean_abs_bearing_deg": 14.781457032900162,
+      "mean_gt_r": 2.1446892410067457,
+      "frac_r_gt3": 0.08768844221105528,
+      "lost_rate": 0.0032663316582914573,
+      "da_mean": 0.4915262276905205,
+      "da_p90": 1.22126692533493,
+      "a_w_sat": 0.07311557788944724,
+      "elapsed_s": 407.5
+    },
+    "1000000": {
+      "ep_ret_mean": 409.44857595562934,
+      "ep_ret_std": 284.6178520145829,
+      "ep_len_mean": 194.0,
+      "med_abs_bearing_deg": 29.00219984332005,
+      "mean_abs_bearing_deg": 25.208269612862843,
+      "mean_gt_r": 3.683128440840957,
+      "frac_r_gt3": 0.3427835051546392,
+      "lost_rate": 0.17577319587628865,
+      "da_mean": 0.5440519281730659,
+      "da_p90": 1.4165418386459347,
+      "a_w_sat": 0.09896907216494845,
+      "elapsed_s": 395.9
+    }
+  }
+}

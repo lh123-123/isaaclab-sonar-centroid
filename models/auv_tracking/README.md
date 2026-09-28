@@ -5,8 +5,12 @@
 | **v0** | `Isaac-AUV-Tracking-Direct-v0` | MLP on belief | Geometric GT → KF | `v0_gt_sb3_sac/model.zip` |
 | **v1 (MLP)** | `Isaac-AUV-Tracking-Direct-v0` | MLP on belief | OceanSim sonar → KF | `v1_sonar_sb3_sac/model.zip` |
 | **v1 vision best** | `Isaac-AUV-Tracking-Direct-v1` | CustomSAC (Actor=sonar img) | OceanSim → KF + image | `v1_vision_sb3_sac_best/model.zip` |
+| **v4-cam 800k** | `Isaac-AUV-Tracking-Direct-v4-cam` | CustomSAC (Actor=14-ch CNN) | Appearance detector → KF | `v4_cam_sb3_sac_800k/model.zip` |
 
 **Naming:** folder `v1_sonar_sb3_sac` is still **Direct-v0** (MLP). Gym **`Isaac-AUV-Tracking-Direct-v1`** is vision SAC. See `v1_vision_sb3_sac_best/README.md` for why later steps underperformed the early peak.
+
+**v4-cam 800k** is frozen at 800k rather than the run's final 1M: a 20-episode eval over 400k/600k/800k/1M from the same run shows 800k best on every geometric metric (`mean_gt_r` 2.15 m, `lost` 0.3 %) while 1M regressed to 3.68 m / 17.6 %. Its Actor input includes **2 channels of GT flow**, so it is not a camera-only policy — and it needs a specific (currently unstaged) encoder revision. Read `v4_cam_sb3_sac_800k/README.md` and its `SOURCE_PIN.md` before using it.
+
 
 Packaged checkpoints were trained in **calm water** (`ocean_current.enabled=false`, the default). Enabling currents changes dynamics without changing obs/network interfaces.
 
