@@ -4,6 +4,7 @@
 - **Run**: `logs/sb3/Isaac-AUV-Tracking-Direct-v1/2026-08-10_12-24-58`
 - **Why this one**: Among saved checkpoints (every 250k), nearest TensorBoard `ep_rew_mean` was highest (~593 @ 240k). Absolute TB peak (~648 @ 380k) had no zip; play eval of this ckpt: ep_ret ≈ 663 (2 episodes, len 199).
 - **Task**: `Isaac-AUV-Tracking-Direct-v1` (Actor=sonar image, Critic=belief state)
+- **Encoder note**: This zip was trained with the **compact CNN** Actor. Current code uses **ResNet50** (Holo-style) — do **not** load this zip into a freshly created ResNet policy; retrain for ResNet50 weights.
 
 ## Play
 

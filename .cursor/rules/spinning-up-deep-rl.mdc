@@ -1,0 +1,29 @@
+---
+name: "RL Algorithm Reference Guide"
+tags: ["deep-rl", "algorithms", "spinning-up", "SAC", "PPO", "DDPG"]
+description: "Reference guide from Spinning Up in Deep RL for RL algorithms, debugging, and experimentation"
+---
+
+# RL Algorithm Reference Guide
+
+## Purpose
+Provides reference materials from OpenAI's "Spinning Up in Deep RL" for:
+- Understanding RL fundamentals and MDPs
+- Model-free algorithm taxonomy
+- Policy gradient derivations
+- Six reference algorithms (VPG, TRPO, PPO, DDPG, TD3, SAC)
+- Debugging RL code
+- Running multi-seed experiments
+
+## When to Apply
+- Implementing or modifying RL algorithms
+- Debugging RL training instability
+- Selecting appropriate algorithms for tasks
+- Designing reward functions
+- Setting hyperparameters for RL training
+
+## Reference Materials
+- Policy gradient methods and derivations
+- Algorithm comparison guidelines
+- Common debugging strategies for RL
+- Experimental design principles

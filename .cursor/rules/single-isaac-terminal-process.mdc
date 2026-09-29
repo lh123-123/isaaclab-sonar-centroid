@@ -20,4 +20,5 @@ alwaysApply: true
 ## 脚本
 
 - 启动 guard：`scripts/lib/ensure_single_isaac_process.sh`（已被 sonar debug/eval 脚本 source）
+- Agent 钩子：`.cursor/hooks/block-second-isaac.sh`（`beforeShellExecution`，已有 Isaac 时拒绝再启动）
 - 清理：`./scripts/kill_isaac_lab_processes.sh`

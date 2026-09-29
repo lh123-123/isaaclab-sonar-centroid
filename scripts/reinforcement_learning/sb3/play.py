@@ -46,6 +46,14 @@ parser.add_argument(
 )
 parser.add_argument("--real-time", action="store_true", default=False, help="Run in real-time, if possible.")
 parser.add_argument(
+    "--kf_measurement",
+    type=str,
+    default=None,
+    choices=["gt", "sonar"],
+    help="AUV-Tracking Direct-v0 KF measurement: geometric GT (fast) or OceanSim sonar.",
+)
+parser.add_argument("--steps", type=int, default=None, help="Number of env steps to play (default: until app closes).")
+parser.add_argument(
     "--keep_all_info",
     action="store_true",
     default=False,
@@ -56,8 +64,14 @@ AppLauncher.add_app_launcher_args(parser)
 # parse the arguments
 args_cli, hydra_args = parser.parse_known_args()
 
-# cameras required for video and for OceanSim sonar tasks (AUV tracking)
-if args_cli.video or (args_cli.task is not None and "AUV-Tracking" in args_cli.task):
+# cameras required for video, Direct-v1 vision, or OceanSim sonar KF
+_needs_cameras = bool(args_cli.video)
+if args_cli.task is not None and "AUV-Tracking" in args_cli.task:
+    if "Direct-v1" in args_cli.task:
+        _needs_cameras = True
+    elif args_cli.kf_measurement != "gt":
+        _needs_cameras = True
+if _needs_cameras:
     args_cli.enable_cameras = True
 
 # clear out sys.argv for Hydra
@@ -113,6 +127,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # note: certain randomizations occur in the environment initialization so we set the seed here
     env_cfg.seed = agent_cfg["seed"]
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
+    if args_cli.kf_measurement is not None and hasattr(env_cfg, "kf_measurement"):
+        env_cfg.kf_measurement = args_cli.kf_measurement
 
     # directory for logging into
     log_root_path = os.path.join("logs", "sb3", train_task_name)
@@ -169,13 +185,18 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         env.training = False
         # reward normalization is not needed at test time
         env.norm_reward = False
-    elif "normalize_input" in agent_cfg:
+    elif bool(agent_cfg.get("normalize_input", False)):
+        print(f"Normalizing input, clip_obs={agent_cfg.get('clip_obs', 100.0)}")
         env = VecNormalize(
             env,
-            training=True,
-            norm_obs="normalize_input" in agent_cfg and agent_cfg.pop("normalize_input"),
-            clip_obs="clip_obs" in agent_cfg and agent_cfg.pop("clip_obs"),
+            training=False,
+            norm_obs=True,
+            norm_reward=False,
+            clip_obs=float(agent_cfg.pop("clip_obs", 100.0)),
         )
+    # Drop any leftover norm keys so they don't leak into the agent constructor.
+    for _k in ("normalize_input", "normalize_value", "clip_obs"):
+        agent_cfg.pop(_k, None)
 
     # create agent from stable baselines
     print(f"Loading checkpoint from: {checkpoint_path}")
@@ -183,29 +204,70 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     agent = algo_cls.load(checkpoint_path, env, print_system_info=True)
 
     dt = env.unwrapped.step_dt
+    core = env.unwrapped
+    if not hasattr(core, "_robot"):
+        core = getattr(core, "unwrapped", core)
 
     # reset environment
     obs = env.reset()
     timestep = 0
+    rew_sum = 0.0
+    done_count = 0
+    auv_spd, tgt_spd, cmd_vs = [], [], []
+    max_steps = args_cli.steps if args_cli.steps is not None else (args_cli.video_length if args_cli.video else None)
     # simulate environment
     while simulation_app.is_running():
         start_time = time.time()
         # run everything in inference mode
         with torch.inference_mode():
-            # agent stepping
             actions, _ = agent.predict(obs, deterministic=True)
-            # env stepping
-            obs, _, _, _ = env.step(actions)
-        if args_cli.video:
-            timestep += 1
-            # Exit the play loop after recording one video
-            if timestep == args_cli.video_length:
-                break
+            obs, rewards, dones, infos = env.step(actions)
+        timestep += 1
+        r_mean = float(rewards.mean()) if hasattr(rewards, "mean") else float(rewards)
+        rew_sum += r_mean
+        n_done = int(dones.sum()) if hasattr(dones, "sum") else int(bool(dones))
+        done_count += n_done
+        v_auv = v_tgt = cmd_v = cmd_w = float("nan")
+        if hasattr(core, "_robot") and hasattr(core, "_target_state"):
+            lin_w = core._robot.data.root_lin_vel_w
+            v_auv = float(torch.linalg.norm(lin_w[:, :2], dim=-1).mean())
+            v_tgt = float(torch.linalg.norm(core._target_state[:, 2:4], dim=-1).mean())
+            cmd = core._cmd_vel
+            cmd_v = float(cmd[:, 0].mean())
+            cmd_w = float(cmd[:, 1].mean())
+            auv_spd.append(v_auv)
+            tgt_spd.append(v_tgt)
+            cmd_vs.append(cmd_v)
+        if timestep % 50 == 0 or n_done:
+            print(
+                f"[play] step={timestep:4d}  mean_rew={r_mean:7.3f}  "
+                f"avg_rew={rew_sum / timestep:7.3f}  dones={done_count}  "
+                f"auv_xy={v_auv:.3f} m/s  tgt_xy={v_tgt:.3f} m/s  cmd_v={cmd_v:.3f} cmd_w={cmd_w:.3f}",
+                flush=True,
+            )
+        if args_cli.video and timestep >= args_cli.video_length:
+            break
+        if max_steps is not None and timestep >= max_steps:
+            break
 
         # time delay for real-time evaluation
         sleep_time = dt - (time.time() - start_time)
         if args_cli.real_time and sleep_time > 0:
             time.sleep(sleep_time)
+
+    avg = rew_sum / max(timestep, 1)
+    print(f"[play] done steps={timestep}  mean_step_rew={avg:.3f}  approx_ep_rew={avg * 200:.1f}  env_dones={done_count}")
+    if auv_spd:
+        import numpy as np
+        print(
+            f"[play] AUV |v_xy| mean={float(np.mean(auv_spd)):.3f} max={float(np.max(auv_spd)):.3f} "
+            f"cmd_v mean={float(np.mean(cmd_vs)):.3f} max={float(np.max(np.abs(cmd_vs))):.3f}",
+            flush=True,
+        )
+        print(
+            f"[play] TGT |v_xy| mean={float(np.mean(tgt_spd)):.3f} max={float(np.max(tgt_spd)):.3f}",
+            flush=True,
+        )
 
     # close the simulator
     env.close()

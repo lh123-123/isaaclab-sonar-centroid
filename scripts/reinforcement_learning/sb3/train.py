@@ -37,6 +37,16 @@ parser.add_argument("--seed", type=int, default=None, help="Seed used for the en
 parser.add_argument("--log_interval", type=int, default=100_000, help="Log data every n timesteps.")
 parser.add_argument("--checkpoint", type=str, default=None, help="Continue the training from checkpoint.")
 parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy training iterations.")
+parser.add_argument(
+    "--kf_measurement",
+    type=str,
+    default=None,
+    choices=["gt", "sonar"],
+    help="AUV-Tracking Direct-v0 KF measurement: geometric GT (fast) or OceanSim sonar.",
+)
+parser.add_argument("--rew_speed", type=float, default=None, help="Override rew_scale_speed (v2 speed match).")
+parser.add_argument("--rew_ref", type=float, default=None, help="Override rew_scale_ref (v2 reference distance).")
+parser.add_argument("--rew_ref_sigma", type=float, default=None, help="Override rew_ref_sigma (v2 ref gaussian width).")
 parser.add_argument("--export_io_descriptors", action="store_true", default=False, help="Export IO descriptors.")
 parser.add_argument(
     "--keep_all_info",
@@ -48,8 +58,18 @@ parser.add_argument(
 AppLauncher.add_app_launcher_args(parser)
 # parse the arguments
 args_cli, hydra_args = parser.parse_known_args()
-# cameras required for video and for OceanSim sonar tasks (AUV tracking)
-if args_cli.video or (args_cli.task is not None and "AUV-Tracking" in args_cli.task):
+# cameras required for video and for OceanSim sonar / Direct-v1 vision
+_needs_cameras = bool(args_cli.video)
+if args_cli.task is not None and "AUV-Tracking" in args_cli.task:
+    if "Direct-v1" in args_cli.task or "Direct-v2" in args_cli.task:
+        _needs_cameras = True
+    elif "Direct-v3-cam" in args_cli.task:
+        # The RGB camera *is* the policy observation. The KF uses geometric GT here, so
+        # the sonar branch below must not be what decides this.
+        _needs_cameras = True
+    elif args_cli.kf_measurement != "gt":
+        _needs_cameras = True
+if _needs_cameras:
     args_cli.enable_cameras = True
 
 # clear out sys.argv for Hydra
@@ -90,6 +110,8 @@ from typing import Any
 import omni
 from stable_baselines3 import PPO, SAC
 from stable_baselines3.common.callbacks import CheckpointCallback, LogEveryNTimesteps
+
+from isaaclab_tasks.direct.isaac_auv_tracking.agents.gate_log_callback import CriticGateLogCallback
 from stable_baselines3.common.noise import NormalActionNoise
 from stable_baselines3.common.vec_env import VecNormalize
 
@@ -154,6 +176,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # note: certain randomizations occur in the environment initialization so we set the seed here
     env_cfg.seed = agent_cfg["seed"]
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
+    if args_cli.kf_measurement is not None and hasattr(env_cfg, "kf_measurement"):
+        env_cfg.kf_measurement = args_cli.kf_measurement
+    if args_cli.rew_speed is not None and hasattr(env_cfg, "rew_scale_speed"):
+        env_cfg.rew_scale_speed = args_cli.rew_speed
+    if args_cli.rew_ref is not None and hasattr(env_cfg, "rew_scale_ref"):
+        env_cfg.rew_scale_ref = args_cli.rew_ref
+    if args_cli.rew_ref_sigma is not None and hasattr(env_cfg, "rew_ref_sigma"):
+        env_cfg.rew_ref_sigma = args_cli.rew_ref_sigma
 
     # directory for logging into
     run_info = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -271,7 +301,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         f"(≈{ckpt_every * num_envs} transitions, {num_envs} envs)"
     )
     checkpoint_callback = CheckpointCallback(save_freq=ckpt_every, save_path=log_dir, name_prefix="model", verbose=2)
-    callbacks = [checkpoint_callback, LogEveryNTimesteps(n_steps=args_cli.log_interval)]
+    callbacks = [checkpoint_callback, LogEveryNTimesteps(n_steps=args_cli.log_interval), CriticGateLogCallback()]
 
     # train the agent
     # reset_num_timesteps=False: keep counter so learn() stops at total n_timesteps (true resume).

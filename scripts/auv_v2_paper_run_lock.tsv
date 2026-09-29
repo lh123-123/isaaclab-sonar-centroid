@@ -1,0 +1,12 @@
+# Canonical (task, seed) → run directory for the Direct-v2 paper 1M series.
+# Resume and eval MUST use these folders. Do not pick "newest zip in the task dir".
+# Columns: task<TAB>seed<TAB>run_dir (relative to IsaacLab root)
+#
+# Locked now (already exist):
+Isaac-AUV-Tracking-Direct-v2	42	logs/sb3/Isaac-AUV-Tracking-Direct-v2/2026-09-14_12-28-05
+Isaac-AUV-Tracking-Direct-v2	66	logs/sb3/Isaac-AUV-Tracking-Direct-v2/2026-09-08_12-37-33
+Isaac-AUV-Tracking-Direct-v2-image	66	logs/sb3/Isaac-AUV-Tracking-Direct-v2-image/2026-09-11_13-03-32
+Isaac-AUV-Tracking-Direct-v2-state	66	logs/sb3/Isaac-AUV-Tracking-Direct-v2-state/2026-09-11_19-58-51
+Isaac-AUV-Tracking-Direct-v2	7	logs/sb3/Isaac-AUV-Tracking-Direct-v2/2026-09-14_20-54-11
+Isaac-AUV-Tracking-Direct-v2-image	7	logs/sb3/Isaac-AUV-Tracking-Direct-v2-image/2026-09-15_03-56-49
+Isaac-AUV-Tracking-Direct-v2	123	logs/sb3/Isaac-AUV-Tracking-Direct-v2/2026-09-15_10-40-20

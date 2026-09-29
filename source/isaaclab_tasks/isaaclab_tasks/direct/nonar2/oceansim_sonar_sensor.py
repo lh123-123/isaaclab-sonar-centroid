@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 
 import torch
 import torch.nn.functional as F
@@ -450,15 +451,17 @@ class OceanSimSonarSensor:
 
                 except RuntimeError as e:
                     print(f"ERROR: CUDA/Warp error in env {env_idx}: {e}", flush=True)
+                    self._abort_on_fatal_cuda(e, env_idx=env_idx, where="update")
                     self._handle_empty_frame(env_idx, force_zeros=True)
-                    if self.device.startswith("cuda"):
-                        torch.cuda.synchronize()
                 except Exception as e:
                     print(f"ERROR: Unexpected error in env {env_idx}: {type(e).__name__}: {e}", flush=True)
                     self._handle_empty_frame(env_idx, force_zeros=True)
                 finally:
                     if self.num_envs > 1 and self.device.startswith("cuda"):
-                        torch.cuda.synchronize()
+                        try:
+                            torch.cuda.synchronize()
+                        except RuntimeError as e:
+                            self._abort_on_fatal_cuda(e, env_idx=env_idx, where="update.synchronize")
     
     def _check_annotator_health(self, sensor):
         """检查注释器是否健康
@@ -493,10 +496,27 @@ class OceanSimSonarSensor:
         except Exception as e:
             return False
     
+    @staticmethod
+    def _is_fatal_cuda_error(exc: BaseException) -> bool:
+        msg = str(exc).lower()
+        return "illegal memory access" in msg or "device-side assertions triggered" in msg
+
+    @staticmethod
+    def _abort_on_fatal_cuda(exc: BaseException, *, env_idx: int, where: str) -> None:
+        if OceanSimSonarSensor._is_fatal_cuda_error(exc):
+            print(
+                f"FATAL: [env {env_idx}] unrecoverable CUDA error in {where}: {exc} — exiting for watchdog restart",
+                flush=True,
+            )
+            os._exit(1)
+
     def _fill_zero_frame(self, env_idx: int) -> None:
         """Safe fallback when GPU sonar buffers may be corrupted."""
-        self._sonar_image[env_idx].zero_()
-        self._beam_data[env_idx].zero_()
+        try:
+            self._sonar_image[env_idx].zero_()
+            self._beam_data[env_idx].zero_()
+        except RuntimeError as e:
+            self._abort_on_fatal_cuda(e, env_idx=env_idx, where="_fill_zero_frame")
 
     def _handle_empty_frame(self, env_idx: int, *, force_zeros: bool = False) -> None:
         """Handle failed sonar frames without cloning potentially corrupted CUDA tensors."""
@@ -515,7 +535,8 @@ class OceanSimSonarSensor:
                 self._beam_data[env_idx].copy_(self._last_valid_beam_data[env_idx])
             else:
                 self._beam_data[env_idx].zero_()
-        except RuntimeError:
+        except RuntimeError as e:
+            self._abort_on_fatal_cuda(e, env_idx=env_idx, where="_handle_empty_frame")
             self._fill_zero_frame(env_idx)
     
     def debug_info(self):

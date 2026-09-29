@@ -25,7 +25,8 @@ alwaysApply: true
 
 ## 已对齐要点
 
-- reward / is_col / done-by-reward / episode≈200 / init a2t±π/5
+- reward / is_col / done-by-reward / episode≈200
+- init a2t：**声呐叶瓣中央** `[1.5,2.5] m × ±π/10`（用户指定；Holo 原为 `[1,4] × ±π/5`，贴 4 m 量程边）
 - workspace **±20** + `margin2wall=1`
 - belief init **t2b** polar `[0,2]` × `±π/2`
 - KF **state clip**（XY 工作区 + vel±3）

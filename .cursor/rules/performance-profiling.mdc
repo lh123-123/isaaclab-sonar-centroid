@@ -1,0 +1,31 @@
+---
+name: "Performance Profiling Guide"
+tags: ["performance", "profiling", "optimization", "python", "pytorch"]
+description: "Guidelines for systematic performance profiling and optimization"
+---
+
+# Performance Profiling Guide
+
+## Purpose
+Systematic approach to identifying and resolving performance bottlenecks in applications, especially for Python and PyTorch code.
+
+## Core Capabilities
+- CPU profiling (flamegraphs)
+- Memory profiling and leak detection
+- Load testing with k6/Artillery
+- Before/after measurement
+- Bottleneck identification
+
+## Golden Rule: Measure First
+Always establish a baseline before optimization:
+- Record P50, P95, P99 latency
+- Monitor RPS (requests per second)
+- Track error rates
+- Measure memory usage
+
+## When to Apply
+- Application is slower than expected
+- High memory consumption
+- Long training times in ML projects
+- Preparing for increased traffic/load
+- Investigating performance regressions
