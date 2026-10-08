@@ -1,0 +1,84 @@
+# SPDX-License-Identifier: BSD-3-Clause
+# Direct-v6-flowvec SAC: the actor's input is the (frame_stack * 6,) float32 vector of the
+# analytic flow numbers that the v5 raster is merely a picture of -- u/W, v/H, rad/12, du, dv,
+# validity per frame, 24 dims at K=4. The extractor is FlowVectorExtractor (Linear + LayerNorm +
+# Tanh), so there is no convolution anywhere in the policy.
+#
+# This config is sb3_sac_v5_flow_cfg.yaml with exactly TWO edits, both forced by the input change:
+#   * features_extractor_class -> flow_vec_encoder.FlowVectorExtractor
+#     (and its kwargs, which no longer take use_sparse_flow)
+#   * buffer_size stays at 8000, but for a completely different reason -- see the RAM note; at 96
+#     bytes per observation it is now ~1.5 MB, i.e. free. It is kept at the v5 value so the
+#     v5-vs-v6 comparison holds every hyperparameter fixed and only the representation moves.
+#
+# Read the v5 config (`sb3_sac_v5_flow_cfg.yaml`) for the full derivation of the hyperparameters
+# -- the HoloOcean sac_v1 alignment, the asymmetric actor/critic rationale, and the deviations.
+# Everything in that file applies here unchanged; only the two items above differ, so they are the
+# only things restated in detail below.
+
+seed: 66
+n_timesteps: 1000000
+# Holo v1's asymmetric policy: actor on the flow vector, critic on the belief state.
+policy: "isaaclab_tasks.direct.isaac_auv_tracking.agents.custom_sac_policy.CustomSACPolicy"
+
+learning_rate: 0.0001
+# Matches v5-flow (which matches the v4_cam_sb3_sac_800k snapshot) so the two representations are
+# compared at equal budget. See the RAM note below: this number is now RAM-free, so it is worth a
+# separate sweep, but NOT in the same run that is meant to isolate the representation.
+buffer_size: 8000
+learning_starts: 1000
+batch_size: 256
+tau: 0.005
+gamma: 0.99
+train_freq: 1
+gradient_steps: 1
+ent_coef: "auto"
+target_entropy: "auto"
+target_update_interval: 10
+normalize_input: false
+normalize_value: false
+
+use_action_noise: true
+action_noise_std: 0.05
+
+policy_kwargs:
+  # MUST stay false: CustomSACPolicy.make_critic ignores any extractor and returns a StateCritic
+  # over obs["state"]. Sharing would be meaningless here (the critic never touches the encoder) and
+  # would make SB3 hand the actor's extractor to make_critic.
+  share_features_extractor: false
+  # Unchanged from v5 on purpose. `pi` now takes a 512-D vector rather than a 512-D CNN latent, so
+  # the architecture is identical and only what feeds it differs.
+  net_arch:
+    pi: [512, 256, 256]
+    qf: [512, 256]
+  features_extractor_class: "isaaclab_tasks.direct.isaac_auv_tracking.agents.flow_vec_encoder.FlowVectorExtractor"
+  features_extractor_kwargs:
+    # Same width as v5's CNN latent, so `pi` is untouched and the head sees a like-for-like input.
+    # The extractor is Linear(20 -> 512) + LayerNorm + Tanh = ~10.8K params, versus the CNN's
+    # 481,856 -- a 45x reduction in the actor's encoder.
+    features_dim: 512
+  # NOTE: `normalize_images` is deliberately left at SB3's default (True) and is inert here.
+  # SB3 only normalises spaces that `is_image_space` accepts, which requires uint8 + [0, 255] AND
+  # a 1/3/4-channel shape. This observation is a 1-D float32 Box, so `preprocess_obs` is the
+  # identity on it. `scripts/debug_auv_v6_flowvec_obs.sh` asserts that rather than assuming it.
+
+device: "cuda:0"
+
+# ---------------------------------------------------------------------------------------------
+# RAM note (replaces v5's, which was the binding constraint there)
+#
+# SB3's DictReplayBuffer keeps TWO copies (observations and next_observations) of ONE observation:
+#     image  :  24 * 4 B (float32 flow vector)  =  96 B
+#     state  :   4 * 4 B (float32 belief)       =  16 B
+#                                         total = 112 B
+# so a buffer of N transitions costs N * 2 * 112 B:
+#   buffer_size=  8000 => 1.7 MiB   (the value above)
+#   buffer_size=426667 => 91.2 MiB  (the Direct-v0-matched budget at 64 envs)
+# v5's raster scheme cost 131088 B per observation, i.e. 1170x more, which is what forced v5 down
+# to 8000. That constraint is gone: at 112 B the buffer is negligible and buffer_size is a pure
+# hyperparameter, not a memory decision. It is left at 8000 here only to keep the comparison with
+# v5 clean -- raise it in a *separate* run once the representation question is settled.
+#
+# `buffer_size` is still the TOTAL transition count, NOT per environment (DictReplayBuffer
+# allocates `np.zeros((buffer_size // num_envs, num_envs, *shape))`, so num_envs only reshapes the
+# array; verified against SB3 2.8).
