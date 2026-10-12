@@ -19,8 +19,11 @@
 #   * ocean currents OFF. Do NOT add `env.ocean_current.enabled=true` here.
 #   * target speed ALIGNED to v0: constant 0.5 m/s cruise / 0.6 ceiling, no accel limit
 #   * NOT touched: cold-start 0-3 s + easy leash 3-5 s + free RRT.
-#   * Reward: the 800k snapshot's Holo-bounded shaping -- uncertainty 0.2 * -log det Sigma, plus
-#     range 0.2 (sigma 0.6), bearing 0.3, action-delta 0.02, lost 0.50, all `clamp(max=1.0)`.
+#   * Reward (2026-10-09 first-principles revision, see the env cfg): alive 1.0
+#     + bearing 1.1 * exp(-(a/15deg)^2) + size-ratio 1.0 * exp(-(log s / 0.5)^2)
+#     - action-delta 0.03. The 800k-era shaping (uncertainty/range/bearing/lost with
+#     clip=1.0) is gone; termination (OOV streak / envelope / timeout) replaces the
+#     lost penalty. No one-time OOV terminal penalty.
 #   * KF measurement is the appearance/depth path ("cam"), not GT. World-velocity matching stays
 #     disabled: on a surge+yaw vehicle it produced parallel, off-centre following.
 #
@@ -29,12 +32,10 @@
 # still required and the KF is unaffected by the observation change.
 #
 # RAM note: SB3 keeps 2 copies of every observation (obs + next_obs) and ONE observation is
-# 131088 B (float32 flow stack 131072 + belief 16), so the buffer costs
-# buffer_size * 2 * 131088 B. `buffer_size` is the TOTAL transition count, NOT per env, so
-# num_envs does not affect it: the shipped 8000 is 1.95 GiB. That is 4 bytes/pixel/step versus the
-# v4-cam scheme's 1, which is exactly why the shipped buffer_size is 8000 and not v4-cam's 15000.
-# Run `scripts/debug_auv_cam_spaces.sh --task Isaac-AUV-Tracking-Direct-v5-flow` for the live
-# figure.
+# 81944 B (float32 5ch flow+mask stack 81920 + state 24), so the buffer costs
+# buffer_size * 2 * 81944 B. `buffer_size` is the TOTAL transition count, NOT per env.
+# 2026-10-12: buffer_size=106667 with gradient_steps=5 (the measured anti-dilution setting,
+# 16.3 GiB) -- see sb3_sac_v5_flow_cfg.yaml for the derivation.
 #
 # The v0 defaults are kept for the knobs Direct-v3-cam turned on. To match that run, add:
 #   env.dyn_time_constant=0.2 env.thruster_first_order_lag=true \

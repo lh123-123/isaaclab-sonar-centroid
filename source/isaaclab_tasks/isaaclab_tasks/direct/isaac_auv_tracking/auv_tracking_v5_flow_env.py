@@ -217,6 +217,8 @@ class AUVTrackingV5FlowEnvCfg(AUVTrackingEnvCfg):
     rew_penalty_bearing: float = 0.0
     rew_penalty_lost: float = 0.0
     rew_penalty_action_delta: float = 0.0
+    # v5 不消费这些基类罚分键（_compute_step_reward 不调 super）；显式置 0 只为
+    # 防止 yaml/继承链把它们重新打开。OOV 终止罚分已彻底删除，见下方 oov_limit_steps 注释。
     rew_penalty_oov_terminal: float = 0.0
     # 新奖励三项（有界、处处可导、无死区）：
     rew_alive: float = 1.0            # 每存活一步
@@ -299,8 +301,10 @@ class AUVTrackingV5FlowEnvCfg(AUVTrackingEnvCfg):
     flow_min_lit_px: int = 20
     # Consecutive steps with no flow-detected target before the episode terminates.
     oov_limit_steps: int = 10
-    # One-time penalty on the terminating step (matches v0's rew_c_penalty vocabulary).
-    rew_penalty_oov_terminal: float = 5.0
+    # NOTE: the one-time OOV terminal penalty was deliberately removed from v5's reward
+    # (see the reward block above -- termination itself already drops all future alive
+    # reward). The field is NOT consumed by _compute_step_reward here; do not re-add a
+    # value and assume a penalty exists (v6_flowvec defines and consumes its own).
     # Mirror the robot's simulated pose into the robot prim's USD xform every render step.
     # Required: with replicate_physics=True PhysX writes poses to Fabric and never updates USD,
     # so the camera (a child prim, not a rigid body) would otherwise inherit a frozen transform
