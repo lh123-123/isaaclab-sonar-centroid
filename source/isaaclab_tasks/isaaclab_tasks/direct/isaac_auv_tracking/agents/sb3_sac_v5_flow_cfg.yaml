@@ -2,9 +2,9 @@
 # Direct-v5-flow SAC (R8): the actor sees a (frame_stack*2 + 1, 64, 64) float32 stack --
 # K=2 RAFT optical-flow frames (4 ch) plus the 1-channel orange-appearance mask, i.e. 5
 # channels into the first convolution. (The flow is RAFT-estimated from consecutive renders
-# by default; the analytic GT stamp is the flow_source="gt" ablation.) One variable differs
-# from Direct-v4-cam: buffer_size, cut from 15000 to 8000 because float32 flow costs 4x the
-# bytes per pixel of the uint8 RGB it replaces (see the RAM note below). Every hyperparameter
+# by default; the analytic GT stamp is the flow_source="gt" ablation.) Two variables differ
+# from Direct-v4-cam: buffer_size and gradient_steps (2026-10-12, see the dilution note by the
+# buffer_size block below). Every other hyperparameter
 # is otherwise identical to sb3_sac_v4_cam_cfg.yaml so a run here is comparable to the
 # v4_cam_sb3_sac_800k baseline.
 #
@@ -65,11 +65,18 @@
 #     state  :            6 * 4 B (float32 belief + ego vel)  =    24 B
 #                                               total = 81944 B
 # so a buffer of N transitions costs N * 2 * 81944 B:
-#   buffer_size=  8000 => 1.31 GiB
+#   buffer_size=106667 => 17.48 GiB (host numpy memory; remote box has 52 GiB available)
 # For reference, the v4-cam scheme was 16400 B/transition (uint8 image), so the same
-# buffer_size=8000 there was 0.25 GiB.
-# Dropping to 8000 (from v4-cam's 15000) keeps this comfortably inside the ~8 GiB of available
-# host RAM on the 15 GiB machine this is trained on.
+# buffer_size there was 0.25 GiB.
+#
+# 2026-10-12: buffer_size and gradient_steps were set from the measured "learning-budget
+# dilution" result on this task (v0: matching gradient_steps=n_envs/3 and
+# buffer_size=6667*n_envs reproduced the original 3-env SAC; diluting either stalled it).
+#   gradient_steps=5      ~= n_envs/3, restoring 312k updates over 1M steps
+#   buffer_size=106667    => 106667/16 = 6667 vec-steps of buffer horizon (5x more updates
+#                            and 6.7x longer horizon than the gs=1/16000 draft).
+# The earlier "15 GiB machine" RAM rationale is obsolete -- the training host reports
+# 62 GB total / 52 GB available.
 
 # IMPORTANT: `buffer_size` is the TOTAL number of transitions, NOT per environment.
 # DictReplayBuffer allocates `np.zeros((buffer_size // num_envs, num_envs, *shape))`, so num_envs
@@ -92,9 +99,10 @@ policy: "isaaclab_tasks.direct.isaac_auv_tracking.agents.custom_sac_policy.Custo
 learning_rate: 0.0001
 # 1M steps / seed 66 / learning_starts 1000 are the v4_cam_sb3_sac_800k values, kept so the two
 # schemes are compared at equal budget. Only buffer_size moves, for the RAM reason above.
-# 16 envs (2026-10-09): buffer doubled so per-env history stays 1000 steps
-# (16000//16), same as 8000//8 before. 16000 * 2 * 81944 B = 2.62 GiB, fine on 62 GB RAM.
-buffer_size: 16000
+# 16 envs (2026-10-12): raised to 106667 so the buffer horizon is 106667//16 = 6667
+# vec-steps (the measured sweet spot on this task); footprint 106667 * 2 * 81944 B = 17.5 GiB,
+# fine on the 62 GB training host.
+buffer_size: 106667
 # 1000 total = 125 steps/env at 8 envs. Matches the 800k snapshot (and Holo's single-env
 # config).
 learning_starts: 1000
@@ -102,7 +110,9 @@ batch_size: 256
 tau: 0.005
 gamma: 0.99
 train_freq: 1
-gradient_steps: 1
+# 5 ~= n_envs/3: with train_freq=1 this gives (1M-1k)/16*5 ~= 312k gradient updates,
+# matching the update-density the dilution experiments identified as necessary on this task.
+gradient_steps: 5
 ent_coef: "auto"
 target_entropy: "auto"
 target_update_interval: 10
