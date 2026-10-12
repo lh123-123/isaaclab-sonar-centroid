@@ -31,6 +31,9 @@ alwaysApply: true
 - belief init **t2b** polar `[0,2]` × `±π/2`
 - KF **state clip**（XY 工作区 + vel±3）
 - 目标速度：**cruise U[0.5,1.0]**，峰值 `×1.2`，`max_accel=1.0`（贴近 BlueROV 包络）
+ - 已实现（2026-09-18）：`target_cruise_spread` / `target_peak_factor` / `target_max_accel`
+ （基类默认 `1.0/0.0/0.0` = 完全等价 Holo 恒定 0.5，故 v0 不受影响；v4-cam 里开启 `2.0/1.2/1.0`）。
+ 每 episode 在 `reset` 采样一次，**冷启动/reset 调度（3s 斜坡 + 3–5s 软绳）逐字未动**。
 - KF **measurement**：OceanSim 声纳（cold-start 全局 → belief gate + intensity centroid + range bias），不再用几何 GT；obs/网络接口不变
 - 整合场景适配（r=0.35）：`skip_median_filter=True`、target reflectivity=2.0、gain↑、OceanSim `max_range=4m`（对齐 Holo sensor_range，避开远距杂波）
 
@@ -38,3 +41,145 @@ alwaysApply: true
 
 - 平台 WarpAUV；Isaac 多 env；深度 z≈8 vs Holo fix_depth≈-15。
 - 洋流走现有密度/粘性力的 \(v_{\mathrm{rel}}\)，不是 Holo UE `OceanCurrentsCommand`。
+
+## 踩过的坑（v3-cam 复盘；**务必实测效应，不报错的才是真坑**）
+
+1. **子 prim 位姿冻结**：`replicate_physics=True` 下 PhysX 只写 Fabric、不写 USD；非刚体的子 prim（相机等）渲染时只从 USD 解析 → 位姿永久冻结（页面完全不动，但不报错）。对策：在渲染 substep 用 `XFormPrim.set_world_poses(..., usd=True)` 把父刚体的 sim 位姿回写 USD（见 `auv_tracking_cam_env.py::_sync_robot_usd_pose`）。
+2. **`apply_nested` 跳过 instance prim**：`source/isaaclab/isaaclab/sim/utils.py:193`（及 `:569`）对 `IsInstance()` 直接 `continue`。所以往 AUV 的 `collisions`（instance prim）写 `collision_enabled` 是**空操作且不报错**。别对 instance prim 写属性。
+3. **上游动力学开关可能是空操作**：`thruster_dynamics.py` 曾用 `alpha = torch.zeros_like(dt)` 让一阶滞后完全失效（状态永远等于指令）。开任何 lag / 滤波都要验证响应曲线，别信参数名。
+4. **SB3 会自己归一化图像**：`preprocess_obs` 对「uint8 且 0–255 的三维 Box」直接 `/255`。`is_image_space` 的 `check_channels` **默认为 False**，所以**非 1/3/4 通道也被判为图像**。features extractor 里再除一次 → 输入被压到 `[0, 0.0039]`，策略学不动。写法照 `sonar_encoder.SonarEncoder` 的 guard：`dtype==uint8` 时除，否则 `max>1.5` 才除。
+5. **超参由调用点定义，别照库文档推断**：`--log_interval` 走 `scripts/reinforcement_learning/sb3/train.py` 的 `LogEveryNTimesteps`（**按 step**），同时把 SB3 自带那个（**按 episode**）设为 `None`。
+6. **读空间要读单 env 的**：`env.observation_space` 是**批维** `(num_envs, ...)`，`shape[0]` 是 num_envs 不是通道数；SB3 用 `unwrapped.single_observation_space["policy"]`（`isaaclab_rl/sb3.py::_process_spaces`）。且 `gym.spaces.Dict` 继承 `Mapping` 而非 `dict`，`isinstance(x, dict)` 为 **False**。
+7. **改观测表示要扫所有消费者**，包括临时 debug 脚本（`scripts/debug_auv_cam_*.py` 里存在 shape/dtype 断言）。
+8. **watchdog 自动续训会静默污染曲线**（2026-09-29 实测）：`scripts/watchdog_train_auv_tracking_sb3_sac_v4.sh`
+   会守着训练 —— 停滞 `STALL_SEC=600` / 非零退出 / 启动超时 → kill 并从**本 session 最新 checkpoint** 续跑。
+   该 session 的日志在 `/home/lh/auv_v4_16env/{watchdog.out,train.log}`（**不是** `/tmp/auv_v4_cam_watchdog.log`，
+   那是别的 session）。四个后果：
+   - **同一个 `SAC_1` 目录里混着多段独立运行**，TensorBoard 曲线是拼接的，看着像连续退化、其实中间断过。
+     09-28 22:22–22:31 **9 分钟重启 11 次（间隔 37s）** → 之前误判为"用户手动起了多个进程"，
+     实为 watchdog 内循环。**排查"训练退化"前先 `grep "watchdog attempt"`**。
+   - SB3 `--checkpoint` **只恢复权重、不恢复 replay buffer**。续跑 = 已训练的 actor + 空缓冲区，
+     critic 从零重估 Q。`buffer_size=30000` 时伤害有限，但无人值守长跑必须知道。
+   - **kill 训练杀不掉**：只杀 bash 包装进程时 watchdog 会立刻从 checkpoint 再起一个。
+     **必须先杀 watchdog，再杀训练**（用精确 PID）。
+   - 附带：`pkill -f <pattern>` 的模式串若出现在自己的命令行里，会**自杀 ssh shell**（exit 255）。
+     用 `[t]rain[.]py` 括号技巧或精确 PID。
+   - **但别反射性地拿它解释一切**：本次 11:51→13:57 实测 `attempt=1` 连续跑完 500k、
+     `exit_code=143`（=128+15 SIGTERM，人工 kill），**零中途重启** → 那次 +121→−145 的崩塌是
+     **真实不稳定**，不能归因 watchdog。查证：`grep -E "exit_code|attempt="`。
+9. **高 `num_envs` 会砍掉学习量 —— 这是 v0 跑不好的真正原因**（2026-09-29，对照原始 HoloOcean 源码
+   `/home/lh/IsaacLab/drltrakc/RL_AUV_tracking` 得出）。原始 v0 **从没用过 3 个以上环境**
+   （`configs/algorithm/sac.yml` 与 `sac_v0_fast.yml` 都是 `nb_envs: 3`），跑 2M 步共
+   **12.1 小时**（`log/AUVTracking_v0/PID/SAC/08-02_15/monitor.csv` 末行 `t=43735s`，
+   10039 episodes × 200 = 2.008M 样本 ✓），**稳定在 ep_rew ≈ +684，2M 步零退化**。
+   在 `train_freq=1, gradient_steps=1` 下，两个量决定"学了多少"：
+   ```
+   n_updates      = (timesteps − learning_starts) / n_envs × gradient_steps
+   buffer 时域     = buffer_size / n_envs            (vec-step 数)
+   ```
+   | 运行 | envs | timesteps | n_updates | buffer 时域 | 结果 |
+   |---|---|---|---|---|---|
+   | 原始 HoloOcean v0 | 3 | 2M | **665k** | 6667 步 | **+684** 稳定 |
+   | Isaac v0 (09-19) | 64 | 3M | **46.8k** | **312 步** | +358 停滞 |
+   | Isaac v4-cam | 16 | 2M | 125k | 937 步 | +121→−145 |
+   | Isaac v6-flowvec | 8 | 1M | 125k | 1000 步 | +536→+406 |
+   - 实测校验（v0-gt 运行中）：`total_timesteps=240,384 → n_updates=3,677`，
+     而 `(240384−5000)/64 = 3677.9` ✓ 精确吻合。**别凭直觉推断这个换算，会差一个量级。**
+   - 我们 v0 用 64 env 时，buffer 只装得下 **312 vec-step ≈ 1.5 个 episode**，更新看到的样本高度相关。
+   - 原始在 47k 次更新时（≈146k 样本）已到 **+630**，我们 47k 次更新时（3M 样本）只有 **+358**
+     → 说明除更新次数外，buffer 时域也在起作用（两者都源于高 n_envs）。
+   - **要复现原始动力学就得同时匹配两个比值**：`gradient_steps = n_envs/3`、
+     `buffer_size = 6667 × n_envs`。当前采用 n_envs=16 / gradient_steps=5 / buffer_size=100000
+     （623k 更新、6250 步时域，≈ 原始的 94%）。
+   - **已验证成功（2026-09-29）**：n_envs=64 / gradient_steps=21 / buffer_size=426667
+     （654k 更新 = 原始 98.5%；时域 6666 步 = 原始 99.98%），加 `action_noise`。
+     逐点对照原始 `log/AUVTracking_v0/PID/SAC/08-02_15`：
+
+     | 样本 | 原始 | 方案 C |
+     |---|---|---|
+     | 20k | −333 | −245 |
+     | 40k | +499 | −3 |
+     | 60k | +665 | +177 |
+     | 80k | +668 | +515 |
+     | 100k | +663 | +592 |
+     | **200k** | **+650** | **+641** |
+
+     即方案 C **只滞后 ~40–60k 样本"起飞"，200k 时追平（差 1.3%）**。
+     **别被早期的滞后误导**：40k 时落后 500 点看着像失败，其实只是延迟；至少要等到 200k 再判断。
+     - 吞吐取舍：实测 vec-step 速率恒定 ~7/s（与环境数无关，存在串行瓶颈），所以 samples/s ∝ n_envs。
+       方案 A（n_envs=3，唯一能同时匹配两比值的"纯净"配置）只有 ~21 samples/s → 2M 需 **26h**；
+       方案 C 用 64 env 有 ~226 samples/s → **2.5h**。
+     - **被证伪的假设**：曾以为"每 vec-step 更新密度"（gs=21 vs 原始的 1）是第二个根因 ——
+       方案 C 用 gs=21 依然追平，**密度不是问题**，只有总更新数与 buffer 时域是。
+     - 注意 `rollout/ep_rew_mean` 是 SB3 的"最近 100 个 episode"窗口：这 100 个 episode 在 3 env 下
+       横跨 6667 vec-step、在 64 env 下只横跨 312 vec-step，**窗口时间跨度差 21 倍**，曲线平滑度不等价。
+   - 原始还有一个我们缺的 **`action_noise`**：`SB3_trainer.py::create_action_noise` 给 2-D PID
+     动作空间加 `NormalActionNoise(mean=0, sigma=0.05)`。已在 `isaaclab_rl/sb3.py::process_sb3_cfg`
+     支持声明式 yaml 块，并写进 `agents/sb3_sac_cfg.yaml`。
+   - **原始配置里的死键**（别再照着它们推断行为）：`c_smooth: 1.0`（代码里被注释）、
+     `measurement_disfactor: 0.9`（全仓无引用）、`her_kwargs`（`replay_buffer.type` 不是
+     `HerReplayBuffer`，不走该分支）、`n_step: 3`（SAC 分支不读）。奖励公式、`is_col`、
+     done-by-reward(100/−3.5)、控制周期 0.2s、episode 200 步、KF 参数（`sensor_r_sd`/`sensor_b_sd`/
+     `target_init_cov`/`const_q`/`fov`）**逐值核对一致**，所以差距不来自这些。
+
+   - **终点验证 + 实测测评（2026-09-29 16:00）**：v0-gt（方案 C）跑到 1,161,856 步被人工停止，
+     **全程零退化**（58 个日志点里 95% 的 `ep_rew_mean` > 500，峰值 +658.8）。最终 checkpoint
+     `model_1099648_steps.zip` 测 24 个 episode：
+
+     | 指标 | 方案 C 实测 | 原始 HoloOcean v0 |
+     |---|---|---|
+     | 平均回报 | **679.5 ± 12.0** | 678.9（tail200） |
+     | 回报 CV | 1.8% | — |
+     | episode 长度 | 199.0 ± 0（24/24 撑满） | 199.7 |
+     | 距离误差 \|r−r*\| | 0.42 m | — |
+     | 方位误差（中位） | 7.3° | — |
+     | Time-on-Target | 99.7% | — |
+     | 首次回报 >500 的步数 | ~80k | ~60k |
+
+     → **方案 C 与原始基线在统计上等价**，根因诊断（学习预算稀释）确认成立，不是任务/物理建模问题。
+   - **测评命令的口径坑**：`scripts/play_auv_tracking_sb3_sac_v0.py` 的 `--kf_measurement`
+     默认是 **`sonar`**（会顺手打开相机渲染），测 v0-gt 必须显式传 `--kf_measurement gt`，
+     否则测的不是训练时那套观测：
+     `./scripts/eval_auv_tracking_sb3_sac_v0.sh --checkpoint <zip> --episodes 24 --kf_measurement gt --headless`
+   - **v6-flowvec 没有专用 eval 脚本**，直接复用 v4-cam 的驱动即可
+     （同一个 `CustomSACPolicy`；v6 的 obs 键仍叫 `image`/`state`，且 dtype 已是 float32，
+     所以 `eval_auv_tracking_v4_cam.py` 里那段 `uint8→float32` 补丁会被自动跳过）：
+     `./scripts/eval_auv_tracking_v4_cam.sh --task Isaac-AUV-Tracking-Direct-v6-flowvec --checkpoint <zip> --episodes 20 --headless`
+     实测 700k checkpoint：**466 ± 272**、方位误差中位 38.5°、丢目标 14.3%、`frac r>3m` 15% ——
+     能跟距离（gt_r 均值 2.07）但控不住方位，训练曲线 140k 冲 +536 后 460k 崩到 −236 再回 +408，
+     属真实的 SAC 不稳定／灾难性遗忘。
+   - **跨任务回报不可直接对标**：v0 奖励只有 `0.2·(−log det Σ)` + 碰撞惩罚，v6 额外叠加
+     range / bearing / action_delta / lost 四项 `rew_penalty_*`。同等追踪质量下 v6 回报天然更低，
+     所以**只有几何指标**（r_err、方位角、丢目标比例、单 episode 分布）是可比的。
+
+## Direct-v3-cam（相机任务）
+
+- **目标例外**：本节目标是**第二艘 WarpAUV**，是对上面「追踪目标 = 小球、无双 AUV」的新指定（对齐 Holo v0）。
+- 相机 prim `LookFollowCamera0` 在**资产副本** `data/warpauv_cam/warpauv.usd` 内（`warpauv_base_link` 子级，安装位姿 = 声呐位姿，45° HFOV）；env 用 `tiled_camera.spawn=None` 采用它。目标仍用原版资产，不共享副本。
+- 观测：**灰度 K=4 → `(4, 64, 64)` uint8**（1 字节/像素）。不用 RGB —— 实测 89.09% 像素 `R==G==B`、`corr(R,G)=0.9999864`、色度方差仅占总方差 0.0022%。
+- `buffer_size` 要按 `buffer_size × num_envs × 2 × (K·64·64)` 估（SB3 同时存 obs 与 next_obs）。**声呐的 100000 不是可对标基线**：名义 36.6 GiB，靠 numpy calloc 惰性分配 + 只填了 38% 槽位才没炸，代价是 fps 25（swap 换页）。
+- 目标 AUV 每步在 `_sync_target_entity` 写 yaw，否则恒为单位四元数、看着横漂。
+- 控制链**未改**：`action(2,) → cmd_vel → BatchPIDController（物理频率内循环）→ 6 PWM`。
+- 训练：`./scripts/train_auv_tracking_sb3_sac_v3_cam.sh --num_envs 8 --headless`
+
+## Direct-v4-cam（v0 的副本，2026-09-17）
+
+- **意图**：`Direct-v0` 原样保留作基线，另存一份副本继续改。文件
+  `auv_tracking_v4_cam_env.py`（=`auv_tracking_env.py` 的拷贝），gym id `Isaac-AUV-Tracking-Direct-v4-cam`。
+- **只改两处**（其余逐字照 v0）：
+  1. 目标实体：`r=0.35 m` 小球 → **第二艘 WarpAUV**。**运动模式不变** —— 仍是 v0 的
+     `BatchHoloTargetMotion`（RRT_2d + 一阶速度滞后 + 3s 软启动 / 5s leash 调度），
+     `_sync_target_entity` 每物理 tick 回写位姿，额外写 yaw（否则恒为单位四元数、看着横漂）。
+  2. 传感：去掉 OceanSim 声呐 → KF 用几何 GT（`kf_measurement="gt"`），策略观测换成
+     声呐安装位姿上的前视相机、**灰度 K=4 → `(4,64,64)` uint8**。
+- **刻意保持 v0 默认**（v3-cam 开了、这里没开）：`dyn_time_constant=0.05` +
+  `thruster_first_order_lag=False`、`rew_scale_speed=0.0`、`target_init_dist=[1.5,2.5]`。
+  想对齐 v3-cam 就在命令行加：
+  `env.dyn_time_constant=0.2 env.thruster_first_order_lag=true env.rew_scale_speed=0.2 env.target_init_dist_min=1.0 env.target_init_dist_max=4.0`。
+- `sensor_fov_deg` 必须 = 相机 HFOV（45°），否则 GT `observed` 门会给「相机看不见」的
+  目标报有效量测，不确定性奖励与观测自相矛盾。v0 的 a2t 初始角 ±π/10=±18° < 22.5° 半视场，
+  所以初值本来就落在画面里。
+- 相机/资产/编码器沿用 v3-cam 那套（`WARPAUV_CAM_CFG`、`data/warpauv_cam/warpauv.usd`、
+  `agents/cam_encoder.MidCNNExtractor`）；只新加 `agents/sb3_sac_v4_cam_cfg.yaml` 便于独立调参。
+- 训练：`./scripts/train_auv_tracking_sb3_sac_v4.sh --num_envs 8 --headless`
+- 空间自检：`./scripts/debug_auv_cam_spaces.sh --headless --num_envs 4 --task Isaac-AUV-Tracking-Direct-v4-cam`

@@ -23,7 +23,8 @@ Two candidate mechanisms, which need different fixes:
 
 Method
 ------
-This script only READS. It prints, for ``Robot`` / ``Robot/Camera`` / ``Target``:
+This script only READS. It prints, for ``Robot`` / ``Robot/warpauv_base_link/LookFollowCamera0`` /
+``Target``:
 
 * the USD local transform, the USD world transform (via ``UsdGeom.XformCache``), and whether the
   prim is instanceable / an instance / has a Fabric-backed xform;
@@ -86,6 +87,11 @@ def main() -> None:
 
     cfg = AUVTrackingCamEnvCfg()
     cfg.scene.num_envs = 1
+    # Ship-config check: cam_sync_usd_pose is True by default, so the probe observes exactly what
+    # training sees. The camera now lives inside the asset at
+    # .../Robot/warpauv_base_link/LookFollowCamera0, so its USD world pose should equal the robot's
+    # simulated pose composed with the baked mount offset (0.35, 0, 0.05) and the "world" rotation.
+    cfg.cam_sync_usd_pose = True
     env = gym.make("Isaac-AUV-Tracking-Direct-v3-cam", cfg=cfg)
     raw = env.unwrapped
     dev = raw.device
@@ -99,10 +105,24 @@ def main() -> None:
         "World": "/World",
         "envs": "/World/envs",
         "env_0": "/World/envs/env_0",
-        "Robot": "/World/envs/env_0/Robot",
-        "Camera": "/World/envs/env_0/Robot/Camera",
+        "Robot(wrapper)": "/World/envs/env_0/Robot",
+        "Camera": "/World/envs/env_0/Robot/warpauv_base_link/LookFollowCamera0",
         "Target": "/World/envs/env_0/Target",
+        "Target(body)": "/World/envs/env_0/Target/warpauv_base_link",
     }
+    # The sonar is parented to the *inner* rigid-body prim, not the spawn wrapper
+    # (see shared_platform.py::_resolve_rigid_body_prim_path). Discover the robot's rigid-body
+    # prim the same way so we can compare USD freshness on both levels.
+    from isaaclab.sim.utils import get_all_matching_child_prims
+    from pxr import UsdPhysics as _UsdPhysics
+
+    body_prims = get_all_matching_child_prims(
+        "/World/envs/env_0/Robot", predicate=lambda p: p.HasAPI(_UsdPhysics.RigidBodyAPI)
+    )
+    print(f"[xform] robot rigid-body prims (RigidBodyAPI): {[p.GetPath().pathString for p in body_prims]}", flush=True)
+    if body_prims:
+        paths["Robot(body)"] = body_prims[0].GetPath().pathString
+        paths["SonarMount(would-be)"] = body_prims[0].GetPath().pathString + "/SonarMount"
 
     print("\n[xform] ================ static structure ================", flush=True)
     print(f"[xform] scene.env_origins (sim) = {raw.scene.env_origins.detach().cpu().numpy()}", flush=True)
@@ -155,7 +175,7 @@ def main() -> None:
     print(f"[xform] camera intrinsics K=\n{np.array2string(intr, precision=3)}", flush=True)
 
     def record(tag: str) -> dict:
-        """Snapshot USD world transforms and simulated poses for the three key prims."""
+        """Snapshot USD world transforms and simulated poses for the key prims."""
         sim = {
             "Robot": raw._robot.data.root_pos_w[0, :3].detach().cpu().numpy(),
             "Target": raw._target.data.root_pos_w[0, :3].detach().cpu().numpy(),
@@ -165,8 +185,11 @@ def main() -> None:
         except Exception as exc:  # pragma: no cover
             sim["Camera"] = np.array([np.nan, np.nan, np.nan])
             print(f"[xform] camera pos_w unavailable: {exc}", flush=True)
-        usd = {k: np.array(cache.GetLocalToWorldTransform(stage.GetPrimAtPath(p)).ExtractTranslation())
-               for k, p in paths.items()}
+        usd = {}
+        for k, p in paths.items():
+            pr = stage.GetPrimAtPath(p)
+            if pr and pr.IsValid():
+                usd[k] = np.array(cache.GetLocalToWorldTransform(pr).ExtractTranslation())
         # Camera pose derived from the robot's SIMULATED pose + mount offset (the pose the
         # renderer *should* use if the camera rides the robot).
         import torch as _t
@@ -178,9 +201,11 @@ def main() -> None:
         derived = (raw._robot.data.root_pos_w[0, :3].detach().cpu()
                    + quat_apply(rq.unsqueeze(0), off.unsqueeze(0)).squeeze(0)).numpy()
         print(f"\n[xform] ---------------- {tag} ----------------", flush=True)
-        for k in ("Robot", "Camera", "Target"):
-            print(f"[xform] {k:7s} sim={_fmt(sim[k])}  usd_world={_fmt(usd[k])}"
-                  f"  |sim-usd|={np.linalg.norm(sim[k] - usd[k]):8.3f}", flush=True)
+        for k in usd:
+            line = f"[xform] {k:20s} usd_world={_fmt(usd[k])}"
+            if k in sim:
+                line += f"  sim={_fmt(sim[k])}  |sim-usd|={np.linalg.norm(sim[k] - usd[k]):8.3f}"
+            print(line, flush=True)
         print(f"[xform] expected camera from robot sim pose + offset = {_fmt(derived)}", flush=True)
         print(f"[xform]   usd_world(Camera) - derived = {_fmt(usd['Camera'] - derived)}", flush=True)
         print(f"[xform]   sim(Camera)       - derived = {_fmt(sim['Camera'] - derived)}", flush=True)

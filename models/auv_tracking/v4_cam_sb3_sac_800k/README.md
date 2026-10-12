@@ -75,6 +75,21 @@ Key task fields (full list in `params/env.yaml`):
 | reward | **only** `rew_scale_uncertainty_mean 0.2`; range/bearing/lag/speed/σ/smooth all 0. Penalties: range 0.2, bearing 0.3, lost 0.5, Δaction 0.02 |
 | water | calm (`ocean_current.enabled false`) |
 
+> **Live reward defaults changed 2026-09-28.** The table above is the *training-time* snapshot —
+> what this policy was optimised against — and it stays accurate as history. The live task default
+> is now: uncertainty `0.2 → 0.02`, cost clip `1.0 → 0.0` (new `rew_penalty_clip` field; 0 means the
+> geometry costs stay unbounded instead of going constant outside the band), range `0.2 → 0.05`,
+> bearing `0.3 → 0.05`. Rationale and measurements are in the `AUVTrackingV4CamEnvCfg` comment.
+>
+> This does **not** move the policy: actions are independent of the reward, so the geometry metrics
+> (`mean_gt_r`, `lost`, `med|α|`, `da_p90`) still reproduce. Only the reported `ep_ret` changes
+> scale. To reproduce `ep_ret ≈ 569` with the legacy reward, add:
+>
+> ```bash
+> env.rew_scale_uncertainty_mean=0.2 env.rew_penalty_clip=1.0 \
+> env.rew_penalty_range=0.2 env.rew_penalty_bearing=0.3
+> ```
+
 ### Caveat: the actor is not purely visual
 
 The CNN's first conv is `Conv2d(14, 32, 5, 5)`: 12 RGB channels **+ 2 `flow_image` channels**. And
@@ -107,6 +122,15 @@ commit made without re-staging would ship an encoder that cannot load this check
 ```
 
 Expected: `ep_ret ≈ 569 ± 244`, `mean_gt_r ≈ 2.14 m`, `lost ≈ 0.3 %`, `da_p90 ≈ 1.22`.
+
+`ep_ret` is the **legacy** reward's scale; with the 2026-09-28 defaults it will read much smaller
+(the uncertainty term is 10x lighter and the geometry costs are unbounded). Use the legacy
+overrides above if you need that number.
+
+**The `mean_gt_r ≈ 2.14 m` figure is not evidence of tracking quality.** It equals both the reset
+distance (`target_init_dist 2.0`) and the reward set-point (`rew_range_star 2.0`), so it only shows
+the policy sat at the standoff it was initialised at and rewarded for. Rank checkpoints on
+`med|α|` / `frac r>3 m` / `lost`, and read `ep_ret` last — see the 2026-09-28 reward analysis.
 
 `eval/sweep_4ckpt.png` was produced from `eval/sweep_4ckpt.json`. The sweep JSON and the `.npz`
 per-step dump (`rew`, `abs_bearing_deg`, `gt_r`, `lost`, `a_v`, `a_w`, `da`, `done`) are kept for

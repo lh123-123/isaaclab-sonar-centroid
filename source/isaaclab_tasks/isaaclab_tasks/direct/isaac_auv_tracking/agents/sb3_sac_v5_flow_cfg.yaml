@@ -87,7 +87,9 @@ policy: "isaaclab_tasks.direct.isaac_auv_tracking.agents.custom_sac_policy.Custo
 learning_rate: 0.0001
 # 1M steps / seed 66 / learning_starts 1000 are the v4_cam_sb3_sac_800k values, kept so the two
 # schemes are compared at equal budget. Only buffer_size moves, for the RAM reason above.
-buffer_size: 8000
+# 16 envs (2026-10-09): buffer doubled so per-env history stays 1000 steps
+# (16000//16), same as 8000//8 before. ~3.9 GiB, fine on 62 GB RAM.
+buffer_size: 16000
 # 1000 total = 125 steps/env at 8 envs. Matches the 800k snapshot (and Holo's single-env
 # config).
 learning_starts: 1000

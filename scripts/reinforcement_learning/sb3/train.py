@@ -63,9 +63,10 @@ _needs_cameras = bool(args_cli.video)
 if args_cli.task is not None and "AUV-Tracking" in args_cli.task:
     if "Direct-v1" in args_cli.task or "Direct-v2" in args_cli.task:
         _needs_cameras = True
-    elif "Direct-v3-cam" in args_cli.task:
-        # The RGB camera *is* the policy observation. The KF uses geometric GT here, so
-        # the sonar branch below must not be what decides this.
+    elif "-cam" in args_cli.task:
+        # A camera task (Direct-v3-cam / Direct-v4-cam ...): the RGB camera *is* the policy
+        # observation. These use geometric-GT KF measurements, so the sonar branch below must
+        # not be what decides this.
         _needs_cameras = True
     elif args_cli.kf_measurement != "gt":
         _needs_cameras = True

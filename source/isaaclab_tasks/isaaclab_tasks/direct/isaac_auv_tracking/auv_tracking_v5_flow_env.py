@@ -58,7 +58,7 @@ import isaaclab.sim as sim_utils
 from isaaclab.assets import RigidObjectCfg
 from isaaclab.sensors import TiledCamera, TiledCameraCfg
 from isaaclab.utils import configclass
-from isaaclab.utils.math import quat_from_euler_xyz
+from isaaclab.utils.math import euler_xyz_from_quat, quat_from_euler_xyz
 
 from isaaclab_tasks.direct.sonar_centroid_track.auv_platform import AUV_SONAR_MOUNT_OFFSET_LOCAL
 
@@ -193,13 +193,39 @@ class AUVTrackingV5FlowEnvCfg(AUVTrackingEnvCfg):
     # `_compute_step_reward` needs no change: with `rew_penalty_clip = 1.0` it clamps
     # range / bearing / action-delta at 1.0 exactly as the legacy code did, and the two new
     # terms below are weighted 0.0, so the arithmetic is identical to the 800k revision.
-    rew_scale_uncertainty_mean: float = 0.2
-    rew_penalty_clip: float = 1.0  # >0 restores the legacy `clamp(max=1.0)` on each cost
-    rew_penalty_range: float = 0.2
-    rew_range_sigma: float = 0.6
-    rew_penalty_bearing: float = 0.5
-    rew_penalty_lost: float = 0.5
-    rew_penalty_action_delta: float = 0.02
+    # --- v5-flow first-principles reward (2026-10-09) ---
+    # Actor只看到光流，它唯一能控制的是：把目标保持在画面中心（bearing→0）、
+    # 保持在2m左右、不跟丢。因此奖励只回答三个问题：
+    #   活着吗（alive）+ 对得准吗（bearing）+ 距离对吗（range）。
+    # 删掉的东西以及原因：
+    #   * uncertainty项（-logdet）：目标进FOV约3步就饱和到EKF地板，之后是常数，
+    #     对actor是不可归因的常数偏置，只给critic看（state里已有），不进reward。
+    #   * lost每步扣分：丢目标已由OOV直接终止，终止即丢掉未来全部alive，
+    #     再每步扣是双重惩罚，且教policy“丢了不如早点死”。
+    #   * OOV终止步-5：同理，截断未来回报已是最大惩罚，一次性-5只增加方差。
+    #   * clip=1.0：把二次项封顶恰好制造了零梯度死区（曾经median漂到20°的原因）。
+    #   * yaw_sat：bearing对准了自然不打满舵，无需单列。
+    # 基类rolling-mean done（rew_done_threshold=-3.5）随之自然失效：
+    # 新奖励恒≥0，均值不可能<-3.5，终止只剩超时+OOV，正是我们想要的。
+    rew_scale_uncertainty_mean: float = 0.0
+    rew_penalty_clip: float = 0.0
+    rew_penalty_range: float = 0.0
+    rew_range_sigma: float = 1.0
+    rew_penalty_bearing: float = 0.0
+    rew_penalty_lost: float = 0.0
+    rew_penalty_action_delta: float = 0.0
+    rew_penalty_oov_terminal: float = 0.0
+    # 新奖励三项（有界、处处可导、无死区）：
+    rew_alive: float = 1.0            # 每存活一步
+    rew_bearing_scale: float = 1.1    # R5：从R2的1.0小步加码（近距对准要求略严；1.3已证明过猛）
+    rew_bearing_sigma_deg: float = 15.0  # bearing高斯宽度（≈FOV半角45°的1/3）
+    rew_range_scale: float = 1.0      # R8：尺寸比项权重（s=1拿满，4m处s≈0.42只剩~0.05）
+    rew_size_sigma: float = 0.5       # R8：log(s)高斯宽度；自标定，无fx/L
+    # --- range-cue通道（阶段1，diag-B：corr(w,1/r)=0.86，div符号一致率0.87）---
+    flow_cue_ema: float = 0.3         # bbox宽度EMA系数（平滑检测抖动）
+    rew_penalty_action_delta_v5: float = 0.03  # R5：0.01→0.03（压bang-bang；0.05留待R3式恶化时再用）
+    # 近场尺度说明（R4）：r<1m时bbox宽度顶到1.0饱和、RAFT大位移被obs clip±1截断——
+    # 近场本就不需要距离cue做精调，靠加码后的bearing+alive即可；cue只在中远场起作用。
     # 2026-10-08 bearing rebalance (single-channel change on top of the 800k snapshot):
     # the quadratic cost saturates at bearing_sigma = 0.45 * fov_half = 20.25 deg (HFOV 90), and
     # clip=1.0 makes it constant beyond that -- zero gradient exactly where the 1M checkpoint
@@ -208,8 +234,8 @@ class AUVTrackingV5FlowEnvCfg(AUVTrackingEnvCfg):
     # gradient past 15 deg (-0.02 rew/deg sustained out to the 90 deg FOV edge), where the
     # historical value was 0. Everything else (uncertainty 0.2, range 0.2, clip 1.0, lost 0.5)
     # is frozen so the effect is attributable -- the 09-28 multi-variable rebalance collapsed.
-    rew_bearing_linear_deg: float = 15.0
-    rew_penalty_bearing_linear: float = 0.02
+    rew_bearing_linear_deg: float = 10.0
+    rew_penalty_bearing_linear: float = 0.05
     rew_penalty_yaw_sat: float = 0.0
 
     # Uniform scale applied to the target AUV only (1.0 = same size as the agent). 0.8 makes the
@@ -254,7 +280,7 @@ class AUVTrackingV5FlowEnvCfg(AUVTrackingEnvCfg):
     # Aperture used to derive the focal length written onto the adopted camera prim. Defaults to
     # the value the asset was authored with; see _apply_camera_intrinsics.
     cam_aperture_mm: float = _CAM_APERTURE_MM
-    frame_stack: int = 4
+    frame_stack: int = 2              # R8：4→2（单帧flow已是速度，历史冗余；buffer减半）
     # --- estimated-flow actor (RAFT-Small) ---
     # "gt" keeps the analytic disk stamp (ablation baseline); "raft" replaces it with
     # RAFT-Small dense flow computed from consecutive render-res RGB frames. The actor's
@@ -269,7 +295,7 @@ class AUVTrackingV5FlowEnvCfg(AUVTrackingEnvCfg):
     # episode ends instead of wandering blind -- see oov_limit_steps).
     flow_min_lit_px: int = 20
     # Consecutive steps with no flow-detected target before the episode terminates.
-    oov_limit_steps: int = 30
+    oov_limit_steps: int = 10
     # One-time penalty on the terminating step (matches v0's rew_c_penalty vocabulary).
     rew_penalty_oov_terminal: float = 5.0
     # Mirror the robot's simulated pose into the robot prim's USD xform every render step.
@@ -337,13 +363,15 @@ class AUVTrackingV5FlowEnvCfg(AUVTrackingEnvCfg):
     # unchanged; only its content is now a flow stack. Nothing here depends on the camera's render
     # resolution: the render is only used for the KF measurement (``_update_belief_from_camera``).
     observation_space = {
-        # GT optical-flow stack, oldest frame first.
+        # Flow stack (frame_stack*2 ch, oldest first) + 1ch外观mask（R8：治actor静止aliasing）。
+        # 5ch @K=2。flow零+mask中央亮=跟住静止；flow零+mask黑=跟丢静止。
         "image": gym.spaces.Box(
-            low=-1.0, high=1.0, shape=(frame_stack * 2, cam_height, cam_width), dtype=np.float32
+            low=-1.0, high=1.0, shape=(frame_stack * 2 + 1, cam_height, cam_width), dtype=np.float32
         ),
         "state": gym.spaces.Box(
-            low=np.array([0.0, -np.pi, -50.0, 0.0], dtype=np.float32),
-            high=np.array([600.0, np.pi, 50.0, 2.0], dtype=np.float32),
+            # [r, alpha, logdet, observed] + 本体[v_surge, yaw_rate]（R8：critic不再猜自运动）
+            low=np.array([0.0, -np.pi, -50.0, 0.0, -2.0, -2.0], dtype=np.float32),
+            high=np.array([600.0, np.pi, 50.0, 2.0, 2.0, 2.0], dtype=np.float32),
             dtype=np.float32,
         ),
     }
@@ -388,6 +416,16 @@ class AUVTrackingV5FlowEnv(AUVTrackingEnv):
         self._teach_vec = torch.zeros(self.num_envs, 4, device=self.device)
         h, w = int(self.cfg.cam_height), int(self.cfg.cam_width)
         self._flow_image = torch.zeros((self.num_envs, 2, h, w), device=self.device)
+        # bbox测距EMA（reward用）：orange宽度/256，无效帧保持，reset清零。
+        self._cue_w = torch.zeros(self.num_envs, device=self.device)
+        self._cue_w_ok = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        # teach尺子（R8）：reset后首次有效bbox即2m/0°初始帧宽度；尺寸比s=w/teach。
+        self._teach_w = torch.zeros(self.num_envs, device=self.device)
+        self._teach_w_ok = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._size_ratio = torch.ones(self.num_envs, device=self.device)
+        # 外观平面（R8）：橙mask下采样到cam-res，actor第5通道。接口按teach框预留，
+        # 当前实现用橙mask（tint脚手架，去橙化时换teach框mask，形状不变）。
+        self._app_plane = torch.zeros((self.num_envs, 1, h, w), device=self.device)
         self._gt_px = torch.zeros(self.num_envs, 2, device=self.device)
         self._gt_px_ok = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self._flow_vec = torch.zeros(self.num_envs, 3, device=self.device)
@@ -663,71 +701,36 @@ class AUVTrackingV5FlowEnv(AUVTrackingEnv):
             self._sync_robot_usd_pose()
 
     def _compute_step_reward(self) -> torch.Tensor:
-        """Uncertainty reward (auxiliary), plus unbounded geometry costs (primary).
+        """First-principles tracking reward: alive + centered + well-ranged.
 
-        The base term is `rew_scale_uncertainty_mean * -log det(Sigma)`, which saturates at the
-        EKF floor within ~3 steps of the target being inside the FOV -- see
-        `AUVTrackingV5FlowEnvCfg.rew_penalty_clip` for the measurement. So the range/bearing
-        quadratic costs carry the tracking gradient.
-
-        Whether those costs are clipped is the `rew_penalty_clip` knob: the historical value 1.0
-        made each cost constant outside its band, i.e. zero gradient at long range / large bearing,
-        which let the policy park inside the dead band. The default is now 0.0 (no clip).
+        actor能影响的只有三件事——别跟丢（活着）、把目标放中心（bearing→0）、
+        保持2m。每项有界、处处可导：最优时≈1+1+0.3=2.3/步，
+        丢目标时episode终止，未来alive全丢，不再另设扣分。
+        几何量在raft下取RAFT估计（可部署），gt下取真值（ablation）。
+        基类super()故意不调：它的uncertainty常数偏置+碰撞min(0,rew)会
+        把这里的有界 shaping 冲掉；碰撞仍由_compute_is_col记录但不进奖励。
         """
-        rew = super()._compute_step_reward()
-
         agent_pos, agent_yaw = self._agent_pose_2d()
         if str(getattr(self.cfg, "flow_source", "gt")) == "raft":
-            # Geometry from the RAFT estimate, not from GT: range/bearing are what the flow
-            # blob says. Invalid frames fall back to the frustum edge (max cost, not NaN).
-            gt_r, gt_a = self._flow_est_r, self._flow_est_a
+            r, a = self._flow_est_r, self._flow_est_a
         else:
-            _, gt_r, gt_a = self.kf.get_observation(self._target_pos, agent_pos, agent_yaw)
+            _, r, a = self.kf.get_observation(self._target_pos, agent_pos, agent_yaw)
 
-        range_sigma = max(float(self.cfg.rew_range_sigma), 1.0e-6)
-        range_cost = ((gt_r - float(self.cfg.rew_range_star)) / range_sigma) ** 2
-
-        bearing_sigma = max(
-            float(self.cfg.rew_bearing_sigma_frac) * float(self._fov_half),
-            1.0e-6,
-        )
-        bearing_cost = (gt_a / bearing_sigma) ** 2
-
-        action_delta_cost = torch.sum((self._actions - self._prev_actions) ** 2, dim=-1)
-        lost_cost = (~self._observed).to(dtype=rew.dtype)
-        # Linear bearing tail beyond rew_bearing_linear_deg (default 15): 0.02/deg,
-        # so the late-episode drift keeps a gradient where the quadratic is flat-ish.
-        lin_deg = float(getattr(self.cfg, "rew_bearing_linear_deg", 15.0))
-        bearing_lin_cost = torch.clamp(gt_a.abs() * 57.29578 - lin_deg, min=0.0)
-        # Yaw-saturation term: |a_w| > 0.9 means commanding at the 0.5 rad/s stop.
-        yaw_sat_cost = (self._actions[:, 1].abs() > 0.9).to(dtype=rew.dtype)
-
-        # clip > 0 reproduces the legacy Holo-bounded shaping (constant cost outside the band);
-        # clip <= 0 leaves the costs unbounded so the gradient survives off-target.
-        clip = float(getattr(self.cfg, "rew_penalty_clip", 1.0))
-        if clip > 0.0:
-            range_cost = torch.clamp(range_cost, max=clip)
-            bearing_cost = torch.clamp(bearing_cost, max=clip)
-            action_delta_cost = torch.clamp(action_delta_cost, max=clip)
+        sig_b = max(float(getattr(self.cfg, "rew_bearing_sigma_deg", 15.0)) / 57.29578, 1.0e-6)
+        r_bearing = torch.exp(-((a / sig_b) ** 2))
+        # R8尺寸比距离：s=1拿满，4m处s≈0.42只剩~0.05；自标定，无fx/L。
+        # r仍用bbox几何供包络/他处，reward距离语言只认s。
+        sig_s = max(float(getattr(self.cfg, "rew_size_sigma", 0.5)), 1.0e-6)
+        r_size = torch.exp(-((torch.log(self._size_ratio.clamp(min=0.05)) / sig_s) ** 2))
+        smooth = torch.sum((self._actions - self._prev_actions) ** 2, dim=-1)
 
         rew = (
-            rew
-            - float(self.cfg.rew_penalty_range) * range_cost
-            - float(self.cfg.rew_penalty_bearing) * bearing_cost
-            - float(getattr(self.cfg, "rew_penalty_bearing_linear", 0.0)) * bearing_lin_cost
-            - float(self.cfg.rew_penalty_action_delta) * action_delta_cost
-            - float(getattr(self.cfg, "rew_penalty_yaw_sat", 0.0)) * yaw_sat_cost
-            - float(self.cfg.rew_penalty_lost) * lost_cost
+            float(self.cfg.rew_alive)
+            + float(self.cfg.rew_bearing_scale) * r_bearing
+            + float(self.cfg.rew_range_scale) * r_size
+            - float(getattr(self.cfg, "rew_penalty_action_delta_v5", 0.01)) * smooth
         )
-        # Out-of-view terminal: estimated flow cannot reacquire, so end the episode with a
-        # one-time penalty instead of wandering blind. `== limit`: the streak advances by one
-        # per step and any valid detection resets it, so this fires on exactly one step.
-        if str(getattr(self.cfg, "flow_source", "gt")) == "raft":
-            oov_limit = int(self.cfg.oov_limit_steps)
-            lost_terminal = self._oov_streak == oov_limit
-            if bool(lost_terminal.any()):
-                rew = rew - lost_terminal.to(dtype=rew.dtype) * float(self.cfg.rew_penalty_oov_terminal)
-        return torch.nan_to_num(rew, nan=0.0, posinf=0.0, neginf=-50.0)
+        return torch.nan_to_num(rew, nan=0.0, posinf=2.5, neginf=0.0)
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         """Base terminations plus the out-of-view reset (RAFT branch only).
@@ -740,6 +743,13 @@ class AUVTrackingV5FlowEnv(AUVTrackingEnv):
         terminated, truncated = super()._get_dones()
         if str(getattr(self.cfg, "flow_source", "gt")) == "raft" and hasattr(self, "_oov_streak"):
             terminated = terminated | (self._oov_streak >= int(self.cfg.oov_limit_steps))
+        # 硬边界：目标出传感器包络（4m/±45°，GT判定）立刻重置，不等10帧计数。
+        # 估计器在远场会编假blob，计数门靠不住；包络是任务定义，以真值为准。
+        agent_pos, agent_yaw = self._agent_pose_2d()
+        _, gt_r, gt_a = self.kf.get_observation(self._target_pos, agent_pos, agent_yaw)
+        out_of_envelope = (gt_r > float(self.cfg.sensor_range)) | (gt_a.abs() > float(self._fov_half))
+        if str(getattr(self.cfg, "flow_source", "gt")) == "raft":
+            terminated = terminated | out_of_envelope
         return terminated, truncated
 
     def _apply_reset_extent_range(self, rgb_nhwc: torch.Tensor) -> None:
@@ -817,10 +827,25 @@ class AUVTrackingV5FlowEnv(AUVTrackingEnv):
             self._flow_buf[live, -2:] = self._flow_image[live]
 
         obs["policy"] = {
-            "image": self._flow_buf,
-            "state": belief_state,
+            "image": torch.cat([self._flow_buf, self._app_plane], dim=1),
+            "state": torch.cat(
+                [
+                    belief_state,
+                    self._ego_vel_state(),
+                ],
+                dim=-1,
+            ),
         }
         return obs
+
+    def _ego_vel_state(self) -> torch.Tensor:
+        """本体速度（R8）：v_surge + yaw_rate，world→body。critic专用，actor看不见。"""
+        _, agent_yaw = self._agent_pose_2d()
+        vel_w = self._robot.data.root_lin_vel_w[:, :2]
+        cy, sy = torch.cos(agent_yaw), torch.sin(agent_yaw)
+        v_surge = cy * vel_w[:, 0] + sy * vel_w[:, 1]
+        yaw_rate = self._robot.data.root_ang_vel_w[:, 2]
+        return torch.stack([v_surge.clamp(-2.0, 2.0), yaw_rate.clamp(-2.0, 2.0)], dim=-1)
 
     def _update_est_flow_image(self) -> None:
         """RAFT-Small dense flow -> actor frame + flow-derived geometry.
@@ -839,9 +864,9 @@ class AUVTrackingV5FlowEnv(AUVTrackingEnv):
         """
         curr = self._camera_rgb()
         fresh = ~self._prev_rgb_ok
+        h, w = int(self.cfg.cam_height), int(self.cfg.cam_width)
         if bool((~fresh).any()):
             est = estimate_flow(self._prev_rgb[~fresh], curr[~fresh])
-            h, w = int(self.cfg.cam_height), int(self.cfg.cam_width)
             rh = float(curr.shape[1])
             small = torch.nn.functional.interpolate(est, size=(h, w), mode="area") * (h / rh)
             du, dv = small[:, 0], small[:, 1]
@@ -861,24 +886,77 @@ class AUVTrackingV5FlowEnv(AUVTrackingEnv):
 
             xs = torch.arange(w, device=self.device, dtype=torch.float32)
             mx = (mask * xs.view(1, 1, w)).sum(dim=(-2, -1)) / lit.clamp(min=1)
+            # --- bbox测距（render-res橙框，corr(w,1/r)=0.86） ---
+            # flow面积在远处系统性偏大（r_hat谎报致远），改用bbox宽度反推距离。
+            bw, _, bcount = orange_extent(curr)
+            rw_f = max(float(curr.shape[2]), 1.0)
+            ema = float(getattr(self.cfg, "flow_cue_ema", 0.3))
+            w_now = (bw / rw_f).clamp(0.0, 1.0)
+            hit = bcount >= 20
+            first = hit & ~self._cue_w_ok
+            self._cue_w = torch.where(
+                first, w_now, torch.where(hit, ema * w_now + (1.0 - ema) * self._cue_w, self._cue_w)
+            )
+            self._cue_w_ok = self._cue_w_ok | hit
+            # teach：本episode首次有效bbox即初始帧尺子（2m/0°同姿态reset保证）
+            teach_first = hit & ~self._teach_w_ok
+            self._teach_w = torch.where(teach_first, w_now, self._teach_w)
+            self._teach_w_ok = self._teach_w_ok | hit
+            # 尺寸比（R8距离语言）：teach无效时s=1中性；钳死防log炸
+            self._size_ratio = torch.where(
+                self._teach_w_ok,
+                (self._cue_w / self._teach_w.clamp(min=1e-3)).clamp(0.05, 4.0),
+                torch.ones_like(self._cue_w),
+            )
+            fx_r = float(self.cfg.render_width) * 0.5 / float(np.tan(np.radians(float(self.cfg.cam_hfov_deg)) * 0.5))
+            length = 0.8 * float(getattr(self.cfg, "target_scale", 1.0))
+            # 针孔模型：w_px = L*fx/dist → dist = L*fx/w_px（w用EMA平滑值，防抖）
+            w_px = (self._cue_w * rw_f).clamp(min=2.0)
+            r_bbox_full = (length * fx_r / w_px).clamp(0.4, 13.3)
+            # 远场拍平钳制（range_shots实测：4~5m bbox 16~17px基本不缩小）：平滑宽度<10px
+            # 说明目标已到地板区，反推无意义，直接报far（sensor_range），让铰链/OOV接管。
+            r_bbox_full = torch.where(
+                (self._cue_w * rw_f) < 10.0,
+                torch.full_like(r_bbox_full, float(self.cfg.sensor_range)),
+                r_bbox_full,
+            )
             area = lit.to(torch.float32)
             rad = torch.sqrt(area / torch.pi).clamp(1.0, 12.0)
-            fx = float(self.cfg.render_width) * 0.5 / float(np.tan(np.radians(float(self.cfg.cam_hfov_deg)) * 0.5))
-            fx = fx * (w / float(self.cfg.render_width))
-            length = 0.8 * float(getattr(self.cfg, "target_scale", 1.0))
-            r_hat = (0.5 * length * fx / rad).clamp(0.4, 13.3)
+            fx = fx_r * (w / float(self.cfg.render_width))
+            r_area = (0.5 * length * fx / rad).clamp(0.4, 13.3)
             cx = 0.5 * (w - 1)
             a_hat = torch.atan((cx - mx) / max(fx, 1e-6))
 
             idx = torch.where(~fresh)[0]
+            # 诚实距离：本步bbox命中才用bbox（EMA已含新鲜值），否则回退面积法；
+            # flow无效且bbox无效时下面回退4.0认瞎。EMA跨无效帧的hold只做平滑，不做真值。
+            hit_sub = hit[idx]
+            r_hat = torch.where(hit_sub, r_bbox_full[idx], r_area)
+            # 橙框质心（render-res→cam-res）→ bearing备选：flow无但外观在时用（治静止致盲）
+            rgbn = curr.to(torch.float32) / 255.0
+            om = (rgbn[..., 0] > rgbn[..., 1] + 0.08) & (rgbn[..., 0] > rgbn[..., 2] + 0.08) & (rgbn[..., 0] > 0.25)
+            ocn = om.sum(dim=(-2, -1)).clamp(min=1)
+            oxs = torch.arange(float(curr.shape[2]), device=self.device, dtype=torch.float32)
+            ocu = (om.float() * oxs.view(1, 1, -1)).sum(dim=(-2, -1)) / ocn
+            a_orange_full = torch.atan((cx - ocu * (w / float(curr.shape[2]))) / max(fx, 1e-6))
+            # 外观平面：render-res橙mask → cam-res（area），二值化后写入actor第5通道
+            app_small = (
+                torch.nn.functional.interpolate(om.float().unsqueeze(1), size=(h, w), mode="area") > 0.3
+            ).float()
+            self._app_plane.zero_()
+            self._app_plane[~fresh] = app_small[~fresh]
             self._flow_est_ok[idx] = ok
-            self._flow_est_r[idx] = torch.where(ok, r_hat, torch.full_like(r_hat, float(self.cfg.sensor_range)))
+            self._flow_est_r[idx] = torch.where(
+                ok, r_hat, torch.where(hit_sub, r_bbox_full[idx], torch.full_like(r_hat, float(self.cfg.sensor_range)))
+            )
             self._flow_est_a[idx] = torch.where(
-                ok, a_hat, torch.full_like(a_hat, float(self._fov_half))
+                ok, a_hat, torch.where(hit_sub, a_orange_full[idx], torch.full_like(a_hat, float(self._fov_half)))
             )
             self._flow_image[fresh] = 0.0
             self._flow_est_ok[fresh] = False
-            self._oov_streak[idx] = torch.where(ok, torch.zeros_like(self._oov_streak[idx]), self._oov_streak[idx] + 1)
+            # 存在性判据（治静止致盲）：flow或外观任一命中即存在，只有全无才涨OOV
+            exist_sub = ok | hit_sub
+            self._oov_streak[idx] = torch.where(exist_sub, torch.zeros_like(self._oov_streak[idx]), self._oov_streak[idx] + 1)
         else:
             self._flow_image.zero_()
             self._flow_est_ok[:] = False
@@ -927,6 +1005,9 @@ class AUVTrackingV5FlowEnv(AUVTrackingEnv):
         self._flow_image.zero_()
         self._flow_image[:, 0] = torch.where(mask, du.view(-1, 1, 1), torch.zeros_like(dx))
         self._flow_image[:, 1] = torch.where(mask, dv.view(-1, 1, 1), torch.zeros_like(dy))
+        # GT分支外观平面：真值disk即mask（ablation上限）
+        self._app_plane.zero_()
+        self._app_plane[:, 0] = mask.float()
 
     def _teach_gate(self, rgb_nhwc: torch.Tensor) -> torch.Tensor:
         """Rectangle around the teach-template detection. Empty when the photo does not match."""
@@ -1027,6 +1108,17 @@ class AUVTrackingV5FlowEnv(AUVTrackingEnv):
 
     def _reset_idx(self, env_ids: Sequence[int] | None = None):
         super()._reset_idx(env_ids)
+        # 初始位形：目标定在正前方2m/0°（cfg），姿态与追踪机一致（正视后视角teach）。
+        # base把目标yaw设成首航向（朝waypoint），这里改写成agent yaw并重同步实体。
+        if True:
+            ids_t = torch.as_tensor(
+                self._robot._ALL_INDICES if env_ids is None else env_ids,
+                device=self.device,
+                dtype=torch.long,
+            ).view(-1)
+            _, _, ay = euler_xyz_from_quat(self._default_root_state[ids_t, 3:7])
+            self.target_motion.yaw[ids_t] = ay
+            self._sync_target_entity(ids_t)
         # Base __init__ may call _reset_idx through DirectRLEnv before _setup_scene has run, so
         # the buffer is not guaranteed to exist yet.
         if not hasattr(self, "_stack_pending_reset"):
@@ -1049,6 +1141,15 @@ class AUVTrackingV5FlowEnv(AUVTrackingEnv):
             self._prev_rgb_ok[ids] = False
         if hasattr(self, "_flow_est_ok"):
             self._flow_est_ok[ids] = False
+        if hasattr(self, "_cue_w"):
+            self._cue_w[ids] = 0.0
+            self._cue_w_ok[ids] = False
+        if hasattr(self, "_teach_w"):
+            self._teach_w[ids] = 0.0
+            self._teach_w_ok[ids] = False
+            self._size_ratio[ids] = 1.0
+        if hasattr(self, "_app_plane"):
+            self._app_plane[ids] = 0.0
         if hasattr(self, "_oov_streak"):
             self._oov_streak[ids] = 0
         if hasattr(self, "_cam_locked"):
@@ -1064,6 +1165,9 @@ class AUVTrackingV5FlowEnv(AUVTrackingEnv):
         if not hasattr(self, "_tiled_camera"):
             return
         agent_pos, agent_yaw = self._agent_pose_2d()
+        # 特权critic（R6回滚结论）：teacher_lock用真值播种KF是Holo v1标准做法，
+        # 部署时critic本来就扔掉，只有纯净actor上机。R5去GT锁导致训练初期belief全错→
+        # 死亡螺旋（bearing 36.5°），证明锁定瞬间需要这个“睁眼”。之后全是NCC测量。
         _z_gt, r_true, a_true = self.kf.get_observation(self._target_pos, agent_pos, agent_yaw)
         rgb = self._tiled_camera.data.output["rgb"]
         if rgb.dtype != torch.uint8:

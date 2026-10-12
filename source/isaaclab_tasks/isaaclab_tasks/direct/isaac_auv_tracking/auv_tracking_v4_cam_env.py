@@ -13,9 +13,11 @@ baseline. This module is the copy we iterate on. Exactly two things differ, and 
    velocity lag + the episode soft-start / leash schedule) drives it, and the pose is still
    teleported onto the rigid object every physics tick by ``_sync_target_entity``.
 2. **Sensing** — the OceanSim FLS is dropped. KF measurement is the camera path
-   (``kf_measurement="cam"``). The actor sees a stack of ``K=4`` RGB frames
-   ``(12, 64, 64)`` plus a 2-channel GT optical-flow image. The critic sees only the
-   4-D KF belief ``[r, alpha, log det(Sigma), observed]``.
+   (``kf_measurement="cam"``). The actor sees 1 RGB frame ``(3, 64, 64)`` plus a stack
+   of ``K-1`` GT optical-flow frames (``2*(K-1)`` channels: the target's pinhole-projected
+   pixel displacement, stamped as a disk), i.e. 3 + 2*(K-1) = 9 channels into the first
+   convolution for ``K=4``. The critic sees only the 4-D KF belief
+   ``[r, alpha, log det(Sigma), observed]``.
 
 Target cruise is 0.5 m/s (max 0.6). Surge maps ``a_v`` onto ``[-1.0, 1.0]`` m/s.
 Yaw scale stays 0.5 rad/s. No bearing cone. Geometry penalties are range 0.20 /
@@ -124,7 +126,10 @@ class AUVTrackingV4CamEnvCfg(AUVTrackingEnvCfg):
     # v0 / Holo cruise, same as the 2026-09-22 10:22 run. Spread 1 keeps it constant.
     # Max is 1.2× cruise. Cold start is unchanged: 0–3 s ramp 0→0.5 with leash,
     # 3–5 s full cruise with leash, then free RRT. No bearing cone (base default 180°).
-    # Surge is a_v mapped onto [-1.0, 1.0] m/s (a_v=-1 reverses at 1 m/s).
+    # Holo v1 parity: action_scale_w 0.5 -> yaw a_w * 0.5.
+    # Surge is +-1.0 m/s, i.e. the 800k training snapshot (`params/env.yaml` in
+    # models/auv_tracking/v4_cam_sb3_sac_800k). The 2026-09-28/29 revision widened it to
+    # v1's +-1.5; reverted here so the config matches the frozen checkpoint.
     action_v_min: float = -1.0
     action_v_max: float = 1.0
     target_speed: float = 0.5
@@ -146,14 +151,44 @@ class AUVTrackingV4CamEnvCfg(AUVTrackingEnvCfg):
     rew_scale_lag: float = 0.0
     rew_scale_range: float = 0.0
     rew_range_star: float = 2.0
-    rew_range_sigma: float = 0.6
     rew_scale_bearing: float = 0.0
     rew_bearing_sigma_frac: float = 0.45
-    # Same weights as the 2026-09-22 10:22 run, on top of 0.2 * (-log det Σ).
+    # --- reward: restored to the 800k training snapshot (2026-09-29) ---
+    #
+    # This block is the Holo-bounded shaping the frozen checkpoint
+    # (`models/auv_tracking/v4_cam_sb3_sac_800k`) was trained under, verbatim:
+    #     uncertainty 0.2, range 0.2 / sigma 0.6, bearing 0.3, clip 1.0
+    #
+    # History, so the pendulum is not re-swung blind. The 2026-09-28 "rebalance" argued
+    # that `-log det(Sigma)` saturates at the EKF floor (3.39/step at weight 0.2) within
+    # ~3 steps of the target entering the 90 deg / 4 m cone, independent of range and
+    # bearing, so the agent could park at mean_gt_r 2.14 m / median |bearing| 13.6 deg and
+    # still bank the information term. It therefore dropped uncertainty to 0.02, made the
+    # geometry costs primary, and removed the `clamp(max=1.0)` that flattened them outside
+    # their band. The 2026-09-29 follow-up added a linear bearing tail and a yaw-saturation
+    # penalty on top.
+    #
+    # That line of experiments did not produce a usable policy: the 16-env rebalance run
+    # (logs/sb3/.../2026-09-28_18-52-44) peaked at ep_rew -174 @200k and degraded
+    # monotonically to -506 @780k with ep_len falling 193 -> 118. This revert restores the
+    # configuration whose 800k checkpoint actually tracks (lost 0.3 %, med|alpha| 13.6 deg
+    # over 20 deterministic episodes).
+    #
+    # `_compute_step_reward` needs no change: with `rew_penalty_clip = 1.0` it clamps
+    # range / bearing / action-delta at 1.0 exactly as the legacy code did, and the two new
+    # terms below are weighted 0.0, so the arithmetic is identical to the 800k revision.
+    rew_scale_uncertainty_mean: float = 0.2
+    rew_penalty_clip: float = 1.0  # >0 restores the legacy `clamp(max=1.0)` on each cost
     rew_penalty_range: float = 0.2
+    rew_range_sigma: float = 0.6
     rew_penalty_bearing: float = 0.3
     rew_penalty_lost: float = 0.5
     rew_penalty_action_delta: float = 0.02
+    # Kept as fields (the reward code reads them) but neutralised: the 800k revision had
+    # neither term. Set >0 together with the weights above to re-enable the 09-29 shaping.
+    rew_bearing_linear_deg: float = 15.0
+    rew_penalty_bearing_linear: float = 0.0
+    rew_penalty_yaw_sat: float = 0.0
 
     # Uniform scale applied to the target AUV only (1.0 = same size as the agent). 0.8 makes the
     # tracked vehicle 80% of the agent's length; see _apply_target_scale.
@@ -246,9 +281,10 @@ class AUVTrackingV4CamEnvCfg(AUVTrackingEnvCfg):
     # [d, alpha, log det(Sigma), observed] with a single target (see world_auv_v0.py); the
     # obstacle pair is absent because this task has no obstacles.
     #
-    # uint8 keeps the replay buffer at 1 byte/pixel. K=4 RGB frames are 12 channels.
-    # ``flow_image`` is the actor's GT motion. The vision encoder concatenates those
-    # 2 channels with the 12, so the first convolution sees 14 channels.
+    # uint8 keeps the replay buffer at 1 byte/pixel for the RGB frames. The actor input is the
+    # 800k snapshot's scheme: K=4 stacked RGB frames (12 channels) plus ONE 2-channel GT flow
+    # image (du/W, dv/H of the target's pinhole-projected pixel displacement), i.e.
+    # frame_stack * 3 + 2 = 14 channels into the first convolution.
     #
     # This is the shape the POLICY sees, i.e. the camera's render is downsampled to it; note it is
     # cam_* (64x64), not render_* (256x256), so the buffer cost above is unaffected by the render
@@ -268,6 +304,36 @@ class AUVTrackingV4CamEnvCfg(AUVTrackingEnvCfg):
             low=-1.0, high=1.0, shape=(2, cam_height, cam_width), dtype=np.float32
         ),
     }
+
+
+# #region agent log
+def _dbg_v4cam_log(hypothesis_id: str, location: str, message: str, data: dict) -> None:
+    """NDJSON trace for debug session b16d15 (v4-cam actor-input inspection)."""
+    import json as _json
+    import time as _time
+
+    try:
+        with open("/home/lh/IsaacLab/.cursor/debug-b16d15.log", "a", encoding="utf-8") as _fh:
+            _fh.write(
+                _json.dumps(
+                    {
+                        "sessionId": "b16d15",
+                        "id": f"log_{int(_time.time() * 1000)}_{hypothesis_id}",
+                        "timestamp": int(_time.time() * 1000),
+                        "location": location,
+                        "message": message,
+                        "data": data,
+                        "hypothesisId": hypothesis_id,
+                    },
+                    default=str,
+                )
+                + "\n"
+            )
+    except Exception:
+        pass
+
+
+# #endregion
 
 
 class AUVTrackingV4CamEnv(AUVTrackingEnv):
@@ -292,7 +358,8 @@ class AUVTrackingV4CamEnv(AUVTrackingEnv):
         self._tiled_camera = TiledCamera(self.cfg.tiled_camera)
         self.scene.sensors["tiled_camera"] = self._tiled_camera
         # Allocate the frame stack here: _setup_scene runs before the first _reset_idx, and
-        # self.device / self.num_envs are already final.
+        # self.device / self.num_envs are already final. The actor sees the K=4 RGB stack plus
+        # the single-frame GT flow image, matching the 800k snapshot.
         k = int(self.cfg.frame_stack)
         self._frame_buf = torch.zeros(
             (self.num_envs, k * 3, self.cfg.cam_height, self.cfg.cam_width),
@@ -569,10 +636,16 @@ class AUVTrackingV4CamEnv(AUVTrackingEnv):
             self._sync_robot_usd_pose()
 
     def _compute_step_reward(self) -> torch.Tensor:
-        """v0 uncertainty reward, plus a small action-delta cost for stability.
+        """Uncertainty reward (auxiliary), plus unbounded geometry costs (primary).
 
-        Range, bearing, and lost costs default to 0: those pinned a distance and a
-        viewing direction on top of -log det(Σ).
+        The base term is `rew_scale_uncertainty_mean * -log det(Sigma)`, which saturates at the
+        EKF floor within ~3 steps of the target being inside the FOV -- see
+        `AUVTrackingV4CamEnvCfg.rew_penalty_clip` for the measurement. So the range/bearing
+        quadratic costs carry the tracking gradient.
+
+        Whether those costs are clipped is the `rew_penalty_clip` knob: the historical value 1.0
+        made each cost constant outside its band, i.e. zero gradient at long range / large bearing,
+        which let the policy park inside the dead band. The default is now 0.0 (no clip).
         """
         rew = super()._compute_step_reward()
 
@@ -580,25 +653,38 @@ class AUVTrackingV4CamEnv(AUVTrackingEnv):
         _, gt_r, gt_a = self.kf.get_observation(self._target_pos, agent_pos, agent_yaw)
 
         range_sigma = max(float(self.cfg.rew_range_sigma), 1.0e-6)
-        range_cost = torch.clamp(((gt_r - float(self.cfg.rew_range_star)) / range_sigma) ** 2, max=1.0)
+        range_cost = ((gt_r - float(self.cfg.rew_range_star)) / range_sigma) ** 2
 
         bearing_sigma = max(
             float(self.cfg.rew_bearing_sigma_frac) * float(self._fov_half),
             1.0e-6,
         )
-        bearing_cost = torch.clamp((gt_a / bearing_sigma) ** 2, max=1.0)
+        bearing_cost = (gt_a / bearing_sigma) ** 2
 
-        action_delta_cost = torch.clamp(
-            torch.sum((self._actions - self._prev_actions) ** 2, dim=-1),
-            max=1.0,
-        )
+        action_delta_cost = torch.sum((self._actions - self._prev_actions) ** 2, dim=-1)
         lost_cost = (~self._observed).to(dtype=rew.dtype)
+        # Linear bearing tail beyond rew_bearing_linear_deg (default 15): 0.02/deg,
+        # so the late-episode drift keeps a gradient where the quadratic is flat-ish.
+        lin_deg = float(getattr(self.cfg, "rew_bearing_linear_deg", 15.0))
+        bearing_lin_cost = torch.clamp(gt_a.abs() * 57.29578 - lin_deg, min=0.0)
+        # Yaw-saturation term: |a_w| > 0.9 means commanding at the 0.5 rad/s stop.
+        yaw_sat_cost = (self._actions[:, 1].abs() > 0.9).to(dtype=rew.dtype)
+
+        # clip > 0 reproduces the legacy Holo-bounded shaping (constant cost outside the band);
+        # clip <= 0 leaves the costs unbounded so the gradient survives off-target.
+        clip = float(getattr(self.cfg, "rew_penalty_clip", 1.0))
+        if clip > 0.0:
+            range_cost = torch.clamp(range_cost, max=clip)
+            bearing_cost = torch.clamp(bearing_cost, max=clip)
+            action_delta_cost = torch.clamp(action_delta_cost, max=clip)
 
         rew = (
             rew
             - float(self.cfg.rew_penalty_range) * range_cost
             - float(self.cfg.rew_penalty_bearing) * bearing_cost
+            - float(getattr(self.cfg, "rew_penalty_bearing_linear", 0.0)) * bearing_lin_cost
             - float(self.cfg.rew_penalty_action_delta) * action_delta_cost
+            - float(getattr(self.cfg, "rew_penalty_yaw_sat", 0.0)) * yaw_sat_cost
             - float(self.cfg.rew_penalty_lost) * lost_cost
         )
         return torch.nan_to_num(rew, nan=0.0, posinf=0.0, neginf=-50.0)
@@ -653,22 +739,102 @@ class AUVTrackingV4CamEnv(AUVTrackingEnv):
         k = int(self.cfg.frame_stack)
         frame = self._read_camera_frame()  # (N, 3, H, W)
 
+        self._update_gt_flow_image()
         pending = self._stack_pending_reset
         if bool(pending.any()):
+            # Fresh episode: repeat the first frame across the stack; flow is zero (no history).
             self._frame_buf[pending] = frame[pending].repeat(1, k, 1, 1)
             self._stack_pending_reset[pending] = False
 
         live = ~pending
         if bool(live.any()):
+            # Shift by one RGB frame (3 channels) and append the newest.
             self._frame_buf[live, :-3] = self._frame_buf[live, 3:].clone()
             self._frame_buf[live, -3:] = frame[live]
 
-        self._update_gt_flow_image()
         obs["policy"] = {
             "image": self._frame_buf,
             "flow_image": self._flow_image,
             "state": belief_state,
         }
+
+        # #region agent log
+        self._dbg_v4cam_calls = getattr(self, "_dbg_v4cam_calls", 0) + 1
+        if self._dbg_v4cam_calls <= 8:
+            _i = 0
+            _f = frame[_i].detach().float()  # (3, H, W) uint8->float
+            _gray = (_f[0] == _f[1]) & (_f[1] == _f[2])
+            _fb = self._frame_buf[_i].detach().float()
+            _k = int(self.cfg.frame_stack)
+            _fr = _fb.reshape(_k, 3, *_fb.shape[-2:])
+            _fl = self._flow_image[_i].detach().float()
+            _nz = _fl.abs().sum(dim=0) > 0
+            _ng = ~_gray
+            _dbg_v4cam_log(
+                "H1",
+                "auv_tracking_v4_cam_env.py:_get_observations",
+                "rgb frame channel analysis",
+                {
+                    "call": int(self._dbg_v4cam_calls),
+                    "rgb_frame_shape": list(frame.shape),
+                    "rgb_dtype": str(frame.dtype),
+                    "gray_frac": round(float(_gray.float().mean()), 4),
+                    "nongray_px": int(_ng.sum()),
+                    "nongray_inside_flow_disk": int((_ng & _nz).sum()),
+                    "uint8_min": int(frame.min()),
+                    "uint8_max": int(frame.max()),
+                    "frame_mean": round(float(_f.mean()), 3),
+                },
+            )
+            _dbg_v4cam_log(
+                "H2",
+                "auv_tracking_v4_cam_env.py:_get_observations",
+                "frame stack analysis",
+                {
+                    "call": int(self._dbg_v4cam_calls),
+                    "K": _k,
+                    "stack_all_identical": bool(all(bool((_fr[0] == _fr[j]).all()) for j in range(1, _k))),
+                    "oldest_vs_newest_mean_abs_diff": round(float((_fr[0] - _fr[-1]).abs().mean()), 4),
+                    "per_frame_mean": [round(float(_fr[j].mean()), 2) for j in range(_k)],
+                    "reset_pending": bool(self._stack_pending_reset[_i]),
+                },
+            )
+            _dbg_v4cam_log(
+                "H3",
+                "auv_tracking_v4_cam_env.py:_get_observations",
+                "gt flow raster analysis",
+                {
+                    "call": int(self._dbg_v4cam_calls),
+                    "flow_shape": list(self._flow_image.shape),
+                    "flow_dtype": str(self._flow_image.dtype),
+                    "nonzero_px": int(_nz.sum()),
+                    "total_px": int(_nz.numel()),
+                    "nonzero_frac": round(float(_nz.float().mean()), 5),
+                    "du_min_max": [round(float(_fl[0].min()), 5), round(float(_fl[0].max()), 5)],
+                    "dv_min_max": [round(float(_fl[1].min()), 5), round(float(_fl[1].max()), 5)],
+                    "disk_center_px": [
+                        round(float(self._gt_px[_i, 0]), 2),
+                        round(float(self._gt_px[_i, 1]), 2),
+                    ],
+                    "img_center_px": [0.5 * (int(self.cfg.cam_width) - 1), 0.5 * (int(self.cfg.cam_height) - 1)],
+                },
+            )
+            _dbg_v4cam_log(
+                "H4H5",
+                "auv_tracking_v4_cam_env.py:_get_observations",
+                "obs contract",
+                {
+                    "call": int(self._dbg_v4cam_calls),
+                    "image": {"shape": list(self._frame_buf.shape), "dtype": str(self._frame_buf.dtype)},
+                    "flow_image": {"shape": list(self._flow_image.shape), "dtype": str(self._flow_image.dtype)},
+                    "state": {
+                        "shape": list(belief_state.shape),
+                        "dtype": str(belief_state.dtype),
+                        "values": [round(float(_x), 4) for _x in belief_state[_i]],
+                    },
+                },
+            )
+        # #endregion
         return obs
 
     def _update_gt_flow_image(self) -> None:

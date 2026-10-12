@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
-# Direct-v4-cam SAC: stacked grayscale frames (K=4 -> 4ch, 64x64) through a mid-size CNN.
+# Direct-v4-cam SAC: K=4 stacked RGB frames (12 ch) + 1 GT flow image (2 ch) at 64x64,
+# i.e. 14 channels into the first convolution. Restored to the 800k training snapshot
+# (models/auv_tracking/v4_cam_sb3_sac_800k/params/) on 2026-09-29.
 #
 # Hyperparams follow HoloOcean's *vision* config (drltrakc/RL_AUV_tracking/configs/algorithm/
 # sac_v1.yml), which is this task's counterpart: v4-cam keeps v0's task semantics but takes the
@@ -41,22 +43,35 @@
 # returns a state-only MLP, so the total CNN count stays at one (make_actor builds it). The critic
 # is (4 + action_dim) -> [512, 256] -> 1.
 #
-# SB3 allocates `buffer_size` steps *per environment* and keeps TWO copies (observations and
-# next_observations), so the footprint is
-#     buffer_size * num_envs * 2 * (frame_stack * 64 * 64 + 4 * 4) bytes
-#   = buffer_size * 8 * 2 * 16400 = 262 KB per unit of buffer_size.
-# num_envs=8 / buffer_size=15000  =>  120k transitions in 3.66 GiB.
-# The state vector adds 16 B/transition next to the 16 KB of pixels, i.e. ~0.1% -- the dict layout
-# does not meaningfully change the memory budget.
+# SB3's DictReplayBuffer keeps TWO copies (observations and next_observations) of ONE observation
+# (the 800k scheme: K=4 RGB frames + 1 GT flow image):
+#     image  : 12 * 64 * 64 * 1 B (uint8 RGB stack)   =  49152 B
+#     flow   :  2 * 64 * 64 * 4 B (float32 flow)      =  32768 B
+#     state  :           4 * 4 B (float32 belief)     =     16 B
+#                                              total =  81936 B
+# so a buffer of N transitions costs N * 2 * 81936 B:
+#   buffer_size= 15000 => 2.29 GiB (the value below)
+#
+# This is the total host RAM the buffer needs; the earlier notes in this file about a
+# "15 GiB / RTX 5060" ceiling were written for a different machine and do not bound this
+# config. Size it against whatever host actually runs the training.
+
+# IMPORTANT: `buffer_size` is the TOTAL number of transitions, NOT per environment.
+# DictReplayBuffer allocates `np.zeros((buffer_size // num_envs, num_envs, *shape))`, so num_envs
+# only reshapes the array -- the footprint is identical at 8 and 16 envs (verified against SB3
+# 2.8). An earlier revision of this comment multiplied by num_envs and so overstated the buffer by
+# 8-16x, and `scripts/debug_auv_cam_spaces.sh` inherited the same factor; both are now corrected
+# and the probe prints the live figure. The float32 GT flow image is why one observation is
+# 81936 B rather than the 49152 B the RGB stack alone would suggest.
+# The buffer is host (numpy) memory; numpy allocates with calloc, so unfilled capacity is not
+# resident until written.
 #
 # Scale for context: the older sonar-vision runs asked for buffer_size=100000 at 16 envs, i.e.
-# 1.6M transitions / 36.6 GiB on a 15 GiB + 18.6 GiB swap machine; that only appeared to work
-# because numpy allocates with calloc and the run stopped at ~38% fill, at 25 env-steps/s.
-# Grayscale (see cam_encoder) is what affords 6x their per-env depth in a sixth of the memory.
+# 15.3 GiB on a 15 GiB + 18.6 GiB swap machine; that only appeared to work because numpy
+# allocates with calloc and the run stopped well before filling, at 25 env-steps/s.
 #
-# NOTE: features_dim does NOT change the replay buffer (observations are still uint8 frames); it
-# only widens the extractor trunk and the head inputs. Raising buffer_size without raising
-# num_envs is the single easiest way to OOM this machine.
+# NOTE: features_dim does NOT change the replay buffer (observations are still uint8 frames);
+# it only widens the extractor trunk and the head inputs.
 
 seed: 66
 n_timesteps: 1000000
@@ -64,7 +79,16 @@ n_timesteps: 1000000
 policy: "isaaclab_tasks.direct.isaac_auv_tracking.agents.custom_sac_policy.CustomSACPolicy"
 
 learning_rate: 0.0001
+# 800k snapshot values (models/auv_tracking/v4_cam_sb3_sac_800k/params/agent.yaml).
+# Reverted 2026-09-29 from buffer_size 20000 / learning_starts 8000: that pair was part of
+# the same 09-28 revision line whose reward rebalance never produced a usable policy.
+# NOTE: buffer 15000 here is the 800k value; the earlier claim that 20000 is the RAM ceiling
+# on this box is host-specific (see the cost note above) and does not apply to the 15 GiB
+# machine this config is trained on.
 buffer_size: 15000
+# 1000 total = 125 steps/env at 8 envs. Matches the 800k snapshot (and Holo's single-env
+# config). The 09-28 revision raised it to 8000 to give the critic more random play first;
+# that change is reverted with the rest of the revert. Revisit only if the critic diverges.
 learning_starts: 1000
 batch_size: 256
 tau: 0.005
@@ -93,8 +117,9 @@ policy_kwargs:
     # 512 matches HoloOcean sac_v1's Encoder(features_dim=512); the small CNN has few params, so
     # widening the trunk is nearly free and gives the pi head the same input width v1 uses.
     features_dim: 512
-    # Actor input is the K=4 RGB stack (12 channels) plus flow_image (2 channels).
-    # MidCNNExtractor concatenates them, so the first convolution has 14 inputs.
+    # Actor input is the 800k scheme: K=4 RGB frames (12 ch) + 1 GT flow image (2 ch).
+    # MidCNNExtractor concatenates flow_image with the stack, so the first convolution
+    # has 14 inputs for K=4.
     use_sparse_flow: false
   # NOTE: `normalize_images` is deliberately left at SB3's default (True). The extractor guards
   # against being handed an already-normalised tensor, exactly like SonarEncoder.

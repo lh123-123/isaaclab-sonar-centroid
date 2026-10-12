@@ -56,6 +56,24 @@ Reproduce the check with `scripts`-external helper: load `params/env.pkl` inside
 against `parse_env_cfg(task)` (the pickle needs `omni.*` importable, so it cannot be loaded in a
 bare Python).
 
+### Addendum 2026-09-28: the live reward defaults no longer match this snapshot
+
+Deliberately changed after the freeze, to fix the saturated objective (`-log det Σ` hits its EKF
+floor within ~3 steps of the target being in the FOV, so it carried no tracking gradient):
+
+| field | training snapshot | live now |
+|---|---|---|
+| `rew_scale_uncertainty_mean` | 0.2 | 0.02 |
+| `rew_penalty_clip` (new field) | — (behaves as 1.0) | 0.0 (costs unbounded) |
+| `rew_penalty_range` | 0.2 | 0.05 |
+| `rew_penalty_bearing` | 0.3 | 0.05 |
+| `rew_penalty_action_delta` / `rew_penalty_lost` | 0.02 / 0.5 | same |
+
+Rollouts are unaffected (actions do not depend on the reward), so all the geometry numbers in
+`README.md` still reproduce; only `ep_ret` changes scale. Restore this snapshot's `ep_ret ≈ 569`
+with `env.rew_scale_uncertainty_mean=0.2 env.rew_penalty_clip=1.0 env.rew_penalty_range=0.2
+env.rew_penalty_bearing=0.3`.
+
 ## Known doc drift to fix when touching these files
 
 - `agents/sb3_sac_v4_cam_cfg.yaml` header says "stacked **grayscale** frames (K=4 -> **4ch**)".

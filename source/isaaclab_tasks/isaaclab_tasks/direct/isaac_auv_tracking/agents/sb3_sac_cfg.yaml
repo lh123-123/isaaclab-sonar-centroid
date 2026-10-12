@@ -23,6 +23,13 @@ target_update_interval: 10
 normalize_input: false
 normalize_value: false
 
+# HoloOcean v0 exploration noise (SB3_trainer.py::create_action_noise): the PID/2-D action space
+# gets NormalActionNoise(mean=0, sigma=0.05). Consumed by isaaclab_rl.sb3.process_sb3_cfg.
+action_noise:
+  type: NormalActionNoise
+  mean: [0.0, 0.0]
+  sigma: [0.05, 0.05]
+
 policy_kwargs:
   net_arch:
     pi: [256, 256, 256]

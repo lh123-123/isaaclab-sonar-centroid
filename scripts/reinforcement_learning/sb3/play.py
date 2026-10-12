@@ -54,6 +54,19 @@ parser.add_argument(
 )
 parser.add_argument("--steps", type=int, default=None, help="Number of env steps to play (default: until app closes).")
 parser.add_argument(
+    "--render_interval",
+    type=int,
+    default=None,
+    help="Physics steps between viewport/camera renders. Training uses 24 (~5 viewport FPS). "
+    "GUI defaults to 6 (~20 fps, smoother). Headless leaves the task default alone.",
+)
+parser.add_argument(
+    "--viewport_cam",
+    choices=["robot", "persp", "none"],
+    default=None,
+    help="GUI viewport camera. Default for *-cam tasks: robot onboard LookFollowCamera0.",
+)
+parser.add_argument(
     "--keep_all_info",
     action="store_true",
     default=False,
@@ -64,10 +77,13 @@ AppLauncher.add_app_launcher_args(parser)
 # parse the arguments
 args_cli, hydra_args = parser.parse_known_args()
 
-# cameras required for video, Direct-v1 vision, or OceanSim sonar KF
+# cameras required for video, Direct-v1 vision, camera tasks, or OceanSim sonar KF
 _needs_cameras = bool(args_cli.video)
 if args_cli.task is not None and "AUV-Tracking" in args_cli.task:
     if "Direct-v1" in args_cli.task:
+        _needs_cameras = True
+    elif "-cam" in args_cli.task:
+        # Direct-v3-cam / Direct-v4-cam: the RGB camera is the policy observation.
         _needs_cameras = True
     elif args_cli.kf_measurement != "gt":
         _needs_cameras = True
@@ -83,10 +99,13 @@ simulation_app = app_launcher.app
 """Rest everything follows."""
 
 import gymnasium as gym
+import math
 import os
 import random
 import time
 import torch
+
+import numpy as np
 
 from stable_baselines3 import PPO, SAC
 from stable_baselines3.common.vec_env import VecNormalize
@@ -130,6 +149,26 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     if args_cli.kf_measurement is not None and hasattr(env_cfg, "kf_measurement"):
         env_cfg.kf_measurement = args_cli.kf_measurement
 
+    # GUI viewport stutter: training uses render_interval == decimation == 24, so the image
+    # advances 0.2 s of sim time per frame (~5 fps). Rendering is cheap relative to the PID /
+    # hydrodynamics substep chain; drop the interval so the viewport updates more often.
+    # Headless play / eval keeps the task default so metrics stay comparable to training.
+    # *-cam tasks pay more per render (tiled camera); still prefer frequent presents — probe
+    # measured ~+8 ms/extra frame vs a much smoother view (interval 6→2 ≈ 4→12 presents/step).
+    ui_mode = not bool(getattr(args_cli, "headless", False))
+    render_interval = args_cli.render_interval
+    if render_interval is None and ui_mode:
+        cam_task = args_cli.task is not None and "-cam" in args_cli.task
+        render_interval = 2 if cam_task else 4
+    if render_interval is not None:
+        prev = int(env_cfg.sim.render_interval)
+        env_cfg.sim.render_interval = int(render_interval)
+        print(
+            f"[play] render_interval: {prev} -> {env_cfg.sim.render_interval} "
+            f"({'GUI smooth' if ui_mode else 'override'})",
+            flush=True,
+        )
+
     # directory for logging into
     log_root_path = os.path.join("logs", "sb3", train_task_name)
     log_root_path = os.path.abspath(log_root_path)
@@ -152,6 +191,31 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
+
+    # Point the GUI viewport at the onboard camera for *-cam tasks (same call as the v4 probe).
+    if ui_mode and args_cli.task is not None and "-cam" in args_cli.task:
+        _vp = args_cli.viewport_cam if args_cli.viewport_cam is not None else "robot"
+        if _vp != "none":
+            try:
+                from omni.kit.viewport.utility import get_viewport_from_window_name
+
+                vp = get_viewport_from_window_name("Viewport")
+                if vp is None:
+                    print("[play] WARN: no Viewport window; leaving camera untouched", flush=True)
+                else:
+                    core0 = env.unwrapped
+                    if hasattr(core0, "unwrapped"):
+                        core0 = core0.unwrapped
+                    if _vp == "persp":
+                        target = "/OmniverseKit_Persp"
+                    elif hasattr(core0, "_robot_camera_prim_paths"):
+                        target = core0._robot_camera_prim_paths()[0]
+                    else:
+                        target = "/World/envs/env_0/Robot/warpauv_base_link/LookFollowCamera0"
+                    vp.set_active_camera(target)
+                    print(f"[play] GUI viewport camera -> {target}", flush=True)
+            except Exception as exc:  # noqa: BLE001 - viewport nicety must not abort play
+                print(f"[play] WARN: could not set viewport camera: {exc}", flush=True)
 
     # post-process agent configuration
     agent_cfg = process_sb3_cfg(agent_cfg, env.unwrapped.num_envs)
@@ -213,7 +277,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     timestep = 0
     rew_sum = 0.0
     done_count = 0
-    auv_spd, tgt_spd, cmd_vs = [], [], []
+    auv_spd, tgt_spd, cmd_vs, ep_ages = [], [], [], []
+    # Extra diagnostics for reward redesign (range / FOV / col / actions / belief).
+    diag_gt_r, diag_gt_a, diag_tot, diag_obs = [], [], [], []
+    diag_logdet, diag_is_col, diag_av, diag_aw, diag_rew = [], [], [], [], []
+    diag_r_belief, diag_a_belief = [], []
     max_steps = args_cli.steps if args_cli.steps is not None else (args_cli.video_length if args_cli.video else None)
     # simulate environment
     while simulation_app.is_running():
@@ -230,19 +298,63 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         v_auv = v_tgt = cmd_v = cmd_w = float("nan")
         if hasattr(core, "_robot") and hasattr(core, "_target_state"):
             lin_w = core._robot.data.root_lin_vel_w
-            v_auv = float(torch.linalg.norm(lin_w[:, :2], dim=-1).mean())
-            v_tgt = float(torch.linalg.norm(core._target_state[:, 2:4], dim=-1).mean())
+            # Per-env speeds (not just the mean) so cold-start vs free-RRT phases stay separable.
+            auv_xy = torch.linalg.norm(lin_w[:, :2], dim=-1)
+            tgt_xy = torch.linalg.norm(core._target_state[:, 2:4], dim=-1)
             cmd = core._cmd_vel
+            v_auv = float(auv_xy.mean())
+            v_tgt = float(tgt_xy.mean())
             cmd_v = float(cmd[:, 0].mean())
             cmd_w = float(cmd[:, 1].mean())
-            auv_spd.append(v_auv)
-            tgt_spd.append(v_tgt)
-            cmd_vs.append(cmd_v)
+            auv_spd.extend(auv_xy.detach().cpu().tolist())
+            tgt_spd.extend(tgt_xy.detach().cpu().tolist())
+            cmd_vs.extend(cmd[:, 0].detach().cpu().tolist())
+            if hasattr(core, "episode_length_buf"):
+                # episode_length_buf counts control steps; soft_start_s=3 / easy_s=5 at dt=0.2 s
+                # ⇒ ages <15 / <25. Ages come from episode_length_buf.
+                ep_ages.extend(core.episode_length_buf.detach().cpu().tolist())
+            else:
+                ep_ages.extend([0] * int(auv_xy.numel()))
+
+            # Geometry vs camera FOV / KF belief (what the reward actually cares about).
+            dxy = core._target_pos[:, :2] - core._robot.data.root_pos_w[:, :2]
+            gt_r = torch.linalg.norm(dxy, dim=-1)
+            agent_pos, agent_yaw = core._agent_pose_2d()
+            _, _, gt_a = core.kf.get_observation(core._target_pos, agent_pos, agent_yaw)
+            fov_half = float(core._fov_half)
+            sensor_r = float(core.cfg.sensor_range)
+            tot = (gt_r <= sensor_r) & (gt_a.abs() <= fov_half)
+            act = torch.as_tensor(actions, device=core.device, dtype=torch.float32).reshape(core.num_envs, -1)
+            diag_gt_r.extend(gt_r.detach().cpu().tolist())
+            diag_gt_a.extend(gt_a.abs().detach().cpu().tolist())
+            diag_tot.extend(tot.float().detach().cpu().tolist())
+            diag_obs.extend(core._observed.float().detach().cpu().tolist())
+            diag_logdet.extend(core._log_det_cov().detach().cpu().tolist())
+            diag_is_col.extend(core._is_col.float().detach().cpu().tolist())
+            diag_av.extend(act[:, 0].detach().cpu().tolist())
+            diag_aw.extend(act[:, 1].detach().cpu().tolist())
+            rew_t = rewards if torch.is_tensor(rewards) else torch.as_tensor(rewards)
+            diag_rew.extend(rew_t.detach().float().cpu().reshape(-1).tolist())
+            # Belief polar from policy state when available (asymmetric critic input).
+            if isinstance(obs, dict) and "state" in obs:
+                st = obs["state"]
+                st_t = st if torch.is_tensor(st) else torch.as_tensor(st)
+                diag_r_belief.extend(st_t[..., 0].detach().float().cpu().reshape(-1).tolist())
+                diag_a_belief.extend(st_t[..., 1].abs().detach().float().cpu().reshape(-1).tolist())
+            elif hasattr(core, "_build_policy_obs"):
+                # Fallback: rebuild belief obs (r, alpha, logdet, observed).
+                bel = core._build_policy_obs()
+                diag_r_belief.extend(bel[:, 0].detach().cpu().tolist())
+                diag_a_belief.extend(bel[:, 1].abs().detach().cpu().tolist())
         if timestep % 50 == 0 or n_done:
+            tot_m = float(np.mean(diag_tot[-core.num_envs :])) if diag_tot else float("nan")
+            col_m = float(np.mean(diag_is_col[-core.num_envs :])) if diag_is_col else float("nan")
+            r_m = float(np.mean(diag_gt_r[-core.num_envs :])) if diag_gt_r else float("nan")
             print(
                 f"[play] step={timestep:4d}  mean_rew={r_mean:7.3f}  "
                 f"avg_rew={rew_sum / timestep:7.3f}  dones={done_count}  "
-                f"auv_xy={v_auv:.3f} m/s  tgt_xy={v_tgt:.3f} m/s  cmd_v={cmd_v:.3f} cmd_w={cmd_w:.3f}",
+                f"auv_xy={v_auv:.3f} m/s  tgt_xy={v_tgt:.3f} m/s  cmd_v={cmd_v:.3f} cmd_w={cmd_w:.3f}  "
+                f"gt_r={r_m:.2f} tot={tot_m:.2f} col={col_m:.2f}",
                 flush=True,
             )
         if args_cli.video and timestep >= args_cli.video_length:
@@ -258,16 +370,129 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     avg = rew_sum / max(timestep, 1)
     print(f"[play] done steps={timestep}  mean_step_rew={avg:.3f}  approx_ep_rew={avg * 200:.1f}  env_dones={done_count}")
     if auv_spd:
-        import numpy as np
+
+        a = np.asarray(auv_spd, dtype=np.float64)
+        t = np.asarray(tgt_spd, dtype=np.float64)
+        c = np.asarray(cmd_vs, dtype=np.float64)
+        age = np.asarray(ep_ages, dtype=np.float64) if ep_ages else np.zeros(len(a))
+        # Control-step dt ≈ 0.2 s (decimation=24 @ 120 Hz). soft_start_s=3 → age<15;
+        # easy_s=5 → age<25; free RRT after that. Ages come from episode_length_buf.
+        cold = age < 15
+        easy = (age >= 15) & (age < 25)
+        free = age >= 25
+
+        def _pct(x):
+            return tuple(float(np.percentile(x, p)) for p in (10, 50, 90))
+
+        def _blk(name, mask):
+            if not np.any(mask):
+                return
+            aa, tt, cc = a[mask], t[mask], c[mask]
+            gap = aa - tt
+            print(
+                f"[play][spd {name}] n={int(mask.sum())}  "
+                f"auv p10/50/90={_pct(aa)[0]:.3f}/{_pct(aa)[1]:.3f}/{_pct(aa)[2]:.3f}  "
+                f"tgt p10/50/90={_pct(tt)[0]:.3f}/{_pct(tt)[1]:.3f}/{_pct(tt)[2]:.3f}  "
+                f"cmd_v p10/50/90={_pct(cc)[0]:.3f}/{_pct(cc)[1]:.3f}/{_pct(cc)[2]:.3f}  "
+                f"auv-tgt mean={float(gap.mean()):+.3f}  frac|auv-tgt|>0.2={float(np.mean(np.abs(gap) > 0.2)):.2f}",
+                flush=True,
+            )
+
         print(
-            f"[play] AUV |v_xy| mean={float(np.mean(auv_spd)):.3f} max={float(np.max(auv_spd)):.3f} "
-            f"cmd_v mean={float(np.mean(cmd_vs)):.3f} max={float(np.max(np.abs(cmd_vs))):.3f}",
+            f"[play] AUV |v_xy| mean={float(a.mean()):.3f} max={float(a.max()):.3f} "
+            f"cmd_v mean={float(c.mean()):.3f} max={float(np.max(np.abs(c))):.3f}",
             flush=True,
         )
         print(
-            f"[play] TGT |v_xy| mean={float(np.mean(tgt_spd)):.3f} max={float(np.max(tgt_spd)):.3f}",
+            f"[play] TGT |v_xy| mean={float(t.mean()):.3f} max={float(t.max()):.3f}  "
+            f"(v0 cruise=0.5 ceil=0.6; action_scale_v=1.5 ⇒ cmd_v∈[-1.5,1.5]; rew_scale_speed=0)",
             flush=True,
         )
+        _blk("all", np.ones(len(a), dtype=bool))
+        _blk("cold0-3s", cold)
+        _blk("easy3-5s", easy)
+        _blk("free>5s", free)
+
+    if diag_gt_r:
+
+        gr = np.asarray(diag_gt_r, dtype=np.float64)
+        ga = np.asarray(diag_gt_a, dtype=np.float64)
+        tot = np.asarray(diag_tot, dtype=np.float64)
+        obs_f = np.asarray(diag_obs, dtype=np.float64)
+        ld = np.asarray(diag_logdet, dtype=np.float64)
+        col = np.asarray(diag_is_col, dtype=np.float64)
+        av = np.asarray(diag_av, dtype=np.float64)
+        aw = np.asarray(diag_aw, dtype=np.float64)
+        rw = np.asarray(diag_rew, dtype=np.float64)
+        age = np.asarray(ep_ages, dtype=np.float64) if ep_ages else np.zeros(len(gr))
+        free = age >= 25
+
+        def _pct(x):
+            return tuple(float(np.percentile(x, p)) for p in (10, 50, 90))
+
+        print("[play][diag] === tracking / FOV / collision (reward-relevant) ===", flush=True)
+        print(
+            f"[play][diag] gt_r p10/50/90={_pct(gr)[0]:.2f}/{_pct(gr)[1]:.2f}/{_pct(gr)[2]:.2f}  "
+            f"|gt_a|deg p10/50/90={_pct(np.degrees(ga))[0]:.1f}/{_pct(np.degrees(ga))[1]:.1f}/{_pct(np.degrees(ga))[2]:.1f}  "
+            f"fov_half={math.degrees(float(core._fov_half)):.1f}deg  sensor_r={float(core.cfg.sensor_range):.1f}m",
+            flush=True,
+        )
+        print(
+            f"[play][diag] tot(in FOV+range)={float(tot.mean()):.3f}  observed(KF)={float(obs_f.mean()):.3f}  "
+            f"is_col={float(col.mean()):.3f}  frac_r<1.0={float((gr < 1.0).mean()):.3f}  "
+            f"frac_r>3.5={float((gr > 3.5).mean()):.3f}  frac_|a|>15deg={float((ga > math.radians(15)).mean()):.3f}",
+            flush=True,
+        )
+        print(
+            f"[play][diag] logdet p10/50/90={_pct(ld)[0]:.2f}/{_pct(ld)[1]:.2f}/{_pct(ld)[2]:.2f}  "
+            f"rew p10/50/90={_pct(rw)[0]:.2f}/{_pct(rw)[1]:.2f}/{_pct(rw)[2]:.2f}  "
+            f"frac_rew<0={float((rw < 0).mean()):.3f}",
+            flush=True,
+        )
+        print(
+            f"[play][diag] a_v p10/50/90={_pct(av)[0]:+.2f}/{_pct(av)[1]:+.2f}/{_pct(av)[2]:+.2f}  "
+            f"a_w p10/50/90={_pct(aw)[0]:+.2f}/{_pct(aw)[1]:+.2f}/{_pct(aw)[2]:+.2f}  "
+            f"frac|a_v|>0.9={float((np.abs(av) > 0.9).mean()):.2f}  frac|a_w|>0.9={float((np.abs(aw) > 0.9).mean()):.2f}  "
+            f"frac a_v<0={float((av < 0).mean()):.2f}",
+            flush=True,
+        )
+        # Preferred standoff ~2 m (init band mid); report free-phase only so cold-start leash doesn't dominate.
+        if free.any():
+            print(
+                f"[play][diag free>5s] gt_r p50={float(np.median(gr[free])):.2f}  "
+                f"|gt_a|deg p50={float(np.degrees(np.median(ga[free]))):.1f}  "
+                f"tot={float(tot[free].mean()):.3f}  col={float(col[free].mean()):.3f}  "
+                f"|r-2| mean={float(np.abs(gr[free] - 2.0).mean()):.2f}",
+                flush=True,
+            )
+        if diag_r_belief:
+            rb = np.asarray(diag_r_belief, dtype=np.float64)
+            ab = np.asarray(diag_a_belief, dtype=np.float64)
+            print(
+                f"[play][diag] belief_r p50={float(np.median(rb)):.2f}  "
+                f"|belief_a|deg p50={float(np.degrees(np.median(ab))):.1f}  "
+                f"|belief_r - gt_r| mean={float(np.abs(rb - gr[: len(rb)]).mean()):.2f}",
+                flush=True,
+            )
+        # Dump for offline analysis / canvas.
+        dump_path = "/tmp/auv_v4_cam_play_diag.npz"
+        np.savez(
+            dump_path,
+            gt_r=gr,
+            gt_a=ga,
+            tot=tot,
+            observed=obs_f,
+            logdet=ld,
+            is_col=col,
+            a_v=av,
+            a_w=aw,
+            rew=rw,
+            auv_spd=np.asarray(auv_spd, dtype=np.float64),
+            tgt_spd=np.asarray(tgt_spd, dtype=np.float64),
+            cmd_v=np.asarray(cmd_vs, dtype=np.float64),
+            ep_age=age,
+        )
+        print(f"[play][diag] saved {dump_path}", flush=True)
 
     # close the simulator
     env.close()

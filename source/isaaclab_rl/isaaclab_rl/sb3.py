@@ -82,7 +82,38 @@ def process_sb3_cfg(cfg: dict, num_envs: int) -> dict:
         return hyperparams
 
     # parse agent configuration and convert to classes
-    return update_dict(cfg, depth=0)
+    hyperparams = update_dict(cfg, depth=0)
+
+    # Optional exploration noise. SB3 wants an ActionNoise *instance*, which YAML cannot express,
+    # so build it from a small declarative block:
+    #
+    #   action_noise:
+    #     type: NormalActionNoise
+    #     mean: [0.0, 0.0]
+    #     sigma: [0.05, 0.05]
+    #
+    # This mirrors the HoloOcean AUV-tracking baseline (SB3_trainer.py::create_action_noise, which
+    # appends NormalActionNoise(0, 0.05) for the 2-D PID action space). Absent -> no-op, so every
+    # other task is unaffected.
+    noise_cfg = hyperparams.get("action_noise")
+    if isinstance(noise_cfg, dict):
+        from stable_baselines3.common.noise import NormalActionNoise, OrnsteinUhlenbeckActionNoise
+
+        noise_types = {
+            "NormalActionNoise": NormalActionNoise,
+            "OrnsteinUhlenbeckActionNoise": OrnsteinUhlenbeckActionNoise,
+        }
+        noise_type = str(noise_cfg.get("type", "NormalActionNoise"))
+        if noise_type not in noise_types:
+            raise ValueError(
+                f"Unknown action_noise type '{noise_type}'. Expected one of {sorted(noise_types)}."
+            )
+        hyperparams["action_noise"] = noise_types[noise_type](
+            mean=np.array(noise_cfg["mean"], dtype=np.float32),
+            sigma=np.array(noise_cfg["sigma"], dtype=np.float32),
+        )
+
+    return hyperparams
 
 
 """

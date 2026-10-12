@@ -105,9 +105,28 @@ def main() -> None:
     print("[phase] env created", flush=True)
 
     print(f"[cam] kf_measurement={raw.cfg.kf_measurement}  sonar={'yes' if raw.pipeline else 'no'}", flush=True)
+
+    # This script's pixel math (px/m, `inside`, cx_img, the AABB extents) is all expressed in
+    # OBSERVATION pixels, but the intrinsics put u,v in RENDER pixels. Those coincide for v3-cam --
+    # the task hardcoded below, whose cfg.cam_* IS the render size. If that ever stops holding
+    # (e.g. pointing this at Direct-v4-cam, which renders at render_* and area-averages down in
+    # _read_camera_frame), every pixel-space verdict below becomes silently wrong, so flag it
+    # instead of reporting a confident PASS/FAIL.
+    _render_hw = tuple(int(x) for x in raw._tiled_camera.data.output["rgb"].shape[1:3])
+    _obs_hw = (int(cfg.cam_height), int(cfg.cam_width))
+    if _render_hw != _obs_hw:
+        print(
+            f"[cam] WARNING: render {_render_hw[1]}x{_render_hw[0]} != obs {_obs_hw[1]}x{_obs_hw[0]}."
+            " Pixel-space checks below assume they are equal and would be WRONG.",
+            flush=True,
+        )
+    else:
+        print(f"[cam] render == obs == {_obs_hw[1]}x{_obs_hw[0]} (pixel math below is valid)", flush=True)
     print(
         f"[cam] prim={cfg.tiled_camera.prim_path}  offset={cfg.tiled_camera.offset.pos}"
-        f"  convention={cfg.tiled_camera.offset.convention}  {cfg.cam_width}x{cfg.cam_height}"
+        f"  convention={cfg.tiled_camera.offset.convention}  obs={cfg.cam_width}x{cfg.cam_height}"
+        f"  render={getattr(cfg, 'render_width', cfg.cam_width)}x"
+        f"{getattr(cfg, 'render_height', cfg.cam_height)}"
         f"  hfov={cfg.cam_hfov_deg}  K={cfg.frame_stack}",
         flush=True,
     )
@@ -178,7 +197,18 @@ def main() -> None:
         u[in_front] = K[0, 0] * p_cam[in_front, 0] / z[in_front] + K[0, 2]
         v[in_front] = K[1, 1] * p_cam[in_front, 1] / z[in_front] + K[1, 2]
         range_m = float(np.linalg.norm(tgt_pos.numpy() - pos_w))
-        return u, v, int(in_front.sum()), range_m
+        # Projected centre point of the vehicle (single point -> unambiguous, unlike the AABB
+        # centre of a yawed OBB, which can fall off the object).
+        ctr_w = tgt_pos.numpy() + quat_apply(
+            tgt_quat.unsqueeze(0), torch.as_tensor(TGT_CENTER_OFF, dtype=torch.float32).unsqueeze(0)
+        ).numpy()[0]
+        p_ctr = (ctr_w - pos_w) @ R
+        if p_ctr[2] > 1e-6:
+            u_ctr = K[0, 0] * p_ctr[0] / p_ctr[2] + K[0, 2]
+            v_ctr = K[1, 1] * p_ctr[1] / p_ctr[2] + K[1, 2]
+        else:
+            u_ctr = v_ctr = float("nan")
+        return u, v, int(in_front.sum()), range_m, (u_ctr, v_ctr)
 
     def true_bearing_range(env_i: int = 0):
         robot_p = raw._robot.data.root_pos_w[env_i, :2].detach().cpu().numpy()
@@ -193,15 +223,21 @@ def main() -> None:
         return float(np.hypot(dx, dy)), float(np.degrees(np.arctan2(dy, dx)))
 
     def depth_at(u: float, v: float, env_i: int = 0) -> float:
-        """Rendered depth (m) at the given pixel, or NaN if unavailable."""
+        """Rendered depth (m) at the given pixel, or NaN if unavailable.
+
+        ``u, v`` come from the intrinsics matrix, so they are in RENDER pixels -- which are not
+        ``cfg.cam_width``/``cam_height`` whenever the render resolution differs from the
+        observation size (``_read_camera_frame`` downsamples). Index by the depth buffer's own
+        shape so the two can never be conflated.
+        """
         d = raw._tiled_camera.data.output.get("distance_to_image_plane")
         if d is None:
             return float("nan")
         d = d[env_i]
         d = d[..., 0] if d.ndim == 3 else d
         d = d.detach().cpu().numpy().astype(np.float64)
-        iu = int(round(min(max(u, 0), cfg.cam_width - 1)))
-        iv = int(round(min(max(v, 0), cfg.cam_height - 1)))
+        iu = int(round(min(max(u, 0), d.shape[1] - 1)))
+        iv = int(round(min(max(v, 0), d.shape[0] - 1)))
         return float(d[iv, iu])
 
     actions = torch.zeros((raw.num_envs, raw.action_space.shape[-1]), device=raw.device)
@@ -227,9 +263,9 @@ def main() -> None:
         policy = obs["policy"].clone()
         if step == 0:
             shape, dtype = tuple(policy.shape), policy.dtype
-            print(f"[cam] obs shape={shape} dtype={dtype} (expect (N, {cfg.frame_stack * 3}, "
+            print(f"[cam] obs shape={shape} dtype={dtype} (expect (N, {cfg.frame_stack}, "
                   f"{cfg.cam_height}, {cfg.cam_width}))", flush=True)
-            if shape[1:] != (cfg.frame_stack * 3, cfg.cam_height, cfg.cam_width) or dtype != torch.uint8:
+            if shape[1:] != (cfg.frame_stack, cfg.cam_height, cfg.cam_width) or dtype != torch.uint8:
                 ok = False
                 print("[cam] FAIL: observation shape/dtype mismatch", flush=True)
 
@@ -239,7 +275,7 @@ def main() -> None:
                 rgb = rgb.to(torch.uint8)
             save_png(rgb[..., :3].contiguous(), str(out_dir / f"frame_step{step:03d}.png"))
 
-        u, v, n_front, cam_range = target_pixel_stats(0)
+        u, v, n_front, cam_range, (u_ctr, v_ctr) = target_pixel_stats(0)
         r_m, bearing_deg = true_bearing_range(0)
         exp_px = _px_per_m(cfg, r_m)
         rb = raw._robot.data.root_pos_w[0, :3].detach().cpu().numpy()
@@ -262,19 +298,28 @@ def main() -> None:
         n_sampled += 1
         inside = (u1 > 0) and (u0 < cfg.cam_width - 1) and (v1 > 0) and (v0 < cfg.cam_height - 1)
         n_inside += int(inside)
-        # Depth at the geometric target centre: this is what ties the rendered image to the
-        # derived camera pose.
-        du = 0.5 * (u0 + u1)
-        dv = 0.5 * (v0 + v1)
+        # Depth at the projected vehicle *centre* (a point that is by construction on the object),
+        # not the AABB centre: for a yawed OBB the AABB centre can land off the hull, giving inf.
+        du, dv = u_ctr, v_ctr
         d_target = depth_at(du, dv, 0)
         d_img = raw._tiled_camera.data.output["distance_to_image_plane"][0]
         d_img = (d_img[..., 0] if d_img.ndim == 3 else d_img).detach().cpu().numpy()
+        # The AABB of the yawed vehicle spans from its width up to its length, so the expected
+        # projected width is a RANGE, not 0.40 m * px_per_m (which would silently look 2x off).
+        half = TGT_HALF
+        span_min = 2.0 * float(min(half[1], half[2]))  # narrowest silhouette (width or height)
+        span_max = float(np.linalg.norm(2.0 * half))  # diagonal: worst case at 45 deg yaw
         print(
-            f"[step {step:02d}] proj centre=({du:6.1f},{dv:6.1f}) bbox w={u1-u0:5.1f} h={v1-v0:5.1f} px"
-            f"  img={cfg.cam_width}x{cfg.cam_height} centre=({cx_img:.1f},{cy_img:.1f})"
-            f"  expect_w~{exp_px*0.40:.1f} px  inside={inside}"
-            f"  | depth: at_target={d_target:6.2f} m  img_min={d_img.min():6.2f}"
-            f"  img_p5={np.percentile(d_img, 5):6.2f}  img_med={np.median(d_img):6.2f}",
+            f"[step {step:02d}] aabb=({u0:5.1f}..{u1:5.1f}, {v0:5.1f}..{v1:5.1f}) w={u1-u0:5.1f}"
+            f" h={v1-v0:5.1f} px  centre_pt=({du:5.1f},{dv:5.1f})  img_centre=({cx_img:.1f},{cy_img:.1f})"
+            f"  px/m={exp_px:5.1f}  expect_w={exp_px*span_min:4.1f}..{exp_px*span_max:4.1f} px"
+            f"  inside={inside}",
+            flush=True,
+        )
+        print(
+            f"[step {step:02d}]   depth: at_centre={d_target:6.2f} m  r_cam2tgt={cam_range:5.2f} m"
+            f"  img_min={d_img.min():6.2f}  img_p5={np.percentile(d_img, 5):6.2f}"
+            f"  img_med={np.median(d_img):6.2f}",
             flush=True,
         )
         # Decisive: the rendered depth at the target's geometric pixel must match the
@@ -299,8 +344,10 @@ def main() -> None:
     # moving scene the oldest and newest frames must differ.
     raw._reset_idx(None)
     filled_after_reset = raw._get_observations()["policy"].clone()
-    frames_reset = filled_after_reset.reshape(raw.num_envs, cfg.frame_stack, 3, cfg.cam_height, cfg.cam_width)
+    frames_reset = filled_after_reset.reshape(raw.num_envs, cfg.frame_stack, cfg.cam_height, cfg.cam_width)
     same_after_reset = bool((frames_reset[0, 0] == frames_reset[0, -1]).all())
+    # index along the frame axis: oldest 3 frames vs newest 3 frames must differ once the
+    # scene has moved (with the grayscale (K, H, W) layout dim 1 is the frame, not a channel).
     shifted = bool((policy[0, :3] != policy[0, -3:]).any())
     print(
         f"[cam] stack: identical_across_K_after_reset={same_after_reset} (expect True),"
