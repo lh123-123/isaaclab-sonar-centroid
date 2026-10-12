@@ -19,14 +19,18 @@ new here, and is the only difference from Direct-v4-cam:
    teleported onto the rigid object every physics tick by ``_sync_target_entity``.
 2. **Sensing** — the OceanSim FLS is dropped. KF measurement is the camera path
    (``kf_measurement="cam"``). The camera render feeds that measurement ONLY; the render
-   resolution does not bound the observation. The critic sees only the 4-D KF belief
-   ``[r, alpha, log det(Sigma), observed]``; the actor's input is described in (3).
+   resolution does not bound the observation. The critic sees the 6-D state
+   ``[r, alpha, log det(Sigma), observed, v_surge, yaw_rate]`` (R8: 4-D belief + own-body
+   velocity so it no longer has to infer egomotion); the actor's input is described in (3).
 3. **Actor observation (the change in this module)** — Direct-v4-cam fed the actor a
    ``(frame_stack * 3, 64, 64)`` uint8 RGB stack plus a separate 2-channel ``flow_image``, i.e.
-   ``frame_stack * 3 + 2 = 14`` channels into the first convolution. Here the actor sees ONE
-   ``(frame_stack * 2, 64, 64)`` float32 GT optical-flow stack -- 8 channels for the default
-   ``K=4``, holding du/W and dv/H of the target's pinhole-projected pixel displacement stamped
-   as a disk -- and ``flow_image`` is gone. The shared encoder needs no code change: it reads
+   ``frame_stack * 3 + 2 = 14`` channels into the first convolution. Here (R8) the actor sees
+   ONE ``(frame_stack * 2 + 1, 64, 64)`` float32 stack -- 5 channels at the default ``K=2``:
+   two optical-flow frames (du/W, dv/H) plus a 1-channel teach-NCC detection-box mask that
+   cures the static-target aliasing (flow zero + mask lit = holding a still target; both zero
+   = lost it). The flow is RAFT-estimated from consecutive renders by default
+   (``flow_source="raft"``); the analytic GT stamp is the ablation branch. ``flow_image`` as a
+   separate obs key is gone. The shared encoder needs no code change: it reads
    ``observations["image"]`` and takes its input width from ``shape[0]``, and its
    uint8/``max > 1.5`` rescale guard provably skips float32 flow bounded by 1.0.
 
@@ -35,8 +39,10 @@ One optical-flow frame already carries velocity, so stacking K of them hands the
 stays a free knob to compare against the RGB scheme.
 
 Target cruise is 0.5 m/s (max 0.6). Surge maps ``a_v`` onto ``[-1.0, 1.0]`` m/s.
-Yaw scale stays 0.5 rad/s. No bearing cone. Geometry penalties are range 0.20 /
-bearing 0.30 / action-delta 0.02 / lost 0.50. Target a2t at reset is fixed at 2 m
+Yaw scale stays 0.5 rad/s. No bearing cone. R8 step reward (``_compute_step_reward``):
+alive 1.0 + bearing 1.1 * exp(-(a/15deg)^2) + range 1.0 * exp(-(log s / 0.5)^2) where s is
+the self-calibrated size ratio - action-delta 0.03. Lost target is handled by termination
+(OOV streak / envelope), not by a penalty term. Target a2t at reset is fixed at 2 m
 and bearing 0. Motion after that is still soft-start → leash → RRT.
 
 The camera plumbing (mount pose, USD pose sync, RGB ring buffer, GT flow image) is ported
@@ -69,12 +75,9 @@ from .auv_tracking_env import AUVTrackingEnv, AUVTrackingEnvCfg
 from .cam_meas import detect_s1_rgb, focal_px, teacher_lock_rgb
 from .sonar_meas import body_polar_from_xy
 from .teach_match import (
-    _match_detail,
     cut_teach_template,
     detect_points,
     detect_teach,
-    orange_core,
-    orange_extent,
     teach_from_numpy,
 )
 
@@ -329,7 +332,8 @@ class AUVTrackingV5FlowEnvCfg(AUVTrackingEnvCfg):
     )
 
     # Asymmetric observation, mirroring HoloOcean v1's ``CustomSACPolicy``: the *actor* consumes
-    # the frame stack as ``"image"`` while the *critic* consumes the 4-D KF belief as ``"state"``.
+    # the frame stack as ``"image"`` while the *critic* consumes the 6-D state (4-D KF belief +
+    # own-body velocity, R8) as ``"state"``.
     #
     # Why the split: the v0 reward is ``c_mean * -log det(Sigma)``, i.e. a function of the filter
     # covariance. A symmetric CNN critic has to *infer* Sigma from four luma frames, which is not
@@ -346,9 +350,11 @@ class AUVTrackingV5FlowEnvCfg(AUVTrackingEnvCfg):
     # [d, alpha, log det(Sigma), observed] with a single target (see world_auv_v0.py); the
     # obstacle pair is absent because this task has no obstacles.
     #
-    # The actor input is a stack of ``frame_stack`` GT optical-flow frames, 2 channels each
-    # (du/W, dv/H of the target's pinhole-projected pixel displacement, stamped as a disk), so
-    # ``frame_stack * 2`` channels into the first convolution -- 8 for the default K=4.
+    # The actor input is a stack of ``frame_stack`` optical-flow frames, 2 channels each
+    # (du/W, dv/H of the target's pixel displacement; RAFT-estimated under
+    # ``flow_source="raft"``, analytic GT in the ablation branch), plus the 1-channel
+    # orange-appearance mask (R8: cures the static-target aliasing), so
+    # ``frame_stack * 2 + 1`` channels into the first convolution -- 5 at the default K=2.
     #
     # float32, NOT uint8: optical flow is signed and lives in [-1, 1], so the RGB "1 byte/pixel"
     # trick does not apply. Three consequences fall out of that, all of them wanted:
@@ -413,6 +419,7 @@ class AUVTrackingV5FlowEnv(AUVTrackingEnv):
             device=self.device,
         )
         self._teach: TeachRef | None = None
+        self._teach_template: torch.Tensor | None = None
         self._teach_vec = torch.zeros(self.num_envs, 4, device=self.device)
         h, w = int(self.cfg.cam_height), int(self.cfg.cam_width)
         self._flow_image = torch.zeros((self.num_envs, 2, h, w), device=self.device)
@@ -577,7 +584,9 @@ class AUVTrackingV5FlowEnv(AUVTrackingEnv):
     def _teach_npz_path(self) -> Path:
         # this file: source/isaaclab_tasks/isaaclab_tasks/direct/isaac_auv_tracking/...
         root = Path(__file__).resolve().parents[5]
-        return root / "models" / "auv_tracking" / "teach_v4_2m_0deg.npz"
+        # v5 专属 teach（目标已染橙 0.85/0.38/0.12，与 v4 未染色的 teach_v4 外观不匹配，
+        # 混用会把 ZNCC 压到 ~0.53——gate run2 实测）。npz 缺失时 _capture_teach 自捕获。
+        return root / "models" / "auv_tracking" / "teach_v5_2m_0deg.npz"
 
     def _load_teach_if_present(self) -> None:
         path = self._teach_npz_path()
@@ -589,6 +598,7 @@ class AUVTrackingV5FlowEnv(AUVTrackingEnv):
         keep = pts[0, :, 0] >= 0
         points = pts[0, keep].cpu().numpy()
         self._teach = teach_from_numpy(image, points, float(blob["range_m"]))
+        self._teach_template = cut_teach_template(self._teach.image)
 
     def _camera_rgb(self) -> torch.Tensor:
         """Render-resolution RGB ``(N, H, W, 3)`` uint8."""
@@ -614,6 +624,7 @@ class AUVTrackingV5FlowEnv(AUVTrackingEnv):
         path.parent.mkdir(parents=True, exist_ok=True)
         np.savez(path, image=image, points=points.astype(np.float32), range_m=np.float32(2.0))
         self._teach = teach_from_numpy(image, points, 2.0)
+        self._teach_template = cut_teach_template(self._teach.image)
 
     def _read_camera_frame(self) -> torch.Tensor:
         """Camera RGB ``(N, Rh, Rw, 3)`` uint8 -> observation RGB ``(N, 3, H, W)`` uint8.
@@ -752,47 +763,6 @@ class AUVTrackingV5FlowEnv(AUVTrackingEnv):
             terminated = terminated | out_of_envelope
         return terminated, truncated
 
-    def _apply_reset_extent_range(self, rgb_nhwc: torch.Tensor) -> None:
-        """Replace range with the reset-frame bbox side that changed less.
-
-        Reset is 2 m and 0 deg bearing, but target heading still faces the first waypoint,
-        so the teach photo's orange size is the wrong ruler. The side of the bbox that
-        scales more like a zoom, and less like a turn, is the range cue.
-        """
-        if not hasattr(self, "_extent_ref_ok"):
-            return
-        width, height, count = orange_extent(rgb_nhwc)
-        width = width.to(device=self.device)
-        height = height.to(device=self.device)
-        count = count.to(device=self.device)
-        fresh = (~self._extent_ref_ok) & (count >= 20.0) & (width >= 2.0) & (height >= 2.0)
-        self._extent_ref_w = torch.where(fresh, width, self._extent_ref_w)
-        self._extent_ref_h = torch.where(fresh, height, self._extent_ref_h)
-        self._extent_ref_ok = self._extent_ref_ok | fresh
-        # #region agent log
-        if bool(fresh.any()):
-            ref_rms, ref_n, ref_cw, ref_ch = orange_core(rgb_nhwc)
-            ref_rms = ref_rms.to(device=self.device)
-            ref_n = ref_n.to(device=self.device)
-            ref_cw = ref_cw.to(device=self.device)
-            ref_ch = ref_ch.to(device=self.device)
-            self._core_ref_rms = torch.where(fresh, ref_rms, self._core_ref_rms)
-            self._core_ref_n = torch.where(fresh, ref_n, self._core_ref_n)
-            self._core_ref_w = torch.where(fresh, ref_cw, self._core_ref_w)
-            self._core_ref_h = torch.where(fresh, ref_ch, self._core_ref_h)
-        # #endregion
-        usable = self._extent_ref_ok & (count >= 20.0) & (width >= 2.0) & (height >= 2.0)
-        if not bool(usable.any()):
-            return
-        rw = (2.0 * self._extent_ref_w / width.clamp(min=1.0)).clamp(0.4, 13.3)
-        rh = (2.0 * self._extent_ref_h / height.clamp(min=1.0)).clamp(0.4, 13.3)
-        use_w = (width / self._extent_ref_w.clamp(min=1.0)).log().abs() <= (
-            height / self._extent_ref_h.clamp(min=1.0)
-        ).log().abs()
-        r_hat = torch.where(use_w, rw, rh)
-        self._teach_vec[usable, 0] = r_hat[usable]
-        self._teach_vec[usable, 2] = (2.0 / r_hat[usable]).clamp(0.15, 5.0)
-
     def _get_observations(self) -> dict:
         # The base does the KF bookkeeping (predict + post-reset belief sense). Under
         # kf_measurement="cam" the belief sense reads the camera render straight off the sensor
@@ -865,6 +835,11 @@ class AUVTrackingV5FlowEnv(AUVTrackingEnv):
         curr = self._camera_rgb()
         fresh = ~self._prev_rgb_ok
         h, w = int(self.cfg.cam_height), int(self.cfg.cam_width)
+        if self._teach is None and int(self.episode_length_buf[0]) >= 5:
+            # 首帧自捕获会踩中 spawn 位姿（目标还在海床上、未同步到2m/0°悬浮reset位姿，
+            # gate run3 实测：模板变俯视海床版，ZNCC 锁背景，ncc_only 方位误差 27°）。
+            # 延后 5 步（soft-start 3s 内目标位移 cm 级，仍是标称 2m/0°）。
+            self._capture_teach(curr)
         if bool((~fresh).any()):
             est = estimate_flow(self._prev_rgb[~fresh], curr[~fresh])
             rh = float(curr.shape[1])
@@ -886,13 +861,22 @@ class AUVTrackingV5FlowEnv(AUVTrackingEnv):
 
             xs = torch.arange(w, device=self.device, dtype=torch.float32)
             mx = (mask * xs.view(1, 1, w)).sum(dim=(-2, -1)) / lit.clamp(min=1)
-            # --- bbox测距（render-res橙框，corr(w,1/r)=0.86） ---
-            # flow面积在远处系统性偏大（r_hat谎报致远），改用bbox宽度反推距离。
-            bw, _, bcount = orange_extent(curr)
+            # --- teach NCC 测距（render-res检测框；去橙化 2026-10-12） ---
+            # flow面积在远处系统性偏大（r_hat谎报致远），改用NCC框宽度反推距离；
+            # 橙mask量测整体换成teach模板匹配（detect_teach：0.65阈值+贴边拒检+尺度门）。
+            if getattr(self, "_teach_template", None) is None and self._teach is not None:
+                self._teach_template = cut_teach_template(self._teach.image)
+            if self._teach_template is not None:
+                det = detect_teach(curr, self._teach_template).to(self.device)
+            else:
+                det = torch.zeros((curr.shape[0], 5), dtype=torch.float32, device=self.device)
+                det[:, 0] = -1.0
+            self._det = det
+            bw = det[:, 2]
             rw_f = max(float(curr.shape[2]), 1.0)
             ema = float(getattr(self.cfg, "flow_cue_ema", 0.3))
             w_now = (bw / rw_f).clamp(0.0, 1.0)
-            hit = bcount >= 20
+            hit = det[:, 0] >= 0
             first = hit & ~self._cue_w_ok
             self._cue_w = torch.where(
                 first, w_now, torch.where(hit, ema * w_now + (1.0 - ema) * self._cue_w, self._cue_w)
@@ -932,16 +916,21 @@ class AUVTrackingV5FlowEnv(AUVTrackingEnv):
             # flow无效且bbox无效时下面回退4.0认瞎。EMA跨无效帧的hold只做平滑，不做真值。
             hit_sub = hit[idx]
             r_hat = torch.where(hit_sub, r_bbox_full[idx], r_area)
-            # 橙框质心（render-res→cam-res）→ bearing备选：flow无但外观在时用（治静止致盲）
-            rgbn = curr.to(torch.float32) / 255.0
-            om = (rgbn[..., 0] > rgbn[..., 1] + 0.08) & (rgbn[..., 0] > rgbn[..., 2] + 0.08) & (rgbn[..., 0] > 0.25)
-            ocn = om.sum(dim=(-2, -1)).clamp(min=1)
-            oxs = torch.arange(float(curr.shape[2]), device=self.device, dtype=torch.float32)
-            ocu = (om.float() * oxs.view(1, 1, -1)).sum(dim=(-2, -1)) / ocn
-            a_orange_full = torch.atan((cx - ocu * (w / float(curr.shape[2]))) / max(fx, 1e-6))
-            # 外观平面：render-res橙mask → cam-res（area），二值化后写入actor第5通道
+            # NCC框中心（render-res→cam-res）→ bearing备选：flow无但模板命中时用（治静止致盲）
+            a_det_full = torch.atan((cx - det[:, 0] * (w / rw_f)) / max(fx, 1e-6))
+            # 外观平面：teach检测框（render-res，pad 8px）→ cam-res（area）→ actor第5通道
+            ys_r = torch.arange(int(curr.shape[1]), device=self.device, dtype=torch.float32).view(1, -1, 1)
+            xs_r = torch.arange(int(curr.shape[2]), device=self.device, dtype=torch.float32).view(1, 1, -1)
+            pad = 8.0
+            box = (
+                (det[:, 0] >= 0).view(-1, 1, 1)
+                & (xs_r >= (det[:, 0] - 0.5 * det[:, 2] - pad).view(-1, 1, 1))
+                & (xs_r <= (det[:, 0] + 0.5 * det[:, 2] + pad).view(-1, 1, 1))
+                & (ys_r >= (det[:, 1] - 0.5 * det[:, 3] - pad).view(-1, 1, 1))
+                & (ys_r <= (det[:, 1] + 0.5 * det[:, 3] + pad).view(-1, 1, 1))
+            )
             app_small = (
-                torch.nn.functional.interpolate(om.float().unsqueeze(1), size=(h, w), mode="area") > 0.3
+                torch.nn.functional.interpolate(box.float().unsqueeze(1), size=(h, w), mode="area") > 0.3
             ).float()
             self._app_plane.zero_()
             self._app_plane[~fresh] = app_small[~fresh]
@@ -950,7 +939,7 @@ class AUVTrackingV5FlowEnv(AUVTrackingEnv):
                 ok, r_hat, torch.where(hit_sub, r_bbox_full[idx], torch.full_like(r_hat, float(self.cfg.sensor_range)))
             )
             self._flow_est_a[idx] = torch.where(
-                ok, a_hat, torch.where(hit_sub, a_orange_full[idx], torch.full_like(a_hat, float(self._fov_half)))
+                ok, a_hat, torch.where(hit_sub, a_det_full[idx], torch.full_like(a_hat, float(self._fov_half)))
             )
             self._flow_image[fresh] = 0.0
             self._flow_est_ok[fresh] = False
@@ -1008,103 +997,6 @@ class AUVTrackingV5FlowEnv(AUVTrackingEnv):
         # GT分支外观平面：真值disk即mask（ablation上限）
         self._app_plane.zero_()
         self._app_plane[:, 0] = mask.float()
-
-    def _teach_gate(self, rgb_nhwc: torch.Tensor) -> torch.Tensor:
-        """Rectangle around the teach-template detection. Empty when the photo does not match."""
-        if getattr(self, "_teach_template", None) is None and self._teach is not None:
-            self._teach_template = cut_teach_template(self._teach.image)
-        h, w = int(rgb_nhwc.shape[1]), int(rgb_nhwc.shape[2])
-        gate = torch.zeros(self.num_envs, h, w, dtype=torch.bool, device=self.device)
-        if getattr(self, "_teach_template", None) is None:
-            return gate
-        det = detect_teach(rgb_nhwc, self._teach_template).to(self.device)
-        self._det = det
-        cx, cy, bw, bh, _score = det.unbind(-1)
-        ys = torch.arange(h, device=self.device).view(1, h, 1)
-        xs = torch.arange(w, device=self.device).view(1, 1, w)
-        pad = 8.0
-        x0 = (cx - 0.5 * bw - pad).view(-1, 1, 1)
-        x1 = (cx + 0.5 * bw + pad).view(-1, 1, 1)
-        y0 = (cy - 0.5 * bh - pad).view(-1, 1, 1)
-        y1 = (cy + 0.5 * bh + pad).view(-1, 1, 1)
-        return (cx >= 0.0).view(-1, 1, 1) & (xs >= x0) & (xs <= x1) & (ys >= y0) & (ys <= y1)
-
-    def _measure_render_flow(self, rgb_nhwc: torch.Tensor) -> None:
-        """Flow is the teach-detection centre moving on the 256 image.
-
-        The network receives only that 3-vector. A missed detection writes zeros.
-        """
-        curr = rgb_nhwc.permute(0, 3, 1, 2).contiguous()
-        n, _, h, w = curr.shape
-        if getattr(self, "_det_prev_ok", None) is None or self._det_prev_ok.shape[0] != n:
-            self._det_prev_ok = torch.zeros(n, dtype=torch.bool, device=self.device)
-            self._det_prev_xy = torch.zeros(n, 2, device=self.device)
-            self._det_prev_wh = torch.zeros(n, 2, device=self.device)
-            self._hi_hold = torch.ones(n, dtype=torch.bool, device=self.device)
-        hold = self._hi_hold
-        if bool(hold.any()):
-            self._det_prev_ok = self._det_prev_ok.clone()
-            self._det_prev_ok[hold] = False
-        if getattr(self, "_teach_template", None) is None and self._teach is not None:
-            self._teach_template = cut_teach_template(self._teach.image)
-        if getattr(self, "_teach_template", None) is None:
-            det = curr.new_zeros(n, 5)
-            det[:, 0] = -1.0
-        else:
-            det = detect_teach(
-                rgb_nhwc,
-                self._teach_template,
-                scales=(1.0,),
-            ).to(self.device)
-        self._det = det
-        cx, cy, bw, bh, _score = det.unbind(-1)
-        hit = cx >= 0.0
-        use = hit & self._det_prev_ok & ~hold
-        du = torch.where(use, cx - self._det_prev_xy[:, 0], torch.zeros_like(cx))
-        dv = torch.where(use, cy - self._det_prev_xy[:, 1], torch.zeros_like(cy))
-        vec = torch.stack([du / float(w), dv / float(h), use.float()], dim=-1)
-        self._flow_vec = vec
-        self._flow_xs = cx.view(n, 1)
-        self._flow_ys = cy.view(n, 1)
-        self._flow_du = du.view(n, 1)
-        self._flow_dv = dv.view(n, 1)
-        self._flow_ok = hit.view(n, 1)
-        self._det_prev_xy = torch.where(hit[:, None], torch.stack([cx, cy], dim=-1), self._det_prev_xy)
-        self._det_prev_wh = torch.where(hit[:, None], torch.stack([bw, bh], dim=-1), self._det_prev_wh)
-        self._det_prev_ok = hit
-        new_alive = hit.view(n, 1)
-        self._hi_curr = curr
-        # #region agent log
-        try:
-            import json as _json
-            import time as _time
-
-            _det = getattr(self, "_det", None)
-            _d0 = None if _det is None else [round(float(v), 3) for v in _det[0].tolist()]
-            with open("/home/lh/IsaacLab/.cursor/debug-ffd96a.log", "a", encoding="utf-8") as _fh:
-                _fh.write(
-                    _json.dumps(
-                        {
-                            "sessionId": "ffd96a",
-                            "runId": "flow-follow",
-                            "hypothesisId": "A-F",
-                            "location": "auv_tracking_v5_flow_env.py:_measure_render_flow",
-                            "message": "teach detect",
-                            "data": {
-                                "hold": bool(hold[0].item()),
-                                "det_cx_cy_bw_bh_score": _d0,
-                                "alive_after": int(new_alive[0].sum()),
-                                "flow": [round(float(v), 4) for v in vec[0].tolist()],
-                            },
-                            "timestamp": int(_time.time() * 1000),
-                        }
-                    )
-                    + "\n"
-                )
-        except OSError:
-            pass
-        # #endregion
-        self._hi_hold.zero_()
 
     def _reset_idx(self, env_ids: Sequence[int] | None = None):
         super()._reset_idx(env_ids)

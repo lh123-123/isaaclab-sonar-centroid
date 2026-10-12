@@ -323,7 +323,19 @@ def teach_from_numpy(image_hwc: np.ndarray, points_xy: np.ndarray, range_m: floa
 
 
 _DET_SCALES = (0.55, 0.75, 1.0, 1.35, 1.8)
-_DET_SCORE = 0.40
+# 0.40 matched background NCC noise (~0.50) -> 100% false positives when the target
+# leaves the FOV (probe runs 2-4, 2026-10-12: 237/237 OOV false hits). True hits at
+# r <= 3.8 m (projection >= 20 px) score >= 0.71 (p10), so 0.65 separates them.
+_DET_SCORE = 0.65
+# A detection box touching the frame border within this margin is a miss: the
+# template is truncated there and every high-score (0.76-0.88) false positive in the
+# probe runs sat against an image edge at minimum scale.
+_DET_EDGE_MARGIN = 8.0
+# Optional scale prior window (fraction of the expected box width): far-field
+# detections collapse to the minimum scale (bw_ratio ~2.3 at r > 4 m), which is
+# never a usable measurement.
+_DET_SCALE_LO = 0.6
+_DET_SCALE_HI = 1.4
 
 
 def cut_teach_template(image_hwc: torch.Tensor) -> torch.Tensor:
@@ -384,6 +396,7 @@ def detect_teach(
     prev_bh: torch.Tensor | None = None,
     prev_ok: torch.Tensor | None = None,
     scales: tuple[float, ...] | None = None,
+    exp_bw: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Find the teach template in ``curr`` ``(N, H, W, 3)``.
 
@@ -391,6 +404,11 @@ def detect_teach(
     No colour test is applied to the live frame. The previous box size is kept
     while its score still clears the detection threshold, so a nearly tied
     larger scale cannot pull the centre off the target.
+
+    A hit must clear ``_DET_SCORE``, sit fully inside ``_DET_EDGE_MARGIN`` of the
+    frame border, and — when ``exp_bw`` (expected box widths, ``(N,)``) is given —
+    keep ``bw`` within ``[_DET_SCALE_LO, _DET_SCALE_HI] * exp_bw``. These gates
+    kill the background false positives that the bare 0.40 threshold let through.
     """
     curr = curr_nhwc[..., :3].float()
     if float(curr.detach().max()) > 1.5:
@@ -450,5 +468,16 @@ def detect_teach(
     bh = bh_s[pick, gather_i]
     score = score_s[pick, gather_i]
     hit = score >= _DET_SCORE
+    m = _DET_EDGE_MARGIN
+    inside = (
+        (cx - 0.5 * bw >= m)
+        & (cx + 0.5 * bw <= float(w) - 1.0 - m)
+        & (cy - 0.5 * bh >= m)
+        & (cy + 0.5 * bh <= float(h) - 1.0 - m)
+    )
+    hit = hit & inside
+    if exp_bw is not None:
+        exp = exp_bw.reshape(-1).to(device=bw.device, dtype=bw.dtype)
+        hit = hit & (bw >= _DET_SCALE_LO * exp) & (bw <= _DET_SCALE_HI * exp)
     cx = torch.where(hit, cx, torch.full_like(cx, -1.0))
     return torch.stack([cx, cy, bw, bh, score], dim=-1)
