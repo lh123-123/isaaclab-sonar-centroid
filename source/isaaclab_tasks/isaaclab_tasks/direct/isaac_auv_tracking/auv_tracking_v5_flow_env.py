@@ -229,6 +229,13 @@ class AUVTrackingV5FlowEnvCfg(AUVTrackingEnvCfg):
     # --- range-cue通道（阶段1，diag-B：corr(w,1/r)=0.86，div符号一致率0.87）---
     flow_cue_ema: float = 0.3         # bbox宽度EMA系数（平滑检测抖动）
     rew_penalty_action_delta_v5: float = 0.03  # R5：0.01→0.03（压bang-bang；0.05留待R3式恶化时再用）
+    # NOTE (R9, 2026-10-13): a negative-surge (reverse) penalty was tried and REVERTED.
+    # Dump-based analysis shows reversals (26% of steps) coincide with the distance ALREADY
+    # growing (dr median +0.087 while reversing, +0.122 in the 8 steps before) and almost
+    # never with target approach (2.2% reversal rate when dr<-2cm): backing up is how the
+    # policy keeps the target inside the ±45°/4m kill-envelope while turning around. Do not
+    # penalize it. The real motion-quality levers are the thruster lag (CLI:
+    # env.thruster_first_order_lag=true env.dyn_time_constant=0.2) and action_delta above.
     # 近场尺度说明（R4）：r<1m时bbox宽度顶到1.0饱和、RAFT大位移被obs clip±1截断——
     # 近场本就不需要距离cue做精调，靠加码后的bearing+alive即可；cue只在中远场起作用。
     # 2026-10-08 bearing rebalance (single-channel change on top of the 800k snapshot):

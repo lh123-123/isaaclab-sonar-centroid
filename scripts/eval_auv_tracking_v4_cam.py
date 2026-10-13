@@ -154,6 +154,8 @@ def main() -> None:
     a_v_hist: list[float] = []
     a_w_hist: list[float] = []
     da_hist: list[float] = []
+    v_hist: list[float] = []
+    yawrate_hist: list[float] = []
     dones_hist: list[bool] = []
     last_act = None
 
@@ -208,6 +210,15 @@ def main() -> None:
         s_ratio.append(s_now)
         a_v_hist.append(float(actions[0, 0]))
         a_w_hist.append(float(actions[0, 1]))
+        # R9 运动分析：实测机体前向速度（env._ego_vel_state() 返回 (N,2) [v_surge, yaw_rate]；
+        # 无该方法的任务记 NaN）。
+        if hasattr(raw, "_ego_vel_state"):
+            _ego = raw._ego_vel_state()
+            v_hist.append(float(_ego[0, 0].item()))
+            yawrate_hist.append(float(_ego[0, 1].item()))
+        else:
+            v_hist.append(float("nan"))
+            yawrate_hist.append(float("nan"))
         da = 0.0 if last_act is None else float(np.linalg.norm(actions - last_act))
         da_hist.append(da)
         last_act = actions.copy()
@@ -295,6 +306,8 @@ def main() -> None:
         size_ratio=np.asarray(s_ratio),
         a_v=np.asarray(a_v_hist),
         a_w=np.asarray(a_w_hist),
+        v_surge=np.asarray(v_hist),
+        yaw_rate=np.asarray(yawrate_hist),
         da=np.asarray(da_hist),
         done=np.asarray(dones_hist, dtype=np.bool_),
     )
