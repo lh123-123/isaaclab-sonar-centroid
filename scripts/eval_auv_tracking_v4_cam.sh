@@ -9,6 +9,11 @@ source "$(dirname "$0")/lib/ensure_single_isaac_process.sh"
 ensure_single_isaac_process
 
 export TERM="${TERM:-xterm-256color}"
+# Detached launches (setsid nohup) inherit TERM=dumb; tput then fails nonzero and
+# `set -euo pipefail` aborts this script before isaaclab.sh prints anything.
+if [[ "${TERM}" == "dumb" ]]; then
+  export TERM=xterm-256color
+fi
 export PYTHONUNBUFFERED=1
 
 ./isaaclab.sh -p scripts/eval_auv_tracking_v4_cam.py \
