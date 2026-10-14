@@ -282,6 +282,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     diag_gt_r, diag_gt_a, diag_tot, diag_obs = [], [], [], []
     diag_logdet, diag_is_col, diag_av, diag_aw, diag_rew = [], [], [], [], []
     diag_r_belief, diag_a_belief = [], []
+    # World-space trajectories for offline motion plots (per env, per step).
+    diag_agent_pos, diag_tgt_pos, diag_agent_yaw = [], [], []
     max_steps = args_cli.steps if args_cli.steps is not None else (args_cli.video_length if args_cli.video else None)
     # simulate environment
     while simulation_app.is_running():
@@ -346,6 +348,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 bel = core._build_policy_obs()
                 diag_r_belief.extend(bel[:, 0].detach().cpu().tolist())
                 diag_a_belief.extend(bel[:, 1].abs().detach().cpu().tolist())
+            # Trajectories: agent world pos + yaw, target world pos (2D RRT plane).
+            agent_pos_w = core._robot.data.root_pos_w.detach().cpu()
+            diag_agent_pos.extend(agent_pos_w.reshape(-1).tolist())
+            tgt_p = core._target_pos.detach().cpu()
+            if tgt_p.shape[-1] < 3:
+                tgt_p = torch.cat([tgt_p, torch.zeros(*tgt_p.shape[:-1], 3 - tgt_p.shape[-1])], dim=-1)
+            diag_tgt_pos.extend(tgt_p.reshape(-1).tolist())
+            _, agent_yaw_arr = core._agent_pose_2d()
+            diag_agent_yaw.extend(torch.as_tensor(agent_yaw_arr).detach().cpu().reshape(-1).tolist())
         if timestep % 50 == 0 or n_done:
             tot_m = float(np.mean(diag_tot[-core.num_envs :])) if diag_tot else float("nan")
             col_m = float(np.mean(diag_is_col[-core.num_envs :])) if diag_is_col else float("nan")
@@ -491,6 +502,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             tgt_spd=np.asarray(tgt_spd, dtype=np.float64),
             cmd_v=np.asarray(cmd_vs, dtype=np.float64),
             ep_age=age,
+            agent_pos=np.asarray(diag_agent_pos, dtype=np.float64).reshape(len(gr), -1),
+            tgt_pos=np.asarray(diag_tgt_pos, dtype=np.float64).reshape(len(gr), -1),
+            agent_yaw=np.asarray(diag_agent_yaw, dtype=np.float64),
         )
         print(f"[play][diag] saved {dump_path}", flush=True)
 
