@@ -1,0 +1,51 @@
+# SPDX-License-Identifier: BSD-3-Clause
+# Direct-v7-flow-hover SAC (GS-ROV 8-thruster + cuboid proxy)
+# Optimized for raypc: RTX 3090 24GB / 62GB RAM
+#
+# Actor sees (9, 64, 64) float32: RGB(3) + flow du(1) + dv(1) + magnitude(1) + texture mask(1)
+#              + first-frame anchor offset broadcast (du, dv) — template-match offset vs
+#              the episode's first textured frame (replaces the leaky drift integral).
+# Asymmetric actor/critic (CustomSACPolicy): actor on image, critic on 15-D ego state
+#              (anchor offset du/dv, sim=(ncc+1)/2 and anchor yaw error appended).
+
+seed: 66
+n_timesteps: 2000000      # 2M steps — sufficient for convergence on this task
+n_steps: 1                # collect 1 step per rollout; max_iterations (if passed) = rollout count
+policy: "isaaclab_tasks.direct.isaac_auv_tracking.agents.custom_sac_policy.CustomSACPolicy"
+
+# SB3 SAC hyperparams — tuned for 8-env parallel rollout on raypc (RTX 3090 24GB / 62GB RAM)
+learning_rate: 3.0e-4     # slightly higher for multi-env
+# RAM ceiling: obs image is float32 (9,64,64) ≈ 147 KB, stored twice (obs+next_obs).
+#   buffer_size × 294 KB must fit next to Isaac Sim (~15 GiB RSS) on 62 GiB RAM.
+#   150k → 44 GiB (too tight: 44+15 ≈ 59/62 GiB; the 250k run OOM-died before).
+#   120k → ~35 GiB resident, safe. Buffer horizon 120k/8 = 15k vec-steps ≈ 17 min env time.
+buffer_size: 120000
+learning_starts: 5000     # v0-parity warmup; 625 vec-steps @ 8 envs
+batch_size: 256
+tau: 0.005
+gamma: 0.99
+train_freq: 1
+gradient_steps: 8         # = num_envs → 1 update per env sample; 2M steps → 2M updates (~3x v0's 665k)
+ent_coef: "auto"          # auto-tune temperature
+target_entropy: "auto"
+target_update_interval: 16
+
+# Feature normalization
+normalize_input: false
+normalize_value: false
+
+# Exploration noise
+use_action_noise: true
+action_noise_std: 0.1
+
+# Network architecture — lighter to match buffer budget
+policy_kwargs:
+  share_features_extractor: false
+  net_arch:
+    pi: [256, 256]
+    qf: [256, 256]
+  features_extractor_class: "isaaclab_tasks.direct.isaac_auv_tracking.agents.cam_encoder.MidCNNExtractor"
+  features_extractor_kwargs:
+    features_dim: 256
+
+device: "cuda:0"
