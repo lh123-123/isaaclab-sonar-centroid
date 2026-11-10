@@ -1151,8 +1151,11 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
             self._anchor_yaw[cap] = euler_xyz_from_quat(self._robot.data.root_quat_w)[2][cap]
         valid = self._anchor_valid
         if bool(valid.any()):
-            # px → m on the fronto-parallel plane: d = |px| · Z / f_px.
-            z_plane = (float(self.cfg.plane_distance) - self._robot.data.root_pos_w[:, 0]).clamp(min=0.3)
+            # px → m on the fronto-parallel plane: d = |px| · Z / f_px. Z uses the
+            # env-LOCAL x (root world x minus this env's origin) — origins are spaced
+            # 45 m apart, so world x would inflate Z by ±tens of metres for envs ≠ 0.
+            local_x = self._robot.data.root_pos_w[:, 0] - self.scene.env_origins[:, 0]
+            z_plane = (float(self.cfg.plane_distance) - local_x).clamp(min=0.3)
             self._anchor_disp_m[valid] = (
                 self._anchor_off_px[valid].norm(dim=-1) / self._anchor_f_px
             ) * z_plane[valid]
