@@ -64,7 +64,7 @@ def main():
     samples_p3 = []
     p2_end_drift = (0.0, 0.0)
     for step in range(args_cli.steps):
-        act = torch.zeros(n, 4)
+        act = torch.zeros(n, 3)
         if step >= args_cli.phase2_step:
             act[:, 0] = args_cli.surge
         if step >= args_cli.phase3_step:

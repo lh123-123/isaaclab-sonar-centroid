@@ -62,7 +62,7 @@ running = True
 
 while running and step < args_cli.steps:
     # Step env with zero actions (3-D [surge, sway, yaw])
-    act = torch.zeros(raw.num_envs, 4)
+    act = torch.zeros(raw.num_envs, 3)
     obs, rew, term, trunc, info = env.step(act)
 
     # Print metrics every 30 steps

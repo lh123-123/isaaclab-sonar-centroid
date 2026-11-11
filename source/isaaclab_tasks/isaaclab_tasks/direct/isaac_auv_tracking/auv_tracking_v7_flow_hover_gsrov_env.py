@@ -142,25 +142,27 @@ class AUVTrackingV7FlowHoverGsrovEnvCfg(AUVTrackingEnvCfg):
     # Policy frequency: 15 Hz.  decimation=8 at sim.dt=1/120 → 1/(1/120*8)=15 Hz.
     decimation: int = 8
     sim: SimulationCfg = SimulationCfg(dt=1 / 120, render_interval=8)
-    # Policy actions: [surge, sway, yaw, depth_offset], each in [-1, 1].
-    # The fourth channel offsets the depth-PID setpoint (metres = action * heave_cmd_scale).
-    # It is not a heave velocity: a velocity P-loop cannot cancel the ~2 N residual weight,
-    # so the vehicle would still sit 0.4 m deep of whatever speed it was asked for.
-    action_space: gym.spaces.Box = gym.spaces.Box(low=-1.0, high=1.0, shape=(4,), dtype=np.float32)
-    heave_cmd_scale: float = 0.5  # metres of depth-target offset at action = ±1
+    # Policy actions: [surge, sway, yaw] ∈ [-1, 1]. Depth is NOT action-controlled:
+    # the retuned PI depth loop below holds starting_depth (= the first-frame depth)
+    # on its own, so a 4th depth-offset channel was tried and dropped — with the
+    # loop fixed it carried zero learnable signal (the policy cannot speed up the
+    # integrator with a setpoint shift) and only added exploration noise.
+    action_space: gym.spaces.Box = gym.spaces.Box(low=-1.0, high=1.0, shape=(3,), dtype=np.float32)
     # Depth-loop retune, v7-LOCAL (applied post-hoc in __init__; the class defaults in
     # batch_pid.py stay untouched so v0/v4/v5/v6 keep the old P+D law).
-    #   Why retune: adding ki to the loop makes the char. poly m·s³+kd·s²+kp·s+ki, which
-    #   is Routh-stable only if kd·kp > m_eff·ki. With the old kp=5, kd=3 (product 15)
-    #   and m_eff ≈ 26 kg (13.15 rigid + heave added mass), ANY useful ki (≥0.6) is
-    #   unstable — verified in the wild: ki=4 produced a bounded ±7 cm limit cycle that
-    #   never settled. Raising kp/kd first moves the stability ceiling to
-    #   kd·kp = 6×12 = 72, leaving ki=1.5 a 1.8x margin (26×1.5 = 39).
-    #   P-droop under the 2 N sink drops to 2/12 ≈ 0.17 m, the integral clears the rest
-    #   in a few seconds (error 0.17 m × ki 1.5 → ≈0.25 m·s per second, need ≈1.3 m·s
-    #   for 2 N). heave_wrench_max 3 → 6 N: transient P+I demand exceeds 3 N; the four
-    #   verticals can deliver ~70 N so 6 N is trivial headroom, and attitude moments
-    #   never come near the old 3 N·m cap anyway.
+    #   Why: the old P-only loop (kp=5) equilibrated 0.4 m LOW of target against the
+    #   ~2 N residual weight — the 30k/300k models all hovered 0.43 m deep, capping
+    #   anchor_sim at ~0.75 (image scale drift). Adding an integral alone was NOT
+    #   enough: the char. poly m·s³+kd·s²+kp·s+ki is Routh-stable only if
+    #   kd·kp > m_eff·ki, and with the old kp=5, kd=3 (product 15) any useful ki
+    #   (≥0.6) diverges — ki=4 produced a bounded ±7 cm limit cycle that never
+    #   settled (verified in a zero-action run). Raising kp/kd first moves the
+    #   ceiling to kd·kp = 6×12 = 72, leaving ki=1.5 a 1.8x margin (26×1.5 = 39).
+    #   Validated: zero-action dip to the −6 cm deadband edge, integral clears the
+    #   bias in ~12 s, episode end z = +1.2 cm, monotone convergence.
+    #   heave clamp 3 → 6 N: transient P+I demand exceeds 3 N; the four verticals
+    #   deliver ~70 N so this is trivial headroom, and attitude moments never came
+    #   near the old 3 N·m cap anyway.
     depth_kp: float = 12.0
     depth_ki: float = 1.5
     depth_kd: float = 6.0
@@ -427,15 +429,15 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
         # command-line / benchmark overrides of render resolution would be silently ignored.
         cfg.tiled_camera.width = int(cfg.render_width)
         cfg.tiled_camera.height = int(cfg.render_height)
-        # Override action buffers to 4-D: [surge, sway, yaw, depth_offset].
-        # The parent class initializes _actions / _prev_actions as (N, 2) — we re-create
-        # after super().__init__ so the parent's own buffers are already allocated.
+        # Override action buffers to 3-D: [surge, sway, yaw]. The parent class
+        # initializes _actions / _prev_actions as (N, 2) — we re-create after
+        # super().__init__ so the parent's own buffers are already allocated.
         super().__init__(cfg, render_mode, **kwargs)
         dev = self.device
-        self._actions = torch.zeros(self.num_envs, 4, device=dev)
-        self._prev_actions = torch.zeros(self.num_envs, 4, device=dev)
-        self._cmd_vel = torch.zeros(self.num_envs, 4, device=dev)
-        self._prev_cmd_vel = torch.zeros(self.num_envs, 4, device=dev)
+        self._actions = torch.zeros(self.num_envs, 3, device=dev)
+        self._prev_actions = torch.zeros(self.num_envs, 3, device=dev)
+        self._cmd_vel = torch.zeros(self.num_envs, 3, device=dev)
+        self._prev_cmd_vel = torch.zeros(self.num_envs, 3, device=dev)
         # v7-local depth-loop retune (see cfg comment for the Routh analysis).
         # Class defaults in batch_pid.py are untouched — other tasks keep the old law.
         self.pid.kp_depth = float(self.cfg.depth_kp)
@@ -1197,9 +1199,9 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
             v = self._ocean_current_field(self._robot.data.root_pos_w, t)
             self.set_ocean_currents(None, v)
 
-        # PID at physics rate. Depth setpoint = spawn depth + policy offset, so the
-        # integral holds that depth instead of the 0.4 m buoyancy droop.
-        self.pid.depth_target[:] = float(self.cfg.starting_depth) + self._cmd_vel[:, 3]
+        # PID at physics rate. Depth setpoint is fixed at the spawn depth (= the
+        # first-frame depth); the PI branch holds it without any policy authority.
+        self.pid.depth_target[:] = float(self.cfg.starting_depth)
         self._pwm[:] = self.pid.compute(
             self._cmd_vel,
             self._robot.data.root_pos_w,
@@ -1507,29 +1509,26 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
             self._sync_robot_usd_pose()
 
     def _pre_physics_step(self, actions):
-        """v7 action: [surge, sway, yaw, depth_offset] ∈ [-1, 1].
+        """v7 action: 3-D杆量 [surge, sway, yaw] ∈ [-1, 1].
 
         PID (BatchPIDController.gsrov8) reads cmd_vel[:, 0] as surge target,
-        cmd_vel[:, 1] as sway target and cmd_vel[:, 2] as yaw target. cmd_vel[:, 3]
-        is metres added to the depth-PID setpoint (see heave_cmd_scale).
+        cmd_vel[:, 1] as sway target and cmd_vel[:, 2] as yaw target. Depth is
+        held by the retuned PI depth branch at starting_depth (first-frame depth).
         """
         self._prev_actions[:] = self._actions
         self._actions[:] = torch.clip(actions, -1.0, 1.0)
-        # Horizontal channels are velocities (m/s, rad/s). The depth channel is a
-        # position offset in metres, so it uses heave_cmd_scale rather than cmd_vel_scale.
+        # Normalize the raw joystick-like action to a bounded target velocity. The scale
+        # maps unit policy actions to cmd_vel targets (m/s per horizontal axis, rad/s yaw)
+        # — see cfg.cmd_vel_scale for why it must cover the ocean-current peak.
         scale = float(getattr(self.cfg, "cmd_vel_scale", 0.5))
-        heave_scale = float(getattr(self.cfg, "heave_cmd_scale", 0.5))
         self._cmd_vel[:, 0] = self._actions[:, 0] * scale
         self._cmd_vel[:, 1] = self._actions[:, 1] * scale
         self._cmd_vel[:, 2] = self._actions[:, 2] * scale
-        self._cmd_vel[:, 3] = self._actions[:, 3] * heave_scale
-        # Rate limit is for the velocity channels. The depth offset is a position
-        # command; slewing it with the same per-step cap would lag the setpoint.
         limit = float(getattr(self.cfg, "cmd_rate_limit", 0.0))
         if limit > 0.0:
-            lo = self._prev_cmd_vel[:, :3] - limit
-            hi = self._prev_cmd_vel[:, :3] + limit
-            self._cmd_vel[:, :3] = torch.min(torch.max(self._cmd_vel[:, :3], lo), hi)
+            lo = self._prev_cmd_vel - limit
+            hi = self._prev_cmd_vel + limit
+            self._cmd_vel[:] = torch.min(torch.max(self._cmd_vel, lo), hi)
         self._prev_cmd_vel[:] = self._cmd_vel
 
     def close(self):

@@ -114,7 +114,7 @@ step = 0
 running = True
 try:
     while running and step < args_cli.steps:
-        act = torch.zeros(raw.num_envs, 4)
+        act = torch.zeros(raw.num_envs, 3)
         obs, rew, term, trunc, info = env.step(act)
         if step % 30 == 0:
             st = obs["policy"]["state"][0]

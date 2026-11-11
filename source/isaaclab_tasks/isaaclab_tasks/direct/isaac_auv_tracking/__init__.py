@@ -18,6 +18,9 @@ from .auv_tracking_cam_env import AUVTrackingCamEnv, AUVTrackingCamEnvCfg
 from .auv_tracking_v4_cam_env import AUVTrackingV4CamEnv, AUVTrackingV4CamEnvCfg
 from .auv_tracking_v5_flow_env import AUVTrackingV5FlowEnv, AUVTrackingV5FlowEnvCfg
 from .auv_tracking_v6_flowvec_env import AUVTrackingV6FlowVecEnv, AUVTrackingV6FlowVecEnvCfg
+from .auv_tracking_v7_flow_hover_gsrov_env import AUVTrackingV7FlowHoverGsrovEnv, AUVTrackingV7FlowHoverGsrovEnvCfg
+
+import gymnasium as gym
 
 gym.register(
     id="Isaac-AUV-Tracking-Direct-v0",
@@ -27,6 +30,17 @@ gym.register(
         "env_cfg_entry_point": AUVTrackingEnvCfg,
         "rsl_rl_cfg_entry_point": agents.rsl_rl_ppo_cfg.AUVTrackingPPORunnerCfg,
         "sb3_cfg_entry_point": f"{agents.__name__}:sb3_sac_cfg.yaml",
+    },
+)
+
+# Direct-v7-flow-hover (GS-ROV variant): station keeping via global optical-flow nulling.
+gym.register(
+    id="Isaac-AUV-Tracking-Direct-v7-flow-hover-gsrov",
+    entry_point="isaaclab_tasks.direct.isaac_auv_tracking:AUVTrackingV7FlowHoverGsrovEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": AUVTrackingV7FlowHoverGsrovEnvCfg,
+        "sb3_cfg_entry_point": f"{agents.__name__}:sb3_sac_v7_flow_hover_cfg.yaml",
     },
 )
 
@@ -133,5 +147,17 @@ gym.register(
     kwargs={
         "env_cfg_entry_point": AUVTrackingV6FlowVecEnvCfg,
         "sb3_cfg_entry_point": f"{agents.__name__}:sb3_sac_v6_flowvec_cfg.yaml",
+    },
+)
+
+
+# Direct-v7-flow-hover: station keeping via global optical-flow nulling on GS-ROV.
+gym.register(
+    id="Isaac-AUV-Tracking-Direct-v7-flow-hover",
+    entry_point="isaaclab_tasks.direct.isaac_auv_tracking:AUVTrackingV7FlowHoverGsrovEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": AUVTrackingV7FlowHoverGsrovEnvCfg,
+        "sb3_cfg_entry_point": f"{agents.__name__}:sb3_sac_v7_flow_hover_cfg.yaml",
     },
 )

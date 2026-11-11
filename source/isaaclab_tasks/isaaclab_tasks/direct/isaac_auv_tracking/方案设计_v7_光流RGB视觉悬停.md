@@ -188,8 +188,9 @@ TERM=xterm-256color ./isaaclab.sh -p scripts/debug_auv_v7_drift_flow.py --headle
 
 ### 变更
 
-- 动作 3-D → **4-D**：`[surge, sway, yaw, depth_offset]`，第 4 维是深度**目标**偏移
-  （±1 → ±0.5 m，`heave_cmd_scale`）。选目标偏移而非垂向速度：速度环无法消常数偏差。
+- 动作保持 **3-D** `[surge, sway, yaw]`。曾试加第 4 维深度目标偏移（±1 → ±0.5 m），但在
+  深度环修好后第 4 维零可学信号（设定值平移加速不了积分器），只贡献探索噪声，已撤掉。
+  18 个零动作脚本随之回到 3 维。
 - 深度环 v7 本地整定（`__init__` post-hoc，不动 batch_pid 类默认，其它任务不受影响）：
   `kp 5→12, ki 0→1.5, kd 3→6, heave clamp 3→6 N`。
 - **Routh 稳定性是硬约束**：加 ki 后特征方程 `m·s³+kd·s²+kp·s+ki`，稳定需 `kd·kp > m_eff·ki`。
@@ -204,3 +205,9 @@ TERM=xterm-256color ./isaaclab.sh -p scripts/debug_auv_v7_drift_flow.py --headle
 ### 不兼容
 
 - 旧 checkpoint（3-D 动作）全部作废，SAC.load 会直接拒绝。需重训。
+
+### 终态（2026-11-11 定稿）
+
+动作 3-D 不变；深度由本地整定的 PI 环（kp 12 / ki 1.5 / kd 6 / 限幅 6 N）自主保持出生深度。
+零动作实测：初沉至死区边 −6 cm，积分 ~12 s 清偏差，episode 末 z=+1.2 cm，单调收敛。
+策略的活儿只剩水平（洋流）——这正是第一帧锚定任务本来的自由度。

@@ -90,7 +90,7 @@ rec = {
 
 env.reset()
 # warm up so first PrevFrame is valid
-zero = torch.zeros(1, 4, device=env.device)
+zero = torch.zeros(1, 3, device=env.device)
 for _ in range(3):
     env.step(zero)
 

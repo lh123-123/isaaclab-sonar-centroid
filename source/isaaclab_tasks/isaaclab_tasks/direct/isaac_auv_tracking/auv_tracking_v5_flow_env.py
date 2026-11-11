@@ -136,8 +136,9 @@ class AUVTrackingV5FlowEnvCfg(AUVTrackingEnvCfg):
 
     # --- (1) target: a second WarpAUV. Motion model is untouched (v0 target_* fields). ---
     target_cfg: RigidObjectCfg = TARGET_AUV_CFG
-    # Every episode starts with the target 2 m dead ahead, which is the teach pose.
-    # sample_uniform returns the bound itself when min == max. Agent XY and yaw stay random.
+    # Every episode starts with the target dead ahead at target_init_dist (default 2m,
+    # which is the teach pose). Agent XY and yaw stay random.
+    # sample_uniform returns the bound itself when min == max.
     target_init_dist_min: float = 2.0
     target_init_dist_max: float = 2.0
     target_init_ang_min: float = 0.0
@@ -308,6 +309,10 @@ class AUVTrackingV5FlowEnvCfg(AUVTrackingEnvCfg):
     flow_min_lit_px: int = 20
     # Consecutive steps with no flow-detected target before the episode terminates.
     oov_limit_steps: int = 10
+    # Proximity termination (GT range, meters). 0.0 = off (legacy). When > 0, gt_r below
+    # this ends the episode like leaving the envelope: 贴脸撞=任务失败，丢掉未来 alive。
+    # 2m 任务建议 0.8；1m 任务传 0.4（0.61m 接触包内已穿透，无可救局）。
+    too_close_r: float = 0.0
     # NOTE: the one-time OOV terminal penalty was deliberately removed from v5's reward
     # (see the reward block above -- termination itself already drops all future alive
     # reward). The field is NOT consumed by _compute_step_reward here; do not re-add a
@@ -592,12 +597,24 @@ class AUVTrackingV5FlowEnv(AUVTrackingEnv):
             return
         spawn.scale = (scale, scale, scale)
         print(f"[v5-flow] target AUV scaled x{scale:g}", flush=True)
+    def _teach_dist_m(self) -> float:
+        """Teach scale distance: follows the (fixed) spawn distance.
+
+        Default 2m (unchanged). With target_init_dist_min==max==1.0 the teach becomes
+        a 1m template in teach_v5_1m_0deg.npz and s=1 then means 1m everywhere
+        (reward/geometry consume only s, so nothing else changes).
+        """
+        lo = float(self.cfg.target_init_dist_min)
+        hi = float(self.cfg.target_init_dist_max)
+        return lo if lo == hi else 2.0
+
     def _teach_npz_path(self) -> Path:
         # this file: source/isaaclab_tasks/isaaclab_tasks/direct/isaac_auv_tracking/...
         root = Path(__file__).resolve().parents[5]
         # v5 专属 teach（目标已染橙 0.85/0.38/0.12，与 v4 未染色的 teach_v4 外观不匹配，
         # 混用会把 ZNCC 压到 ~0.53——gate run2 实测）。npz 缺失时 _capture_teach 自捕获。
-        return root / "models" / "auv_tracking" / "teach_v5_2m_0deg.npz"
+        g = float(self._teach_dist_m())
+        return root / "models" / "auv_tracking" / f"teach_v5_{g:g}m_0deg.npz"
 
     def _load_teach_if_present(self) -> None:
         path = self._teach_npz_path()
@@ -631,10 +648,11 @@ class AUVTrackingV5FlowEnv(AUVTrackingEnv):
             return
         image = frame.detach().cpu().numpy()
         points = pts[0, keep].detach().cpu().numpy()
+        g = float(self._teach_dist_m())
         path = self._teach_npz_path()
         path.parent.mkdir(parents=True, exist_ok=True)
-        np.savez(path, image=image, points=points.astype(np.float32), range_m=np.float32(2.0))
-        self._teach = teach_from_numpy(image, points, 2.0)
+        np.savez(path, image=image, points=points.astype(np.float32), range_m=np.float32(g))
+        self._teach = teach_from_numpy(image, points, g)
         self._teach_template = cut_teach_template(self._teach.image)
 
     def _read_camera_frame(self) -> torch.Tensor:
@@ -772,6 +790,10 @@ class AUVTrackingV5FlowEnv(AUVTrackingEnv):
         out_of_envelope = (gt_r > float(self.cfg.sensor_range)) | (gt_a.abs() > float(self._fov_half))
         if str(getattr(self.cfg, "flow_source", "gt")) == "raft":
             terminated = terminated | out_of_envelope
+        # 近距碰撞重置：gt_r 跌破 too_close_r 即判死（见 cfg 注释；0=关）。
+        too_close = float(getattr(self.cfg, "too_close_r", 0.0))
+        if too_close > 0.0:
+            terminated = terminated | (gt_r < too_close)
         return terminated, truncated
 
     def _get_observations(self) -> dict:

@@ -402,6 +402,9 @@ class Sb3VecEnvWrapper(VecEnv):
         # faster version: only process env that terminated and add bootstrapping info
         if self.fast_variant:
             infos = [{} for _ in range(self.num_envs)]
+            # per-episode reward-term means (e.g. "Episode_Reward/track") computed by the
+            # manager-based reward manager for the envs that just reset
+            episode_log = extras.get("log", {}) if isinstance(extras, dict) else {}
 
             for idx in reset_ids:
                 # fill-in episode monitoring info
@@ -409,6 +412,11 @@ class Sb3VecEnvWrapper(VecEnv):
                     "r": self._ep_rew_buf[idx],
                     "l": self._ep_len_buf[idx],
                 }
+                for key, value in episode_log.items():
+                    try:
+                        infos[idx]["episode"][key] = float(value)
+                    except (TypeError, ValueError):
+                        continue
 
                 # fill-in bootstrap information
                 infos[idx]["TimeLimit.truncated"] = truncated[idx] and not terminated[idx]

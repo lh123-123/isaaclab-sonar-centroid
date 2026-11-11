@@ -71,7 +71,7 @@ def main():
     p1_surge, p1_axial, p1_mean = [], [], []
     p2_axial = []
     for step in range(args_cli.steps):
-        act = torch.zeros(n, 4)
+        act = torch.zeros(n, 3)
         if step >= args_cli.phase2_step:
             act[:, 0] = args_cli.surge
         env.step(act)

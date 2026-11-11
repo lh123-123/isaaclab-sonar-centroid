@@ -40,7 +40,7 @@ for step in range(args_cli.steps):
     if args_cli.random:
         act = (torch.rand(n, 3) - 0.5) * 0.4
     else:
-        act = torch.zeros(n, 4)
+        act = torch.zeros(n, 3)
     env.step(act)
     flow_px = env._flow_rms.detach().cpu().numpy()
     vals.extend(float(x) for x in flow_px)

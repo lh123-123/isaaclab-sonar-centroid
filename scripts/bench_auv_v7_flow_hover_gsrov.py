@@ -43,7 +43,7 @@ def run(use_real_usd: bool) -> None:
     build = time.perf_counter() - t0
 
     env.reset()
-    act = torch.zeros(env.num_envs, 4)
+    act = torch.zeros(env.num_envs, 3)
     for _ in range(3):  # warm up shaders / compilation
         env.step(act)
 

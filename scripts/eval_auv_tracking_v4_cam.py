@@ -35,6 +35,18 @@ parser.add_argument(
     "'gt' = analytic disk stamp ablation baseline. Default: use env cfg default.",
 )
 parser.add_argument("--log_every", type=int, default=50)
+parser.add_argument(
+    "--thruster_lag",
+    action="store_true",
+    help="Enable env first-order thruster lag (must match training: "
+    "lag-trained checkpoints evaluated without lag see different dynamics).",
+)
+parser.add_argument(
+    "--dyn_time_constant",
+    type=float,
+    default=0.2,
+    help="Thruster lag time constant (s), used only with --thruster_lag.",
+)
 parser.add_argument("--summary", type=str, default="", help="JSON summary path.")
 parser.add_argument("--dump", type=str, default="", help="Optional npz of per-step arrays.")
 parser.add_argument(
@@ -104,6 +116,13 @@ def main() -> None:
     if args_cli.flow_source is not None and hasattr(env_cfg, "flow_source"):
         env_cfg.flow_source = str(args_cli.flow_source)
         print(f"[eval_v4] flow_source override -> {env_cfg.flow_source}", flush=True)
+    if bool(args_cli.thruster_lag):
+        env_cfg.thruster_first_order_lag = True
+        env_cfg.dyn_time_constant = float(args_cli.dyn_time_constant)
+        print(
+            f"[eval_v4] thruster lag ON (tau={env_cfg.dyn_time_constant}) to match lag training",
+            flush=True,
+        )
     if args_cli.render_interval is not None:
         ri = int(args_cli.render_interval)
         dec = int(getattr(env_cfg, "decimation", ri))

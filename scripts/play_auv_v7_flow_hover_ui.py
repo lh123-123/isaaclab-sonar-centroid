@@ -93,7 +93,7 @@ for step in range(args_cli.steps):
         flow_n = float(st[8])
         print(
             f"[v7-play] step={step:4d} rew={float(np.asarray(rewards).reshape(-1)[0]):.3f} "
-            f"act=({actions[0,0]:+.2f},{actions[0,1]:+.2f},{actions[0,2]:+.2f},{actions[0,3]:+.2f}) "
+            f"act=({actions[0,0]:+.2f},{actions[0,1]:+.2f},{actions[0,2]:+.2f}) "
             f"flow_n={flow_n:.4f} drift=({float(drift[0]):+.3f},{float(drift[1]):+.3f},{float(drift[2]):+.3f})",
             flush=True,
         )

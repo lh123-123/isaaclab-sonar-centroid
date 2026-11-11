@@ -39,7 +39,7 @@ print(f"[obs] depth_err={float(st[0,0]):.4f}  att_err={torch.sqrt(st[0,1]**2+st[
 print(f"[obs] state values: {st[0].tolist()}")
 
 # Step 0 with zero action
-act = torch.zeros(n, 4)
+act = torch.zeros(n, 3)
 obs2, rew, term, trunc, info2 = env.step(act)
 img2 = obs2["policy"]["image"]
 st2 = obs2["policy"]["state"]

@@ -284,6 +284,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     diag_r_belief, diag_a_belief = [], []
     # World-space trajectories for offline motion plots (per env, per step).
     diag_agent_pos, diag_tgt_pos, diag_agent_yaw = [], [], []
+    # v5-flow reward decomposition (only filled when the env exposes the flow attrs).
+    diag_r_bear, diag_r_size, diag_delta_pen, diag_flow_a, diag_size_ratio = [], [], [], [], []
     max_steps = args_cli.steps if args_cli.steps is not None else (args_cli.video_length if args_cli.video else None)
     # simulate environment
     while simulation_app.is_running():
@@ -357,6 +359,23 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             diag_tgt_pos.extend(tgt_p.reshape(-1).tolist())
             _, agent_yaw_arr = core._agent_pose_2d()
             diag_agent_yaw.extend(torch.as_tensor(agent_yaw_arr).detach().cpu().reshape(-1).tolist())
+            # v5-flow reward decomposition (R8 first-principles formula), only when the
+            # attributes exist so v0/v4-cam plays stay unaffected.
+            if hasattr(core, "_flow_est_a") and hasattr(core, "_size_ratio"):
+                sig_b = max(float(getattr(core.cfg, "rew_bearing_sigma_deg", 15.0)) / 57.29578, 1.0e-6)
+                flow_a = core._flow_est_a.detach().float()
+                r_bear = torch.exp(-((flow_a / sig_b) ** 2))
+                sig_s = max(float(getattr(core.cfg, "rew_size_sigma", 0.5)), 1.0e-6)
+                r_size = torch.exp(-((torch.log(core._size_ratio.detach().float().clamp(min=0.05)) / sig_s) ** 2))
+                act = torch.as_tensor(actions, device=core.device, dtype=torch.float32).reshape(core.num_envs, -1)
+                smooth = torch.sum((act - core._prev_actions.detach().float()) ** 2, dim=-1)
+                diag_r_bear.extend(r_bear.cpu().tolist())
+                diag_r_size.extend(r_size.cpu().tolist())
+                diag_delta_pen.extend(
+                    (float(getattr(core.cfg, "rew_penalty_action_delta_v5", 0.03)) * smooth).cpu().tolist()
+                )
+                diag_flow_a.extend(torch.rad2deg(flow_a).cpu().tolist())
+                diag_size_ratio.extend(core._size_ratio.detach().float().cpu().tolist())
         if timestep % 50 == 0 or n_done:
             tot_m = float(np.mean(diag_tot[-core.num_envs :])) if diag_tot else float("nan")
             col_m = float(np.mean(diag_is_col[-core.num_envs :])) if diag_is_col else float("nan")
@@ -505,6 +524,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             agent_pos=np.asarray(diag_agent_pos, dtype=np.float64).reshape(len(gr), -1),
             tgt_pos=np.asarray(diag_tgt_pos, dtype=np.float64).reshape(len(gr), -1),
             agent_yaw=np.asarray(diag_agent_yaw, dtype=np.float64),
+            r_bear=np.asarray(diag_r_bear, dtype=np.float64),
+            r_size=np.asarray(diag_r_size, dtype=np.float64),
+            delta_pen=np.asarray(diag_delta_pen, dtype=np.float64),
+            flow_a_deg=np.asarray(diag_flow_a, dtype=np.float64),
+            size_ratio=np.asarray(diag_size_ratio, dtype=np.float64),
         )
         print(f"[play][diag] saved {dump_path}", flush=True)
 

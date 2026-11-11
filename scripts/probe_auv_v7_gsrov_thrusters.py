@@ -43,7 +43,7 @@ def main() -> None:
     print(f"[probe] max_fwd={env.cfg.thruster_max_thrust_fwd_n} N", flush=True)
 
     env.reset()
-    act = torch.zeros(env.num_envs, 4, device=env.device)
+    act = torch.zeros(env.num_envs, 3, device=env.device)
     torch.set_printoptions(precision=4, sci_mode=False)
 
     for step in range(args_cli.steps):

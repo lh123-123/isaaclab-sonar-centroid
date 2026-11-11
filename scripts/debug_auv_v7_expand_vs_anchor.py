@@ -78,7 +78,7 @@ def main():
     rows = []
     total = args_cli.hold_steps + args_cli.cancel_steps
     for step in range(total):
-        act = torch.zeros(n, 4)
+        act = torch.zeros(n, 3)
         if step >= args_cli.hold_steps:
             act[:, 0] = args_cli.surge
         env.step(act)

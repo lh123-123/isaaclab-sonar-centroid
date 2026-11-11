@@ -63,6 +63,28 @@ def build_thruster_allocation_matrix(
     return b_mat, b_pinv
 
 
+def build_allocation_from_geometry(
+    offsets: torch.Tensor,
+    quats: torch.Tensor,
+    damping: float = 1e-4,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build ``B`` / ``B_pinv`` for an arbitrary thruster set.
+
+    ``offsets`` is ``(n, 3)`` COM->thruster vectors in metres and ``quats`` is ``(n, 4)``
+    mount rotations carrying the local +X axis onto the thrust direction. Returns ``B``
+    of shape ``(6, n)`` with ``wrench_b = B @ u`` and its Moore-Penrose pseudoinverse
+    ``(n, 6)``, so the same code serves the 6-thruster WarpAUV and the 8-thruster GS-ROV.
+    """
+    n = int(offsets.shape[0])
+    force_axis = torch.tensor([1.0, 0.0, 0.0], device=offsets.device, dtype=offsets.dtype)
+    f_b = _quat_apply(quats, force_axis.unsqueeze(0).expand(n, 3))
+    tau_b = torch.cross(offsets, f_b, dim=-1)
+    b_mat = torch.cat([f_b, tau_b], dim=1).transpose(0, 1)  # (6, n)
+    gram = b_mat @ b_mat.T + damping * torch.eye(6, device=b_mat.device, dtype=b_mat.dtype)
+    b_pinv = b_mat.T @ torch.linalg.inv(gram)  # (n, 6)
+    return b_mat, b_pinv
+
+
 def _max_secondary_scale(u_pri: torch.Tensor, u_sec: torch.Tensor, clamp: float) -> torch.Tensor:
     """Per-env scale in [0, 1] so ``|u_pri + s * u_sec| <= clamp`` on all channels."""
     eps = 1.0e-6

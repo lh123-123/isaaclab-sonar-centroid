@@ -146,7 +146,7 @@ t0 = time.time()
 while running and step < args_cli.steps:
     # Zero joystick action: the PID holds depth/attitude, the water current pushes the hull,
     # and the policy objective would be to null the ground-locked optical flow.
-    act = torch.zeros(raw.num_envs, 4, device=device)
+    act = torch.zeros(raw.num_envs, 3, device=device)
     obs, rew, term, trunc, info = env.step(act)
 
     t_now = time.time() - t0

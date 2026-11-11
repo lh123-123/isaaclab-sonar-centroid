@@ -34,7 +34,7 @@ parser.add_argument(
     help="RL algorithm (PPO or SAC).",
 )
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
-parser.add_argument("--log_interval", type=int, default=100_000, help="Log data every n timesteps.")
+parser.add_argument("--log_interval", type=int, default=10_000, help="Log data every n timesteps.")
 parser.add_argument("--checkpoint", type=str, default=None, help="Continue the training from checkpoint.")
 parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy training iterations.")
 parser.add_argument(
@@ -47,6 +47,8 @@ parser.add_argument(
 parser.add_argument("--rew_speed", type=float, default=None, help="Override rew_scale_speed (v2 speed match).")
 parser.add_argument("--rew_ref", type=float, default=None, help="Override rew_scale_ref (v2 reference distance).")
 parser.add_argument("--rew_ref_sigma", type=float, default=None, help="Override rew_ref_sigma (v2 ref gaussian width).")
+parser.add_argument("--flow_method", type=str, default=None, choices=["farneback", "raft"],
+                    help="Optical flow algorithm: 'farneback' (CPU) or 'raft' (GPU, faster).")
 parser.add_argument("--export_io_descriptors", action="store_true", default=False, help="Export IO descriptors.")
 parser.add_argument(
     "--keep_all_info",
@@ -67,6 +69,10 @@ if args_cli.task is not None and "AUV-Tracking" in args_cli.task:
         # A camera task (Direct-v3-cam / Direct-v4-cam ...): the RGB camera *is* the policy
         # observation. These use geometric-GT KF measurements, so the sonar branch below must
         # not be what decides this.
+        _needs_cameras = True
+    elif "v5-flow" in args_cli.task or "v6-flowvec" in args_cli.task or "v7-flow-hover" in args_cli.task:
+        # Camera-bearing tasks even though their name lacks "-cam": the RGB camera is the
+        # policy observation (flow derived from RGB).
         _needs_cameras = True
     elif args_cli.kf_measurement != "gt":
         _needs_cameras = True
@@ -112,7 +118,10 @@ import omni
 from stable_baselines3 import PPO, SAC
 from stable_baselines3.common.callbacks import CheckpointCallback, LogEveryNTimesteps
 
-from isaaclab_tasks.direct.isaac_auv_tracking.agents.gate_log_callback import CriticGateLogCallback
+from isaaclab_tasks.direct.isaac_auv_tracking.agents.gate_log_callback import (
+    CriticGateLogCallback,
+    EpisodeRewardLogCallback,
+)
 from stable_baselines3.common.noise import NormalActionNoise
 from stable_baselines3.common.vec_env import VecNormalize
 
@@ -185,6 +194,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         env_cfg.rew_scale_ref = args_cli.rew_ref
     if args_cli.rew_ref_sigma is not None and hasattr(env_cfg, "rew_ref_sigma"):
         env_cfg.rew_ref_sigma = args_cli.rew_ref_sigma
+    if args_cli.flow_method is not None and hasattr(env_cfg, "flow_method"):
+        env_cfg.flow_method = args_cli.flow_method
+        env_cfg.flow_device = "cuda:0" if args_cli.flow_method == "raft" else "cpu"
 
     # directory for logging into
     run_info = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -295,14 +307,20 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # Without dividing by num_envs, e.g. 3e6//20=1.5e5 with 32 envs ⇒ first ckpt at 4.8e6
     # (never reached) — so a crash leaves no model.zip.
     num_envs = int(env.num_envs)
-    ckpt_transitions = max(50_000, int(n_timesteps // 20))  # ~every 5% of the run
+    # Save often enough for short smoke runs while retaining a 5% cadence for long runs.
+    ckpt_transitions = max(1_000, int(n_timesteps // 20))  # ~every 5% of the run
     ckpt_every = max(1, ckpt_transitions // num_envs)
     print(
         f"[INFO] Checkpoint every {ckpt_every} VecEnv steps "
         f"(≈{ckpt_every * num_envs} transitions, {num_envs} envs)"
     )
     checkpoint_callback = CheckpointCallback(save_freq=ckpt_every, save_path=log_dir, name_prefix="model", verbose=2)
-    callbacks = [checkpoint_callback, LogEveryNTimesteps(n_steps=args_cli.log_interval), CriticGateLogCallback()]
+    callbacks = [
+        checkpoint_callback,
+        LogEveryNTimesteps(n_steps=args_cli.log_interval),
+        CriticGateLogCallback(),
+        EpisodeRewardLogCallback(),
+    ]
 
     # train the agent
     # reset_num_timesteps=False: keep counter so learn() stops at total n_timesteps (true resume).

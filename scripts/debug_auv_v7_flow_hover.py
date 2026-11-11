@@ -74,7 +74,7 @@ def main():
     saw_nonzero = False
     worst_absmax = 0.0
     for step in range(args_cli.steps):
-        act = torch.zeros(n, 4)
+        act = torch.zeros(n, 3)
         obs, rew, term, trunc, info = env.step(act)
         img = obs["policy"]["image"]
         st = obs["policy"]["state"]

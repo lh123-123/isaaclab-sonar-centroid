@@ -24,7 +24,12 @@ from .kalman_filter_batch import BatchKalmanFilter, BatchUnscentedKalmanFilter
 from .ocean_current import clip_current_velocity, create_ocean_current_field
 from .rigid_body_hydrodynamics import HydrodynamicForceModels
 from .sonar_meas import body_polar_from_xy, detect_centroid_polar
-from .thruster_dynamics import DynamicsFirstOrder, ConversionFunctionBasic, get_thruster_com_and_orientations
+from .thruster_dynamics import (
+    DynamicsFirstOrder,
+    ConversionFunctionBasic,
+    get_gsrov_thruster_geometry,
+    get_thruster_com_and_orientations,
+)
 
 import isaaclab.sim as sim_utils
 from isaaclab.assets import RigidObject, RigidObjectCfg
@@ -74,8 +79,11 @@ class OceanCurrentCfg:
 
 @configclass
 class AUVTrackingEnvCfg(DirectRLEnvCfg):
-    # Control period ≈ 0.2 s like HoloOcean v0 (dt=1/120, decimation=24)
-    decimation = 24
+    # Control period ≈ 0.04 s, matching the bridge's ~25 Hz MANUAL_CONTROL rate (logged P50
+    # 46 ms ≈ 21.8 Hz; use 25 Hz here so the sim's policy/timestamps line up with the PC's
+    # send cadence, and the flow per-step is naturally 5× smaller). Render interval equals
+    # decimation so camera updates once per policy step (no stale frames between steps).
+    decimation = 5
     # Holo make()/examples commonly use t_steps=200 @ 0.2 s → 40 s
     episode_length_s = 40.0
     # HoloOcean v0 PID: action_dim=2 in [-1,1], then scale [1.5, 0.5].
@@ -85,6 +93,10 @@ class AUVTrackingEnvCfg(DirectRLEnvCfg):
     state_space = 0
     action_scale_v = 1.5
     action_scale_w = 0.5
+    # Per-env-step slew limit on cmd_vel [v, w] (same units). 0.0 = off (legacy).
+    # Cuts bang-bang without touching plant dynamics (unlike thruster lag, which
+    # cost too much phase: lag-0.2 run peaked then went timid, 539 -> 131).
+    cmd_rate_limit: float = 0.0
 
     sim: SimulationCfg = SimulationCfg(dt=1 / 120, render_interval=decimation)
     robot_cfg: RigidObjectCfg = WARPAUV_CFG.replace(prim_path="/World/envs/env_.*/Robot")
@@ -239,7 +251,8 @@ class AUVTrackingEnvCfg(DirectRLEnvCfg):
     rew_c_penalty = 5.0
     proximity_margin = 1.0
     # Holo: rolling mean reward over 100 steps < -3.5 → done
-    rew_done_window = 100
+    # 100 steps @ 5 Hz = 20 s done-window → keep wall-clock same: 500 steps @ 25 Hz
+    rew_done_window = 500
     rew_done_threshold = -3.5
 
     # WarpAUV dynamics
@@ -251,13 +264,39 @@ class AUVTrackingEnvCfg(DirectRLEnvCfg):
     # First-order thruster lag. False keeps the historical instantaneous response
     # (DynamicsFirstOrder alpha forced to 0); True makes dyn_time_constant a real knob.
     thruster_first_order_lag: bool = False
+    # Thruster set + thrust model.
+    #   "warpauv6" - the calibrated WarpAUV proxy (6 thrusters, quadratic PWM curve).
+    #   "gsrov8"   - the real GS-ROV hull (4 vertical + 4 horizontal, T ~ u*|u| in Newtons).
+    thruster_layout: str = "warpauv6"
+    # ROVMAKER subsea thruster, vendor datasheet at 6S/24 V: 1000-2000 us pulse width,
+    # 1500 us neutral, 2.0 kgf forward / 1.8 kgf reverse. These are *datasheet* numbers,
+    # not measured on our hull (see ROV真机测试总结_20261101.md).
+    thruster_max_thrust_fwd_n: float = 19.613
+    thruster_max_thrust_rev_n: float = 17.652
+    thruster_neutral_us: float = 1500.0
+    thruster_span_us: float = 500.0
+    thruster_rated_voltage_v: float = 24.0
+    # Propeller thrust goes as rpm^2 and rpm goes as pack voltage, so T_max ~ (V/V_rated)^2.
+    # The bench pack measured 22.2-23.1 V, i.e. ~87 % of rated. Left at rated by default so
+    # the calibrated dynamics stay unchanged; randomise it (3S-6S is a 4x range) for robustness.
+    thruster_battery_voltage_v: float = 24.0
+    thruster_deadband: float = 0.05
     volume = 0.022747843530591776
     mass = 2.2701e01
+    # Principal inertia diagonal [Ixx, Iyy, Izz] (kg*m^2) used by the quadratic-drag
+    # and viscous-torque models. Defaults are the WarpAUV values; subclasses that swap
+    # the hull (e.g. GS-ROV) override this.
+    inertia_diag: tuple = (0.37, 0.97, 1.19)
 
     # Ocean currents (default calm water). See docs/superpowers/specs/2026-08-18-auv-ocean-current-design.md
     ocean_current: OceanCurrentCfg = OceanCurrentCfg()
     # KF measurement: "sonar" (OceanSim), "gt" (geometric polar), or "cam" (v4 RGB, see cam_meas)
     kf_measurement: str = "sonar"
+    # Target trim attitude (rad) held by the low-level attitude PID. A free-floating hull
+    # settles nose-up by atan(com_to_cob_x / com_to_cob_z) due to buoyancy torque; command
+    # that trim so the vertical thrusters do not fight the natural floating attitude.
+    trim_roll_rad: float = 0.0
+    trim_pitch_rad: float = 0.0
 
 
 class AUVTrackingEnv(DirectRLEnv):
@@ -315,7 +354,15 @@ class AUVTrackingEnv(DirectRLEnv):
         self._actions = torch.zeros(self.num_envs, 2, device=self.device)
         self._prev_actions = torch.zeros(self.num_envs, 2, device=self.device)
         self._cmd_vel = torch.zeros(self.num_envs, 2, device=self.device)
-        self._pwm = torch.zeros(self.num_envs, 6, device=self.device)
+        self._prev_cmd_vel = torch.zeros(self.num_envs, 2, device=self.device)
+        self.thruster_layout = str(getattr(self.cfg, "thruster_layout", "warpauv6")).lower()
+        if self.thruster_layout == "gsrov8":
+            geometry = get_gsrov_thruster_geometry(self.device)
+        else:
+            self.thruster_layout = "warpauv6"
+            geometry = get_thruster_com_and_orientations(self.device)
+        self.num_thrusters = int(geometry[0].shape[0])
+        self._pwm = torch.zeros(self.num_envs, self.num_thrusters, device=self.device)
         self._thrust = torch.zeros(self.num_envs, 1, 3, device=self.device)
         self._moment = torch.zeros(self.num_envs, 1, 3, device=self.device)
         self._target_state = torch.zeros(self.num_envs, 4, device=self.device)
@@ -335,15 +382,16 @@ class AUVTrackingEnv(DirectRLEnv):
 
         self.kf = self._init_kf()
 
-        self.thruster_com_offsets, self.thruster_quats = get_thruster_com_and_orientations(self.device)
-        self.thruster_com_offsets = self.thruster_com_offsets.unsqueeze(0).repeat(self.num_envs, 1, 1)
-        self.thruster_quats = self.thruster_quats.repeat(self.num_envs, 1)
+        base_offsets, base_quats = geometry
+        self.thruster_com_offsets = base_offsets.unsqueeze(0).repeat(self.num_envs, 1, 1)
+        self.thruster_quats = base_quats.repeat(self.num_envs, 1)
 
         self._gravity_mag = torch.tensor(self.sim.cfg.gravity, device=self.device).norm()
         self.inertia_tensors = torch.zeros((self.num_envs, 3), device=self.device, dtype=torch.float)
-        self.inertia_tensors[:, 0] = 0.37
-        self.inertia_tensors[:, 1] = 0.97
-        self.inertia_tensors[:, 2] = 1.19
+        inr = tuple(getattr(self.cfg, "inertia_diag", (0.37, 0.97, 1.19)))
+        self.inertia_tensors[:, 0] = float(inr[0])
+        self.inertia_tensors[:, 1] = float(inr[1])
+        self.inertia_tensors[:, 2] = float(inr[2])
         self.masses = torch.full((self.num_envs, 1), self.cfg.mass, device=self.device)
         self.com_to_cob_offsets = torch.tensor(self.cfg.com_to_cob_offset, device=self.device).repeat(self.num_envs, 1)
         self.volumes = torch.full((self.num_envs, 1), self.cfg.volume, device=self.device)
@@ -351,17 +399,29 @@ class AUVTrackingEnv(DirectRLEnv):
         self.force_calc = HydrodynamicForceModels(self.num_envs, self.device, False)
         self.thruster_dyn = DynamicsFirstOrder(
             self.num_envs,
-            6,
+            self.num_thrusters,
             self.cfg.dyn_time_constant,
             self.device,
             enable_lag=bool(getattr(self.cfg, "thruster_first_order_lag", False)),
         )
         self.thruster_conv = ConversionFunctionBasic(self.cfg.rotor_constant)
 
+        # Rated thrust scaled by (V/V_rated)^2; see the cfg docstrings for provenance.
+        self._rated_voltage = float(getattr(self.cfg, "thruster_rated_voltage_v", 24.0))
+        self._battery_voltage = float(getattr(self.cfg, "thruster_battery_voltage_v", self._rated_voltage))
+        voltage_scale = (self._battery_voltage / max(self._rated_voltage, 1e-6)) ** 2
+        self._thrust_fwd_n = float(getattr(self.cfg, "thruster_max_thrust_fwd_n", 19.613)) * voltage_scale
+        self._thrust_rev_n = float(getattr(self.cfg, "thruster_max_thrust_rev_n", 17.652)) * voltage_scale
+
         self.pid = BatchPIDController(
             num_envs=self.num_envs,
             device=self.device,
             dt=float(self.cfg.sim.dt),
+            thruster_layout=self.thruster_layout,
+            thruster_offsets=base_offsets if self.thruster_layout == "gsrov8" else None,
+            thruster_quats=base_quats if self.thruster_layout == "gsrov8" else None,
+            trim_roll_rad=float(getattr(self.cfg, "trim_roll_rad", 0.0)),
+            trim_pitch_rad=float(getattr(self.cfg, "trim_pitch_rad", 0.0)),
         )
         self.target_motion = BatchHoloTargetMotion(
             num_envs=self.num_envs,
@@ -625,6 +685,12 @@ class AUVTrackingEnv(DirectRLEnv):
         a_v = self._actions[:, 0]
         self._cmd_vel[:, 0] = v_min + (a_v + 1.0) * 0.5 * (v_max - v_min)
         self._cmd_vel[:, 1] = self._actions[:, 1] * self.cfg.action_scale_w
+        limit = float(getattr(self.cfg, "cmd_rate_limit", 0.0))
+        if limit > 0.0:
+            lo = self._prev_cmd_vel - limit
+            hi = self._prev_cmd_vel + limit
+            self._cmd_vel[:] = torch.min(torch.max(self._cmd_vel, lo), hi)
+        self._prev_cmd_vel[:] = self._cmd_vel
 
     def _apply_action(self) -> None:
         t = None
@@ -891,6 +957,7 @@ class AUVTrackingEnv(DirectRLEnv):
         self._actions[env_ids] = 0.0
         self._prev_actions[env_ids] = 0.0
         self._cmd_vel[env_ids] = 0.0
+        self._prev_cmd_vel[env_ids] = 0.0
         self._pwm[env_ids] = 0.0
         self._ocean_current_vel[env_ids] = 0.0
         self._needs_belief_refresh[env_ids] = True
@@ -951,21 +1018,39 @@ class AUVTrackingEnv(DirectRLEnv):
         super().close()
 
     def _compute_dynamics(self, actions) -> tuple[torch.Tensor, torch.Tensor]:
-        thruster_forces = torch.zeros((self.num_envs, 6, 3), device=self.device, dtype=torch.float)
-        thruster_torques = torch.zeros((self.num_envs, 6, 3), device=self.device, dtype=torch.float)
+        n_thrusters = self.num_thrusters
+        thruster_forces = torch.zeros((self.num_envs, n_thrusters, 3), device=self.device, dtype=torch.float)
+        thruster_torques = torch.zeros((self.num_envs, n_thrusters, 3), device=self.device, dtype=torch.float)
         motor = torch.clone(actions)
         motor = torch.nan_to_num(motor, nan=0.0, posinf=0.0, neginf=0.0)
-        motor[torch.abs(motor) < 0.08] = 0
-        mp, mn = motor >= 0.08, motor <= -0.08
-        motor[mp] = -139.0 * (motor[mp] ** 2) + 500 * motor[mp] + 8.28
-        motor[mn] = 161.0 * (motor[mn] ** 2) + 517.86 * motor[mn] - 5.72
         # Absolute sim time per env (DynamicsFirstOrder expects shape [num_envs])
         t = self.episode_length_buf.to(dtype=torch.float32) * float(self.sim.cfg.dt)
-        motor = self.thruster_dyn.update(motor, t)
-        motor = self.thruster_conv.convert(motor)
+
+        if self.thruster_layout == "gsrov8":
+            # Normalised command -> first-order lag -> thrust. A propeller makes T ~ rpm^2
+            # and PWM maps roughly linearly onto rpm, so T = T_max * delta * |delta|, with
+            # the forward/reverse datasheet rating selected by sign (2.0 / 1.8 kgf at 24 V)
+            # and T_max already scaled by (V/V_rated)^2 in __init__.
+            motor = self.thruster_dyn.update(motor, t)
+            deadband = float(getattr(self.cfg, "thruster_deadband", 0.05))
+            motor = torch.where(motor.abs() < deadband, torch.zeros_like(motor), motor)
+            thrust = torch.where(
+                motor >= 0.0,
+                torch.full_like(motor, self._thrust_fwd_n),
+                torch.full_like(motor, self._thrust_rev_n),
+            )
+            thrust = thrust * motor * motor.abs()
+        else:
+            motor[torch.abs(motor) < 0.08] = 0
+            mp, mn = motor >= 0.08, motor <= -0.08
+            motor[mp] = -139.0 * (motor[mp] ** 2) + 500 * motor[mp] + 8.28
+            motor[mn] = 161.0 * (motor[mn] ** 2) + 517.86 * motor[mn] - 5.72
+            motor = self.thruster_dyn.update(motor, t)
+            thrust = self.thruster_conv.convert(motor)
+
         thruster_forces[..., 0] = 1.0
         thruster_forces = quat_apply(self.thruster_quats, thruster_forces)
-        thruster_forces = thruster_forces * motor.unsqueeze(-1)
+        thruster_forces = thruster_forces * thrust.unsqueeze(-1)
         thruster_torques = torch.cross(self.thruster_com_offsets, thruster_forces, dim=-1)
         thruster_forces = torch.sum(thruster_forces, dim=-2)
         thruster_torques = torch.sum(thruster_torques, dim=-2)

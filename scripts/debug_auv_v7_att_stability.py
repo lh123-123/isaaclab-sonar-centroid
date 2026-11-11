@@ -59,7 +59,7 @@ def main():
     print("[att] cols per env: roll_err pitch_err att_err | dead@step\n")
 
     # constant actions per env
-    acts = torch.zeros(n, 4)
+    acts = torch.zeros(n, 3)
     acts[1, 0] = 0.5  # surge
     acts[2, 1] = 0.5  # sway
     acts[3, 2] = 0.5  # yaw
