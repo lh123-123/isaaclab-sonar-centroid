@@ -176,3 +176,31 @@ TERM=xterm-256color ./isaaclab.sh -p scripts/debug_auv_v7_drift_flow.py --headle
 # 2) 冒烟训练 50k：看 anchor_sim 上升、anchor_disp_m 收窄
 # 3) 全量 2M 后再下结论（v0 教训：<200k 别判生死）
 ```
+
+---
+
+## 9. 垂向动作通道 + 深度环整定（2026-11-11）
+
+### 动机
+
+30 万步模型实测：水平悬停 0.129 ± 0.013 m，但深度稳定沉 0.43 m——深度环是纯 P（kp=5 N/m）
+对 ~2 N 负浮力的稳态误差，导致 anchor_sim 只到 0.75（画面缩放变了）。
+
+### 变更
+
+- 动作 3-D → **4-D**：`[surge, sway, yaw, depth_offset]`，第 4 维是深度**目标**偏移
+  （±1 → ±0.5 m，`heave_cmd_scale`）。选目标偏移而非垂向速度：速度环无法消常数偏差。
+- 深度环 v7 本地整定（`__init__` post-hoc，不动 batch_pid 类默认，其它任务不受影响）：
+  `kp 5→12, ki 0→1.5, kd 3→6, heave clamp 3→6 N`。
+- **Routh 稳定性是硬约束**：加 ki 后特征方程 `m·s³+kd·s²+kp·s+ki`，稳定需 `kd·kp > m_eff·ki`。
+  原增益下 `kd·kp=15`，m_eff≈26 kg（含垂向附加质量），任何有用 ki 都不稳——首版 ki=4 实测
+  ±7 cm 极限环不收敛。先抬 kp/kd 把上限拉到 72，ki=1.5 才有 1.8x 裕度。
+- 实测（零动作 220 步）：初沉至死区边 −6 cm，积分 ~12 s 清偏差，episode 末 z=+1.2 cm，
+  单调收敛无振荡。P 独下垂从 0.42 m 降到 0.17 m，再由 I 清零。
+- batch_pid：积分仅当 `ki_depth != 0` 时累加（其它任务零开销）；`depth_int_limit` 1→4 m·s
+  （ki=1.5 下需 1.33 m·s 才能顶住 2 N）。reset 清积分状态。
+- 所有 v7 零动作脚本（18 个）动作张量 3→4 维。
+
+### 不兼容
+
+- 旧 checkpoint（3-D 动作）全部作废，SAC.load 会直接拒绝。需重训。

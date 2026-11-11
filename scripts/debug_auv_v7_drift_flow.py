@@ -71,7 +71,7 @@ def main():
     for step in range(args_cli.steps):
         if step == 0:
             print("[drift] entering step 0", flush=True)
-        act = torch.zeros(n, 3)
+        act = torch.zeros(n, 4)
         obs, rew, term, trunc, info = env.step(act)
 
         if step % args_cli.print_every == 0 or step == args_cli.steps - 1:
