@@ -392,6 +392,18 @@ class AUVTrackingV7FlowHoverGsrovEnvCfg(AUVTrackingEnvCfg):
     # the logs (disp_end_m / visodom_err_m) and nowhere else.
     vis_odometry: bool = True
     sigma_visodom_m: float = 1.0  # basin of the visodom reward term (≈ sigma_anchor_m)
+    # Leave-one-out. All default False, which is the system trained on 2026-11-13.
+    # A True flag zeros that cue's reward and the observation channels the policy
+    # reads. Image stays (11, 64, 64) and state stays 17-D, so the network shape
+    # does not change. Internal estimates keep running and the logs stay filled.
+    # ablate_visodom pays nothing for position: it does not fall back to GT.
+    # ablate_flow hides the flow image and the flow reward; the integrator still
+    # reads the internal flow. ablate_template drops the match reward, the
+    # similarity reward, and the capture-heading reward together.
+    ablate_flow: bool = False
+    ablate_drift: bool = False
+    ablate_template: bool = False
+    ablate_visodom: bool = False
 
     # Privileged anchor (reward-only, ground truth from sim): penalize the horizontal
     # displacement from the episode spawn origin, in metres. The 287k-step model gamed
@@ -524,6 +536,14 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
         else:
             self._level_heave_wrench = 0.0
             self._level_pitch_moment = 0.0
+        print(
+            "[v7-ablate] "
+            f"flow={int(bool(self.cfg.ablate_flow))} "
+            f"drift={int(bool(self.cfg.ablate_drift))} "
+            f"template={int(bool(self.cfg.ablate_template))} "
+            f"visodom={int(bool(self.cfg.ablate_visodom))}",
+            flush=True,
+        )
 
     def _thruster_body_fz_my(self, fz_cmd: float, my_cmd: float) -> tuple[float, float]:
         """Body heave (N) and pitch moment (N·m) produced by one allocation command.
@@ -1397,7 +1417,7 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
         # unchanged so existing debug tooling reading st[..., 8] keeps working.
         present = (self._texture_count >= self.cfg.min_texture_px).to(torch.float32)
         tex_frac = (self._texture_count / float(self.cfg.cam_height * self.cfg.cam_width)).clamp(0.0, 1.0)
-        return torch.stack([
+        state = torch.stack([
             depth.clamp(-10.0, 10.0),
             roll.clamp(-np.pi, np.pi),
             pitch.clamp(-np.pi, np.pi),
@@ -1423,6 +1443,15 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
             (self._visodom_m()[:, 0]).clamp(-10.0, 10.0),
             (self._visodom_m()[:, 1]).clamp(-10.0, 10.0),
         ], dim=-1)
+        # Ablation zeros the channels the networks read. The values above are
+        # still computed so the logs keep the real estimates.
+        if bool(self.cfg.ablate_flow):
+            state[:, 8] = 0.0
+        if bool(self.cfg.ablate_template):
+            state[:, 11:15] = 0.0
+        if bool(self.cfg.ablate_visodom):
+            state[:, 15:17] = 0.0
+        return state
 
     def _get_observations(self):
         h, w = self.cfg.cam_height, self.cfg.cam_width
@@ -1451,10 +1480,20 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
             (vo[:, 1] / sig_vo).clamp(-1.0, 1.0),
         ], dim=-1)[:, :, None, None].expand(-1, -1, h, w)
 
+        flow_obs = self._flow_image
+        mag_obs = flow_mag
+        if bool(self.cfg.ablate_flow):
+            flow_obs = torch.zeros_like(self._flow_image)
+            mag_obs = torch.zeros_like(flow_mag)
+        if bool(self.cfg.ablate_template):
+            anchor_ch = torch.zeros_like(anchor_ch)
+        if bool(self.cfg.ablate_visodom):
+            visodom_ch = torch.zeros_like(visodom_ch)
+
         image = torch.cat([
             rgb,
-            self._flow_image,
-            flow_mag,
+            flow_obs,
+            mag_obs,
             self._texture_mask,
             anchor_ch,
             visodom_ch,
@@ -1504,7 +1543,11 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
         disp_xy = self._robot.data.root_pos_w[:, :2] - self.scene.env_origins[:, :2]
         d_anchor = torch.norm(disp_xy, dim=-1)
         anchor_term = torch.exp(-(d_anchor ** 2) / (self.cfg.sigma_anchor_m ** 2))
-        if bool(getattr(self.cfg, "vis_odometry", False)):
+        if bool(self.cfg.ablate_visodom):
+            # Cue removed. Do not substitute the GT term: that would measure a
+            # different question (privileged position) instead of "no visodom".
+            position_term = torch.zeros_like(anchor_term)
+        elif bool(getattr(self.cfg, "vis_odometry", False)):
             # Deployable position: integrated consecutive flow (vision only). Same
             # shape/basin as the GT term it replaces.
             d_visodom = self._visodom_m().norm(dim=-1)
@@ -1513,6 +1556,12 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
             )
         else:
             position_term = anchor_term
+        w_flow = 0.0 if bool(self.cfg.ablate_flow) else float(self.cfg.rew_flow)
+        w_drift = 0.0 if bool(self.cfg.ablate_drift) else float(self.cfg.rew_drift)
+        w_anchor_vis = 0.0 if bool(self.cfg.ablate_template) else float(self.cfg.rew_anchor_vis)
+        w_sim = 0.0 if bool(self.cfg.ablate_template) else float(self.cfg.rew_sim)
+        w_yaw = 0.0 if bool(self.cfg.ablate_template) else float(self.cfg.rew_yaw_anchor)
+        w_position = 0.0 if bool(self.cfg.ablate_visodom) else float(self.cfg.rew_anchor)
 
         # per-episode diagnostics (flushed in _reset_idx)
         self._ep_flow_rms_sum += flow_rms_n
@@ -1540,12 +1589,12 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
         smooth = torch.sum((self._actions - self._prev_actions) ** 2, dim=-1)
 
         rew = (
-            self.cfg.rew_flow * flow_term
-            + self.cfg.rew_drift * drift_term
-            + self.cfg.rew_anchor_vis * anchor_vis_term
-            + self.cfg.rew_sim * sim_term
-            + self.cfg.rew_yaw_anchor * yaw_anchor_term
-            + self.cfg.rew_anchor * position_term
+            w_flow * flow_term
+            + w_drift * drift_term
+            + w_anchor_vis * anchor_vis_term
+            + w_sim * sim_term
+            + w_yaw * yaw_anchor_term
+            + w_position * position_term
             + self.cfg.rew_alive * alive
             + self.cfg.rew_depth * depth_term
             + self.cfg.rew_att * att_term
