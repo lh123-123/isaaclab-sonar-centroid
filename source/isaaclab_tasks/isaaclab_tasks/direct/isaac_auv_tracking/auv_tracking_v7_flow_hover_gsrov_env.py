@@ -34,6 +34,7 @@ from isaaclab_tasks.direct.isaac_auv_tracking.auv_tracking_env import (
     AUVTrackingEnvCfg,
     OceanCurrentCfg,
 )
+from isaaclab_tasks.direct.isaac_auv_tracking.template_anchor import update_template_anchor
 from isaaclab_tasks.direct.isaac_auv_tracking.assets.gsrov import DEFAULT_MASS, gsrov_robot_cfg
 from isaaclab_tasks.direct.residual_rl.thruster_allocation import allocate_thrusters
 
@@ -249,19 +250,23 @@ class AUVTrackingV7FlowHoverGsrovEnvCfg(AUVTrackingEnvCfg):
     # Ocean current (water flow): v7 must hold GROUND position against the flow, not drift
     # with it. The flow observation (du/dv) still tells the agent which way the water is
     # moving; the reward below is reshaped so a still (ground-locked) ROV is rewarded and a
-    # drifting one is not. medium strength + slow time modulation approximates real currents.
+    # drifting one is not.
+    # The field itself is the steady uniform current (strength 0.3 m/s along [1, 0.3, 0];
+    # an explicit strength wins over level="medium"). Each episode multiplies it by a
+    # linear ramp, so frame 1 is still water: the level pose and the pre-charged thrusters
+    # are already holding, and the current then rises to full over current_ramp_s.
+    # 0 disables the ramp (full current from the first step).
+    current_ramp_s: float = 10.0
     ocean_current: OceanCurrentCfg = field(
         default_factory=lambda: OceanCurrentCfg(
             enabled=True,
             type="uniform",
-            level="medium",  # ~0.4 m/s base
+            level="medium",  # unused while strength stays at its 0.3 default
             affect_target=False,
             clip_speed=5.0,
             params={
                 "direction": [1.0, 0.3, 0.0],
-                "time_modulation": True,
-                "modulation_period": 12.0,
-                "modulation_amplitude": 0.6,  # 0.4 ± 0.24 m/s, ~0.16–0.64 m/s
+                "time_modulation": False,
                 # random field only. Each axis is max_velocity*sin*cos, so one horizontal
                 # component peaks at 0.4 m/s and the vertical component at 0.12 m/s.
                 "max_velocity": 0.8,
@@ -370,6 +375,24 @@ class AUVTrackingV7FlowHoverGsrovEnvCfg(AUVTrackingEnvCfg):
     rew_yaw_anchor: float = 0.1       # yaw error to the capture heading — image matching is only
     sigma_yaw_anchor: float = 0.3     # well-defined at the same heading (yaw ≠ 0 rotates the template)
 
+    # Visual odometry (visodom): the POSITION cue that replaces the privileged GT
+    # anchor in the reward. Frame-1 matching (dense Farneback or template) dies
+    # once the ROV has moved — the images diverge (probe 2026-11-13: dense
+    # frame-1 flow read a ≈ 0 px at 0.4 m true sway). The consecutive-frame flow
+    # keeps working at ANY distance because it is a ground-relative velocity.
+    # Integrating its uniform component (a_px, b_px) without leak, de-rotated by
+    # yaw so heading changes cannot cancel it, plus the expansion coefficient k
+    # with a tracked Z for the surge leg, gives a body-frame displacement
+    # estimate. Probe (scripts/debug_auv_v7_visodom.py): corr vs GT = 1.000 on
+    # both axes; a plain P servo on it returns from 0.57 m to 0.044 m under the
+    # full 0.3 m/s current ramp while zero-action drifts to 1.02 m. It
+    # overestimates ~15–20 % (113.5 px/m sway vs 92.6 geometric; surge 1.14x) —
+    # the reward does not care about the scale, it learns against it.
+    # When True, rew_anchor pays the visodom term; the GT displacement stays in
+    # the logs (disp_end_m / visodom_err_m) and nowhere else.
+    vis_odometry: bool = True
+    sigma_visodom_m: float = 1.0  # basin of the visodom reward term (≈ sigma_anchor_m)
+
     # Privileged anchor (reward-only, ground truth from sim): penalize the horizontal
     # displacement from the episode spawn origin, in metres. The 287k-step model gamed
     # the vision-only integrator by yawing steadily while drifting: the body-frame flow
@@ -379,9 +402,8 @@ class AUVTrackingV7FlowHoverGsrovEnvCfg(AUVTrackingEnvCfg):
     # The actor input stays vision-only (asymmetric training; the critic already sees
     # privileged state). sigma_anchor_m=1.0: exploit d≈2.8 m ⇒ exp(-7.8)≈0 per step.
     # Weight REDUCED 0.3 → 0.15 now that the visual anchor measures the same metric
-    # deployably; it stays as the ungameable backstop — the plane texture is static
-    # across episodes (randomize_plane_texture=False), so a visually-identical alias
-    # pose could otherwise farm the vision terms.
+    # deployably; with vis_odometry=True the visodom term is paid INSTEAD of this
+    # one; this block stays as the fallback (vis_odometry=False) backstop.
     rew_anchor: float = 0.15
     sigma_anchor_m: float = 1.0
 
@@ -418,10 +440,14 @@ class AUVTrackingV7FlowHoverGsrovEnvCfg(AUVTrackingEnvCfg):
     # integral broadcast: the actor is image-only (CustomSACPolicy), and the anchor offset
     # is its goal-directed "which way is frame 1 / how far am I" cue — the integral forgot
     # (τ=3 s) and was yaw-gamed by the 287k model; the offset is absolute and ungameable.
-    _image_channels: int = 3 + _flow_img_channels + 1 + 2
+    # + visodom(2, broadcast): integrated consecutive-flow displacement (m / sigma,
+    # ±1 clamped) — the position cue that keeps counting OUTSIDE the template-match
+    # window (the anchor saturates at ~±0.9 m; visodom does not).
+    _image_channels: int = 3 + _flow_img_channels + 1 + 2 + 2
     # state: depth, roll, pitch, yaw, v_surge, v_sway, v_heave, yaw_rate, flow_rms,
-    #        present, tex_frac, anchor du_n, anchor dv_n, anchor_sim(ncc), anchor yaw_err = 15 dims
-    _state_dims: int = 15
+    #        present, tex_frac, anchor du_n, anchor dv_n, anchor_sim(ncc), anchor yaw_err,
+    #        visodom_x (m), visodom_y (m) = 17 dims
+    _state_dims: int = 17
     observation_space = {
         "image": gym.spaces.Box(
             low=-1.0,
@@ -431,11 +457,11 @@ class AUVTrackingV7FlowHoverGsrovEnvCfg(AUVTrackingEnvCfg):
         ),
         "state": gym.spaces.Box(
             low=np.array(
-                [-10.0, -np.pi, -np.pi, -np.pi, -3.0, -3.0, -3.0, -3.0, 0.0, 0.0, 0.0, -1.0, -1.0, 0.0, -np.pi],
+                [-10.0, -np.pi, -np.pi, -np.pi, -3.0, -3.0, -3.0, -3.0, 0.0, 0.0, 0.0, -1.0, -1.0, 0.0, -np.pi, -10.0, -10.0],
                 dtype=np.float32,
             ),
             high=np.array(
-                [10.0, np.pi, np.pi, np.pi, 3.0, 3.0, 3.0, 3.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, np.pi], dtype=np.float32
+                [10.0, np.pi, np.pi, np.pi, 3.0, 3.0, 3.0, 3.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, np.pi, 10.0, 10.0], dtype=np.float32
             ),
             dtype=np.float32,
         ),
@@ -625,6 +651,17 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
         # so a world-fixed drift keeps a fixed direction in it (up to camera-geometry
         # anisotropy) and cannot be cancelled by spinning the vehicle.
         self._drift_yaw_prev = torch.zeros(self.num_envs, device=self.device)
+        # Visual odometry: non-leaky de-rotated integral of the consecutive-flow
+        # uniform component (u_px, v_px @ flow-res), the tracked plane distance
+        # _visodom_z (m) and the surge displacement _visodom_x (m, from the
+        # expansion coefficient k). Updated once per policy step in
+        # _update_flow_and_texture; reset in _reset_idx. All vision — deployable.
+        self._visodom = torch.zeros((self.num_envs, 2), dtype=torch.float32, device=self.device)
+        self._visodom_x = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
+        self._visodom_z = torch.full(
+            (self.num_envs,), float(self.cfg.plane_distance), dtype=torch.float32, device=self.device
+        )
+        self._visodom_yaw_prev = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
         # Diagnostic only (not in the observation or the reward): translational
         # flow split into a uniform field (lateral) and a radial field (along the
         # optical axis). Current-aligned creep is mostly axial and cancels in the
@@ -1244,6 +1281,22 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
             self._drift_int[rows, 0] = d0 * self._drift_leak + mean_u
             self._drift_int[rows, 1] = d1 * self._drift_leak + mean_v
             self._drift_yaw_prev[rows] = yaw_now
+            # Visual odometry: same de-rotation, NO leak. The surge leg comes from
+            # the expansion coefficient (k per frame ≈ ΔZ/Z): displacement += k·Z,
+            # then Z shrinks by 1/(1+k). Sway px→m happens in _visodom_m via
+            # f_px and the tracked Z.
+            if bool(getattr(self.cfg, "vis_odometry", False)):
+                dyaw_o = yaw_now - self._visodom_yaw_prev[rows]
+                dyaw_o = torch.atan2(torch.sin(dyaw_o), torch.cos(dyaw_o))
+                co, so = torch.cos(dyaw_o), torch.sin(dyaw_o)
+                u0 = self._visodom[rows, 0] * co - self._visodom[rows, 1] * so
+                v0 = self._visodom[rows, 0] * so + self._visodom[rows, 1] * co
+                self._visodom[rows, 0] = u0 + a_px
+                self._visodom[rows, 1] = v0 + b_px
+                zz = self._visodom_z[rows]
+                self._visodom_x[rows] = self._visodom_x[rows] + k_exp * zz
+                self._visodom_z[rows] = zz / (1.0 + k_exp).clamp(min=0.1)
+                self._visodom_yaw_prev[rows] = yaw_now
         # First-frame anchor: capture (first textured frame) or match (every later frame).
         self._update_anchor_state(curr_raw)
         self._prev_rgb[:] = curr_raw
@@ -1251,89 +1304,42 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
         self._flow_rms[fresh] = 0.0
 
     def _update_anchor_state(self, curr_raw):
-        """First-frame visual anchor: capture frame 1, match every frame against it.
-
-        The episode's first textured frame is stored as a center-crop template at
-        flow-res; each subsequent frame is template-matched (TM_CCOEFF_NORMED) to it.
-        Outputs per env:
-          _anchor_off_px (2,)  scene displacement vs frame 1, flow-res px, body frame
-                              (+u = scene moved right = ROV moved left). Bounded by the
-                              match margin; saturates at the window edge with the sign
-                              still pointing home.
-          _anchor_ncc (,)      match score ∈ [-1, 1] — 1.0 = identical to frame 1.
-          _anchor_disp_m (,)   |offset| in metres via the fronto-parallel plane geometry.
-        On the capture step offset=0 / ncc=1 by definition. cv2 is imported lazily with
-        the same guard as _farneback_flow so gym registration does not hard-require it.
-        """
-        try:
-            import cv2
-        except ImportError:
-            raise RuntimeError(
-                "cv2 (opencv-python) is required for the first-frame anchor. "
-                "Install with: pip install opencv-python"
-            )
-        fh, fw = int(self.cfg.flow_render_height), int(self.cfg.flow_render_width)
-        ch, cw = int(self.cfg.anchor_crop_height), int(self.cfg.anchor_crop_width)
-        y0, x0 = (fh - ch) // 2, (fw - cw) // 2
-        tex_ok = self._texture_count >= self.cfg.min_texture_px
-        capture = (~self._anchor_valid) & tex_ok
-        match = self._anchor_valid & (~capture)
-        if not bool(capture.any() or match.any()):
-            return
-        rows = (capture | match).nonzero().flatten()
-        down = (
-            F.interpolate(
-                curr_raw[rows].permute(0, 3, 1, 2).to(torch.float32), size=(fh, fw), mode="area"
-            )
-            .round()
-            .clamp(0, 255)
-            .to(torch.uint8)
-            .permute(0, 2, 3, 1)
-            .cpu()
-            .numpy()
+        """First-frame template match. The algorithm lives in template_anchor.py."""
+        local_x = self._robot.data.root_pos_w[:, 0] - self.scene.env_origins[:, 0]
+        yaw = euler_xyz_from_quat(self._robot.data.root_quat_w)[2]
+        update_template_anchor(
+            curr_raw,
+            texture_count=self._texture_count,
+            min_texture_px=int(self.cfg.min_texture_px),
+            anchor_valid=self._anchor_valid,
+            anchor_tmpl=self._anchor_tmpl,
+            anchor_off_px=self._anchor_off_px,
+            anchor_ncc=self._anchor_ncc,
+            anchor_disp_m=self._anchor_disp_m,
+            anchor_yaw=self._anchor_yaw,
+            flow_h=int(self.cfg.flow_render_height),
+            flow_w=int(self.cfg.flow_render_width),
+            crop_h=int(self.cfg.anchor_crop_height),
+            crop_w=int(self.cfg.anchor_crop_width),
+            f_px=float(self._anchor_f_px),
+            plane_distance=float(self.cfg.plane_distance),
+            local_x=local_x,
+            yaw=yaw,
         )
-        captured = []
-        for i, r in enumerate(rows.tolist()):
-            gray = cv2.cvtColor(down[i], cv2.COLOR_RGB2GRAY)
-            if bool(capture[r]):
-                crop = gray[y0 : y0 + ch, x0 : x0 + cw]
-                # A near-constant template (dark wall inside the crop) makes
-                # TM_CCOEFF_NORMED degenerate (NaN peak). Refuse to anchor on it —
-                # _anchor_valid stays False and capture retries next frame.
-                if float(crop.std()) < 1.0:
-                    continue
-                self._anchor_tmpl[r] = torch.from_numpy(crop.copy()).to(self._anchor_tmpl.device)
-                captured.append(r)
-            else:
-                res = cv2.matchTemplate(gray, self._anchor_tmpl[r].cpu().numpy(), cv2.TM_CCOEFF_NORMED)
-                _, max_val, _, max_loc = cv2.minMaxLoc(res)
-                self._anchor_off_px[r, 0] = float(max_loc[0]) - float(x0)
-                self._anchor_off_px[r, 1] = float(max_loc[1]) - float(y0)
-                self._anchor_ncc[r] = float(max_val)
-        if captured:
-            cap = torch.as_tensor(captured, device=self.device, dtype=torch.long)
-            self._anchor_valid[cap] = True
-            self._anchor_off_px[cap] = 0.0
-            self._anchor_ncc[cap] = 1.0
-            self._anchor_yaw[cap] = euler_xyz_from_quat(self._robot.data.root_quat_w)[2][cap]
-        valid = self._anchor_valid
-        if bool(valid.any()):
-            # px → m on the fronto-parallel plane: d = |px| · Z / f_px. Z uses the
-            # env-LOCAL x (root world x minus this env's origin) — origins are spaced
-            # 45 m apart, so world x would inflate Z by ±tens of metres for envs ≠ 0.
-            local_x = self._robot.data.root_pos_w[:, 0] - self.scene.env_origins[:, 0]
-            z_plane = (float(self.cfg.plane_distance) - local_x).clamp(min=0.3)
-            self._anchor_disp_m[valid] = (
-                self._anchor_off_px[valid].norm(dim=-1) / self._anchor_f_px
-            ) * z_plane[valid]
 
     def _apply_action(self):
         """v7 applies PID (cmd_vel [surge, yaw, heave]) → PWM → thrust/moments."""
         dt = float(self.cfg.sim.dt)
         t = None
         if getattr(self, "_ocean_current_field", None) is not None:
-            t = self.episode_length_buf.to(dtype=torch.float32) * dt
+            # episode_length_buf counts policy steps and is still 0 during the first
+            # step's physics, so t = 0 at the handover frame. Multiply by the control
+            # period, not sim.dt: sim.dt would stall the clock at ~2 s in a 15 s episode.
+            t = self.episode_length_buf.to(dtype=torch.float32) * (dt * float(self.cfg.decimation))
             v = self._ocean_current_field(self._robot.data.root_pos_w, t)
+            ramp_s = float(getattr(self.cfg, "current_ramp_s", 0.0))
+            if ramp_s > 0.0:
+                v = v * (t / ramp_s).clamp(0.0, 1.0).unsqueeze(-1)
             self.set_ocean_currents(None, v)
 
         # PID at physics rate. Depth setpoint is fixed at the spawn depth (= the
@@ -1362,6 +1368,18 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
         # No collisions in open pool — always False.
         # Kept as a stub for API compatibility with parent class.
         return torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+
+    def _visodom_m(self) -> torch.Tensor:
+        """Visual-odometry displacement estimate, current body frame, metres, (N, 2).
+
+        Column 0 is along the optical axis (from the expansion coefficient), column 1
+        is lateral (u_px / f_px · Z — fronto-parallel geometry with the tracked Z).
+        Returns zeros when vis_odometry is off, so callers can always concatenate.
+        """
+        if not bool(getattr(self.cfg, "vis_odometry", False)):
+            return torch.zeros((self.num_envs, 2), dtype=torch.float32, device=self.device)
+        y_m = self._visodom[:, 0] * self._visodom_z / float(self._anchor_f_px)
+        return torch.stack([self._visodom_x, y_m], dim=-1)
 
     def _ego_vel_state(self):
         _, agent_yaw = self._agent_pose_2d()
@@ -1400,6 +1418,10 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
             (self._anchor_off_px[:, 1] / self._anchor_margin[1]).clamp(-1.0, 1.0),
             ((self._anchor_ncc + 1.0) * 0.5).clamp(0.0, 1.0),
             torch.atan2(torch.sin(yaw - self._anchor_yaw), torch.cos(yaw - self._anchor_yaw)),
+            # Visual odometry displacement (m): the deployable position estimate.
+            # Clipped ±10 m like the depth channel; zeros when vis_odometry is off.
+            (self._visodom_m()[:, 0]).clamp(-10.0, 10.0),
+            (self._visodom_m()[:, 1]).clamp(-10.0, 10.0),
         ], dim=-1)
 
     def _get_observations(self):
@@ -1419,6 +1441,15 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
             (self._anchor_off_px[:, 0] / mx).clamp(-1.0, 1.0),
             (self._anchor_off_px[:, 1] / my).clamp(-1.0, 1.0),
         ], dim=-1)[:, :, None, None].expand(-1, -1, h, w)
+        # Visodom broadcast: integrated consecutive-flow displacement, metres / sigma,
+        # ±1 clamped. Unlike the anchor channels this keeps counting past the
+        # template-match window; ±1 ≈ the reward basin (sigma_visodom_m).
+        sig_vo = float(getattr(self.cfg, "sigma_visodom_m", 1.0)) or 1.0
+        vo = self._visodom_m()
+        visodom_ch = torch.stack([
+            (vo[:, 0] / sig_vo).clamp(-1.0, 1.0),
+            (vo[:, 1] / sig_vo).clamp(-1.0, 1.0),
+        ], dim=-1)[:, :, None, None].expand(-1, -1, h, w)
 
         image = torch.cat([
             rgb,
@@ -1426,6 +1457,7 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
             flow_mag,
             self._texture_mask,
             anchor_ch,
+            visodom_ch,
         ], dim=1)
 
         state = self._ego_vel_state()
@@ -1466,12 +1498,21 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
         yaw_anchor_term = torch.exp(-(yaw_err_anchor ** 2) / (self.cfg.sigma_yaw_anchor ** 2))
 
         # Privileged anchor: horizontal distance from the episode spawn origin (ground
-        # truth, sim state — reward only; the actor never sees it). This is the metric
-        # the vision integrator approximates; anchoring it directly closes the gap
-        # between "flow looks calm" and "the ROV actually stays put".
+        # truth, sim state). With vis_odometry=True this is LOGGING-ONLY — the reward
+        # pays the visodom term instead; the GT stays in TensorBoard (disp_end_m,
+        # visodom_err_m) as the untouched evaluation metric.
         disp_xy = self._robot.data.root_pos_w[:, :2] - self.scene.env_origins[:, :2]
         d_anchor = torch.norm(disp_xy, dim=-1)
         anchor_term = torch.exp(-(d_anchor ** 2) / (self.cfg.sigma_anchor_m ** 2))
+        if bool(getattr(self.cfg, "vis_odometry", False)):
+            # Deployable position: integrated consecutive flow (vision only). Same
+            # shape/basin as the GT term it replaces.
+            d_visodom = self._visodom_m().norm(dim=-1)
+            position_term = present * torch.exp(
+                -(d_visodom ** 2) / (float(self.cfg.sigma_visodom_m) ** 2)
+            )
+        else:
+            position_term = anchor_term
 
         # per-episode diagnostics (flushed in _reset_idx)
         self._ep_flow_rms_sum += flow_rms_n
@@ -1504,7 +1545,7 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
             + self.cfg.rew_anchor_vis * anchor_vis_term
             + self.cfg.rew_sim * sim_term
             + self.cfg.rew_yaw_anchor * yaw_anchor_term
-            + self.cfg.rew_anchor * anchor_term
+            + self.cfg.rew_anchor * position_term
             + self.cfg.rew_alive * alive
             + self.cfg.rew_depth * depth_term
             + self.cfg.rew_att * att_term
@@ -1565,6 +1606,9 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
             d_end = torch.norm(
                 self._robot.data.root_pos_w[ids, :2] - self.scene.env_origins[ids, :2], dim=-1
             )
+            # Visodom estimate at the same instant — logged next to the GT so the
+            # estimator's error is on TensorBoard every episode.
+            vo_end = self._visodom_m()[ids].norm(dim=-1)
             self.extras["log"] = {
                 "flow_rms_n": float((self._ep_flow_rms_sum[ids] / ep_len).mean()),
                 "present_frac": float((self._ep_present_sum[ids] / ep_len).mean()),
@@ -1572,6 +1616,8 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
                 "drift_mag": float((self._ep_drift_sum[ids] / ep_len).mean()),
                 "disp_m": float((self._ep_anchor_sum[ids] / ep_len).mean()),
                 "disp_end_m": float(d_end.mean()),
+                "visodom_end_m": float(vo_end.mean()),
+                "visodom_err_m": float((vo_end - d_end).abs().mean()),
                 "anchor_disp_m": float((self._ep_anchor_vis_sum[ids] / ep_len).mean()),
                 "anchor_sim": float((self._ep_anchor_sim_sum[ids] / ep_len).mean()),
                 "term_tex_lost": float(self._ep_cause[ids, 0].to(torch.float32).mean()),
@@ -1625,6 +1671,12 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
         # Re-seed the de-rotation heading so the first integration after reset computes
         # dyaw from the (post-teleport) spawn heading, not a stale pre-reset one.
         self._drift_yaw_prev[ids] = euler_xyz_from_quat(self._robot.data.root_quat_w[ids])[2]
+        # Visual odometry: fresh episode → zero displacement, plane at the spawn
+        # distance, de-rotation seeded at the spawn heading.
+        self._visodom[ids] = 0.0
+        self._visodom_x[ids] = 0.0
+        self._visodom_z[ids] = float(self.cfg.plane_distance)
+        self._visodom_yaw_prev[ids] = euler_xyz_from_quat(self._robot.data.root_quat_w[ids])[2]
         self._texture_count[ids] = 0.0
         self._prev_rgb_ok[ids] = False
         self._texture_lost_streak[ids] = 0

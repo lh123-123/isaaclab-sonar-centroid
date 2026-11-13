@@ -55,15 +55,16 @@ def main():
     img = obs["policy"]["image"]
     st = obs["policy"]["state"]
     H, W = 64, 64
-    check("image shape", tuple(img.shape[1:]) == (9, H, W), f"{tuple(img.shape)}")
+    check("image shape", tuple(img.shape[1:]) == (11, H, W), f"{tuple(img.shape)}")
     check("image dtype float32", img.dtype == torch.float32, str(img.dtype))
-    check("state shape", tuple(st.shape[1:]) == (13,), f"{tuple(st.shape)}")  # 9 + present + tex_frac + drift(2)
+    check("state shape", tuple(st.shape[1:]) == (17,), f"{tuple(st.shape)}")  # 13 + anchor(3+1) + visodom(2)... see _ego_vel_state
     check("state finite", bool(torch.isfinite(st).all()))
     check("image finite", bool(torch.isfinite(img).all()))
     check("image in [-1,1]", (img.abs() <= 1.0 + 1e-6).all().item(), f"absmax={img.abs().max():.4g}")
 
     print("\n[v7] channel layout:", flush=True)
     print("  0..2 = RGB  3 = flow u  4 = flow v  5 = |flow|  6 = texture mask", flush=True)
+    print("  7..8 = anchor offset (du, dv)  9..10 = visodom (x_m, y_m) / sigma", flush=True)
 
     print("\n[v7] ---- step loop ----", flush=True)
     saw_nonzero = False
