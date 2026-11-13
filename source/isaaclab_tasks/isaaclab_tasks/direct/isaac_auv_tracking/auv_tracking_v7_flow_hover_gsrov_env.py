@@ -25,7 +25,7 @@ from isaaclab.envs import DirectRLEnv
 from isaaclab.sensors import TiledCamera, TiledCameraCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.configclass import field
-from isaaclab.utils.math import euler_xyz_from_quat, quat_from_euler_xyz
+from isaaclab.utils.math import euler_xyz_from_quat, quat_apply, quat_from_euler_xyz
 from isaaclab.sim import SimulationCfg
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 
@@ -35,6 +35,7 @@ from isaaclab_tasks.direct.isaac_auv_tracking.auv_tracking_env import (
     OceanCurrentCfg,
 )
 from isaaclab_tasks.direct.isaac_auv_tracking.assets.gsrov import DEFAULT_MASS, gsrov_robot_cfg
+from isaaclab_tasks.direct.residual_rl.thruster_allocation import allocate_thrusters
 
 _CAM_HFOV_DEG = 81.65
 _CAM_APERTURE_MM = 20.955
@@ -167,6 +168,29 @@ class AUVTrackingV7FlowHoverGsrovEnvCfg(AUVTrackingEnvCfg):
     depth_ki: float = 1.5
     depth_kd: float = 6.0
     heave_wrench_max: float = 6.0
+
+    # Work attitude: hold LEVEL (roll=pitch=0) with continuous thruster moment. The
+    # free-floating trim (~20° nose-up) is the zero-thrust attitude; holding level
+    # instead requires the verticals to carry the buoyancy pitch couple
+    # ρ·g·V·dx ≈ 997·9.81·0.01295·0.040 ≈ 5.07 N·m — about 56% of the verticals'
+    # 9.1 N·m pitch authority — for the whole episode. That is exactly the handover
+    # state the policy should inherit: someone flew the ROV to the work site at level
+    # attitude with the thrusters already holding it, frame 1 is that scene, and the
+    # policy keeps it while fighting the current.
+    # att_ki adds attitude integral action. P+D alone cannot hold a pose away from
+    # the free-floating trim, so the integrator is pre-charged at reset with the
+    # wrench that actually realizes the buoyancy couple. Dividing N·m by T_max
+    # (≈ 0.26) is short: allocation solves a linear command, while thrust is
+    # T_max·u·|u| and reverse is weaker than forward, so the same physical 5.07 N·m
+    # needs a larger command (≈ 0.35). The init solve finds that command, and the
+    # heave command that cancels the ~2.4 N residual weight, and both integrators
+    # are pre-charged. att_int_limit 0.6 stays above that command and below saturation.
+    # NOTE: with this on, checkpoints trained on the trim spawn are no longer
+    # directly comparable (spawn attitude, camera geometry, and att reward reference
+    # all change). Set False to recover the legacy trim behavior.
+    level_attitude: bool = True
+    att_ki: float = 1.0
+    att_int_limit: float = 0.6
 
     # Episode cap 15 s (225 steps @ 15 Hz). The parent's 40 s → 600 steps, but observed
     # behavior resolves within ~4–13 s (the ROV either holds station or drifts into the
@@ -429,6 +453,15 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
         # command-line / benchmark overrides of render resolution would be silently ignored.
         cfg.tiled_camera.width = int(cfg.render_width)
         cfg.tiled_camera.height = int(cfg.render_height)
+        # Attitude hold target, resolved BEFORE super().__init__: the base __init__ calls
+        # _reset_idx at its end, and the spawn quaternion there must already use the work
+        # attitude (level) instead of the free-floating trim.
+        if bool(getattr(cfg, "level_attitude", False)):
+            self._att_roll_target = 0.0
+            self._att_pitch_target = 0.0
+        else:
+            self._att_roll_target = float(cfg.trim_roll_rad)
+            self._att_pitch_target = float(cfg.trim_pitch_rad)
         # Override action buffers to 3-D: [surge, sway, yaw]. The parent class
         # initializes _actions / _prev_actions as (N, 2) — we re-create after
         # super().__init__ so the parent's own buffers are already allocated.
@@ -444,6 +477,110 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
         self.pid.ki_depth = float(self.cfg.depth_ki)
         self.pid.kd_depth = float(self.cfg.depth_kd)
         self.pid.max_heave_wrench = float(self.cfg.heave_wrench_max)
+        # Level-attitude hold: aim the attitude loop at the work attitude and give it
+        # integral action so the verticals can carry the constant buoyancy couple.
+        if bool(getattr(self.cfg, "level_attitude", False)):
+            self.pid.trim_roll_rad = self._att_roll_target
+            self.pid.trim_pitch_rad = self._att_pitch_target
+            self.pid.att_ki = float(self.cfg.att_ki)
+            self.pid.att_int_limit = float(self.cfg.att_int_limit)
+            # Base __init__ already reset every env with att_ki still 0, which zeroed
+            # the integrators. Solve the quadratic thrust map and pre-charge again.
+            fz_cmd, my_cmd, got_fz, got_my, want_fz, want_my = self._solve_level_hold_wrench()
+            self._level_heave_wrench = fz_cmd
+            self._level_pitch_moment = my_cmd
+            self._apply_level_hold_precharge(torch.arange(self.num_envs, device=self.device))
+            print(
+                f"[v7] level-hold pre-charge: heave cmd {fz_cmd:.3f} -> {got_fz:.2f}/{want_fz:.2f} N, "
+                f"pitch cmd {my_cmd:.3f} -> {got_my:.2f}/{want_my:.2f} N·m",
+                flush=True,
+            )
+        else:
+            self._level_heave_wrench = 0.0
+            self._level_pitch_moment = 0.0
+
+    def _thruster_body_fz_my(self, fz_cmd: float, my_cmd: float) -> tuple[float, float]:
+        """Body heave (N) and pitch moment (N·m) produced by one allocation command.
+
+        The allocator treats the command as linear in ``u``. Propeller thrust is
+        ``T_max·u·|u|`` with separate forward and reverse ratings, so the realized
+        wrench is not the command times ``T_max``.
+        """
+        cap = float(self.pid.max_heave_wrench)
+        wrench = torch.zeros(1, 6, device=self.device)
+        wrench[0, 2] = max(-cap, min(cap, fz_cmd))
+        wrench[0, 4] = max(-cap, min(cap, my_cmd))
+        motor = allocate_thrusters(wrench, self.pid._b_pinv, clamp=1.0, priority=False)[0]
+        deadband = float(getattr(self.cfg, "thruster_deadband", 0.05))
+        motor = torch.where(motor.abs() < deadband, torch.zeros_like(motor), motor)
+        t_max = torch.where(
+            motor >= 0.0,
+            torch.full_like(motor, self._thrust_fwd_n),
+            torch.full_like(motor, self._thrust_rev_n),
+        )
+        thrust = t_max * motor * motor.abs()
+        n = self.num_thrusters
+        axes = torch.zeros(n, 3, device=self.device)
+        axes[:, 0] = 1.0
+        forces = quat_apply(self.thruster_quats[:n], axes) * thrust.unsqueeze(-1)
+        torques = torch.cross(self.thruster_com_offsets[0], forces, dim=-1)
+        return float(forces.sum(0)[2]), float(torques.sum(0)[1])
+
+    def _solve_level_hold_wrench(self) -> tuple[float, float, float, float, float, float]:
+        """Allocation commands whose quadratic thrust cancels weight and the pitch couple.
+
+        Returns ``(fz_cmd, my_cmd, realized_fz, realized_my, target_fz, target_my)``.
+        At level, buoyancy torque about +Y is ``-dx·ρ·g·V`` (COB is forward of the
+        COM), so the thrusters must supply the opposite moment. Net heave is the
+        residual weight ``m·g - ρ·g·V``.
+        """
+        g = float(self._gravity_mag)
+        rho = float(self.cfg.water_rho)
+        vol = float(self.cfg.volume)
+        dx = float(self.cfg.com_to_cob_offset[0])
+        target_fz = float(self.cfg.mass) * g - rho * g * vol
+        target_my = dx * rho * g * vol
+        # Linear guess (command = newtons / T_max). Newton then accounts for u·|u|.
+        x = target_fz / max(self._thrust_fwd_n, 1e-6)
+        y = target_my / max(self._thrust_fwd_n, 1e-6)
+        cap = float(self.pid.max_heave_wrench)
+        for _ in range(12):
+            f0, m0 = self._thruster_body_fz_my(x, y)
+            rf, rm = f0 - target_fz, m0 - target_my
+            if abs(rf) < 0.05 and abs(rm) < 0.05:
+                break
+            eps = 1.0e-3
+            fx, mx = self._thruster_body_fz_my(x + eps, y)
+            fy, my = self._thruster_body_fz_my(x, y + eps)
+            j00, j10 = (fx - f0) / eps, (mx - m0) / eps
+            j01, j11 = (fy - f0) / eps, (my - m0) / eps
+            det = j00 * j11 - j01 * j10
+            if abs(det) < 1.0e-8:
+                break
+            x -= (j11 * rf - j01 * rm) / det
+            y -= (-j10 * rf + j00 * rm) / det
+            x = max(-cap, min(cap, x))
+            y = max(-cap, min(cap, y))
+        got_fz, got_my = self._thruster_body_fz_my(x, y)
+        if abs(got_fz - target_fz) > 0.2 or abs(got_my - target_my) > 0.2:
+            raise RuntimeError(
+                f"level-hold pre-charge did not converge: "
+                f"Fz {got_fz:.2f}/{target_fz:.2f} N, My {got_my:.2f}/{target_my:.2f} N·m"
+            )
+        return x, y, got_fz, got_my, target_fz, target_my
+
+    def _apply_level_hold_precharge(self, env_ids: torch.Tensor) -> None:
+        """Write the solved hold into the depth and pitch integrators.
+
+        ``fz = ki·sum`` and ``my = -att_ki·sum_y`` when the proportional and
+        derivative errors are zero, which is the spawn state.
+        """
+        if not bool(getattr(self.cfg, "level_attitude", False)):
+            return
+        if float(self.pid.att_ki) > 0.0:
+            self.pid.att_error_sum[env_ids, 1] = -float(self._level_pitch_moment) / float(self.pid.att_ki)
+        if float(self.pid.ki_depth) > 0.0:
+            self.pid.depth_error_sum[env_ids] = float(self._level_heave_wrench) / float(self.pid.ki_depth)
 
     def _setup_scene(self):
         # Base builds robot + target + ground + light + sonar. We override to drop target/sonar.
@@ -1350,10 +1487,10 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
         depth_term = torch.exp(-(depth_err ** 2) / (self.cfg.sigma_depth ** 2))
 
         roll, pitch, _ = euler_xyz_from_quat(self._robot.data.root_quat_w)
-        # Attitude error is relative to the free-floating trim (~20 deg nose-up), not level:
-        # holding the natural trim is the physically correct "no drift" attitude.
-        roll_err = roll - self.cfg.trim_roll_rad
-        pitch_err = pitch - self.cfg.trim_pitch_rad
+        # Attitude error is relative to the WORK attitude (level when level_attitude,
+        # free-floating trim otherwise), not to whatever the hull drifts to.
+        roll_err = roll - self._att_roll_target
+        pitch_err = pitch - self._att_pitch_target
         att_err = torch.sqrt(roll_err * roll_err + pitch_err * pitch_err)
         att_term = torch.exp(-(att_err ** 2) / (self.cfg.sigma_att ** 2))
 
@@ -1395,8 +1532,8 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
         depth_end = depth_err > self.cfg.depth_limit
         terminated = terminated | depth_end
         roll, pitch, _ = euler_xyz_from_quat(self._robot.data.root_quat_w)
-        roll_err = roll - self.cfg.trim_roll_rad
-        pitch_err = pitch - self.cfg.trim_pitch_rad
+        roll_err = roll - self._att_roll_target
+        pitch_err = pitch - self._att_pitch_target
         att_err = torch.sqrt(roll_err * roll_err + pitch_err * pitch_err)
         att_end = att_err > self.cfg.att_limit
         terminated = terminated | att_end
@@ -1461,12 +1598,13 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
         self._default_root_state[ids, 0] = origins[:, 0]
         self._default_root_state[ids, 1] = origins[:, 1]
         self._default_root_state[ids, 2] = self.cfg.starting_depth
-        # Spawn at the free-floating trim attitude (nose-up ~20 deg), not level: starting
-        # level would be ~20 deg from trim and immediately exceed the attitude tolerance.
+        # Spawn at the WORK attitude (level when level_attitude; free-floating trim
+        # otherwise). Level is not a buoyancy equilibrium — the attitude PID carries
+        # the leveling moment from step 0 (integrator pre-charged below).
         zeros_ang = torch.zeros(ids.numel(), device=self.device)
-        trim_pitch = torch.full((ids.numel(),), float(self.cfg.trim_pitch_rad), device=self.device)
-        trim_roll = torch.full((ids.numel(),), float(self.cfg.trim_roll_rad), device=self.device)
-        spawn_quat = quat_from_euler_xyz(trim_roll, trim_pitch, zeros_ang)
+        spawn_pitch = torch.full((ids.numel(),), float(self._att_pitch_target), device=self.device)
+        spawn_roll = torch.full((ids.numel(),), float(self._att_roll_target), device=self.device)
+        spawn_quat = quat_from_euler_xyz(spawn_roll, spawn_pitch, zeros_ang)
         self._default_root_state[ids, 3:7] = spawn_quat
         self._robot.write_root_pose_to_sim(self._default_root_state[ids, :7], ids)
         self._robot.write_root_velocity_to_sim(self._default_root_state[ids, 7:], ids)
@@ -1501,6 +1639,10 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
             self._ocean_current_vel[ids] = 0.0
         if hasattr(self, "pid"):
             self.pid.reset(ids, depth_target=float(self.cfg.starting_depth))
+            # pid.reset just cleared both integrators. Put the solved level-hold
+            # wrench back so frame 0 is already the handover state.
+            if getattr(self, "_level_pitch_moment", 0.0) != 0.0 or getattr(self, "_level_heave_wrench", 0.0) != 0.0:
+                self._apply_level_hold_precharge(ids)
         if hasattr(self, "thruster_dyn") and getattr(self.cfg, "thruster_first_order_lag", False):
             reset_mask = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
             reset_mask[ids] = True

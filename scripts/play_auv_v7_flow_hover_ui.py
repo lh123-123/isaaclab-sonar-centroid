@@ -41,6 +41,33 @@ from isaaclab_tasks.direct.isaac_auv_tracking.agents.custom_sac_policy import Cu
 from isaaclab_tasks.direct.isaac_auv_tracking.auv_tracking_v7_flow_hover_gsrov_env import (
     AUVTrackingV7FlowHoverGsrovEnvCfg,
 )
+from isaaclab_tasks.direct.isaac_auv_tracking.thruster_dynamics import GSROV_THRUSTERS
+
+_NAMES = [t[0] for t in GSROV_THRUSTERS]
+_OFFSETS = np.array([t[1] for t in GSROV_THRUSTERS], dtype=np.float64)
+_AXES = np.array([t[2] for t in GSROV_THRUSTERS], dtype=np.float64)
+
+
+def _thrust_n(pwm: np.ndarray, fwd: float, rev: float, deadband: float) -> np.ndarray:
+    out = np.where(pwm >= 0.0, fwd, rev) * pwm * np.abs(pwm)
+    return np.where(np.abs(pwm) < deadband, 0.0, out)
+
+
+def _print_thrusters(tag: str, pwm: np.ndarray, fwd: float, rev: float, deadband: float) -> None:
+    thrust = _thrust_n(pwm, fwd, rev, deadband)
+    forces = thrust[:, None] * _AXES
+    torques = np.cross(_OFFSETS, forces)
+    print(f"[v7-play] {tag} thrusters", flush=True)
+    for name, u, force in zip(_NAMES, pwm, thrust):
+        cap = fwd if u >= 0.0 else rev
+        pct = abs(force) / cap * 100.0 if cap > 0.0 else 0.0
+        print(f"[v7-play]   {name:>3}  pwm={u:+.3f}  {force:+7.2f} N  {pct:5.1f}%", flush=True)
+    print(
+        f"[v7-play]   sums  pitch={float(torques[:, 1].sum()):+.2f} N·m  "
+        f"heave={float(forces[:, 2].sum()):+.2f} N  "
+        f"surge={float(forces[:, 0].sum()):+.2f} N  sway={float(forces[:, 1].sum()):+.2f} N",
+        flush=True,
+    )
 
 cfg = AUVTrackingV7FlowHoverGsrovEnvCfg()
 cfg.scene.num_envs = args_cli.num_envs
@@ -72,6 +99,10 @@ t0 = time.perf_counter()
 pace_dt = 1.0 / args_cli.pace_hz if args_cli.pace_hz > 0 else 0.0
 last_pos = pos0.clone()
 ep_rows: list[dict] = []
+pwm_samples: list[np.ndarray] = []
+deadband = float(getattr(raw.cfg, "thruster_deadband", 0.05))
+fwd_n = float(raw._thrust_fwd_n)
+rev_n = float(raw._thrust_rev_n)
 for step in range(args_cli.steps):
     with torch.inference_mode():
         actions, _ = agent.predict(obs, deterministic=True)
@@ -91,15 +122,19 @@ for step in range(args_cli.steps):
         st = obs["state"][0] if isinstance(obs, dict) else obs[0]["state"]
         st = np.asarray(st).reshape(-1)
         flow_n = float(st[8])
+        pwm = raw._pwm[0].detach().cpu().numpy().copy()
+        pwm_samples.append(pwm)
         print(
             f"[v7-play] step={step:4d} rew={float(np.asarray(rewards).reshape(-1)[0]):.3f} "
             f"act=({actions[0,0]:+.2f},{actions[0,1]:+.2f},{actions[0,2]:+.2f}) "
             f"flow_n={flow_n:.4f} drift=({float(drift[0]):+.3f},{float(drift[1]):+.3f},{float(drift[2]):+.3f})",
             flush=True,
         )
+        _print_thrusters(f"step={step}", pwm, fwd_n, rev_n, deadband)
         last_pos = pos.clone()
     elif not done:
         last_pos = raw._robot.data.root_pos_w[0].detach().cpu().clone()
+        pwm_samples.append(raw._pwm[0].detach().cpu().numpy().copy())
     if done:
         end = last_pos - pos0
         ep = {}
@@ -117,6 +152,15 @@ for step in range(args_cli.steps):
             f"timeout={ep.get('term_timeout', float('nan'))} att={ep.get('term_att', float('nan'))}",
             flush=True,
         )
+        if pwm_samples:
+            _print_thrusters(
+                f"episode {len(ep_rows)} mean",
+                np.mean(np.stack(pwm_samples), axis=0),
+                fwd_n,
+                rev_n,
+                deadband,
+            )
+        pwm_samples.clear()
         ep_rows.append({
             "horiz": horiz,
             "z": float(end[2]),

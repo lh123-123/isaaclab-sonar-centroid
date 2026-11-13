@@ -60,6 +60,8 @@ class BatchPIDController:
         yaw_pwm_cap: float = 0.25,
         trim_roll_rad: float = 0.0,
         trim_pitch_rad: float = 0.0,
+        att_ki: float = 0.0,
+        att_int_limit: float = 8.0,
     ):
         self.num_envs = num_envs
         self.device = device
@@ -83,6 +85,13 @@ class BatchPIDController:
         # trim instead of level, otherwise it fights buoyancy forever and burns thrust.
         self.trim_roll_rad = float(trim_roll_rad)
         self.trim_pitch_rad = float(trim_pitch_rad)
+        # Attitude integral (off by default — legacy tasks keep the P+D law). Holding an
+        # attitude away from the free-floating trim needs a CONSTANT moment (buoyancy
+        # couple ~5 N·m for the GS-ROV at level); a P-only loop has no way to supply it
+        # without standing error, so add integral action for that case. The env pre-charges
+        # att_error_sum at reset so frame 0 already carries the leveling moment.
+        self.att_ki = float(att_ki)
+        self.att_int_limit = float(att_int_limit)
         self.thruster_layout = str(thruster_layout).lower()
 
         if self.thruster_layout == "gsrov8":
@@ -108,6 +117,7 @@ class BatchPIDController:
         self.sway_last_error = torch.zeros(num_envs, device=device)
         self.depth_target = torch.zeros(num_envs, device=device)
         self.depth_error_sum = torch.zeros(num_envs, device=device)
+        self.att_error_sum = torch.zeros(num_envs, 2, device=device)
         self.lin_int_limit = 2.0
 
     def reset(self, env_ids: torch.Tensor, depth_target: torch.Tensor | float | None = None):
@@ -116,6 +126,7 @@ class BatchPIDController:
         self.sway_error_sum[env_ids] = 0.0
         self.sway_last_error[env_ids] = 0.0
         self.depth_error_sum[env_ids] = 0.0
+        self.att_error_sum[env_ids] = 0.0
         if depth_target is not None:
             if isinstance(depth_target, torch.Tensor):
                 self.depth_target[env_ids] = depth_target
@@ -199,8 +210,16 @@ class BatchPIDController:
         target_qy = math.sin(0.5 * self.trim_pitch_rad)
         roll_error = root_quat_w[:, 1] - target_qx
         pitch_error = root_quat_w[:, 2] - target_qy
+        if self.att_ki != 0.0:
+            att_err = torch.stack([roll_error, pitch_error], dim=-1)
+            self.att_error_sum = torch.clip(
+                self.att_error_sum + att_err * dt, -self.att_int_limit, self.att_int_limit
+            )
         mx = -self.kp_att * roll_error - self.kd_att * ang_vel_b[:, 0]
         my = -self.kp_att * pitch_error - self.kd_att * ang_vel_b[:, 1]
+        if self.att_ki != 0.0:
+            mx = mx - self.att_ki * self.att_error_sum[:, 0]
+            my = my - self.att_ki * self.att_error_sum[:, 1]
 
         if self.thruster_layout == "gsrov8":
             # Horizontals carry Fx/Mz, verticals carry Fz/Mx/My; allocate as one wrench.
