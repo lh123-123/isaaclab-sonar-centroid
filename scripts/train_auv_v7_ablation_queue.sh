@@ -19,7 +19,7 @@ run() {
   shift
   echo "=== ${name} start $(date -Is) ===" | tee -a "${QUEUE_LOG}"
   set +e
-  ./scripts/train_auv_tracking_sb3_sac_v7_flow_hover_gsrov.sh \
+  bash ./scripts/train_auv_tracking_sb3_sac_v7_flow_hover_gsrov.sh \
     --num_envs 8 --headless --max_iterations 200000 \
     "$@" > "/home/lh/auv_v7_ablate/${name}.log" 2>&1
   local code=$?
