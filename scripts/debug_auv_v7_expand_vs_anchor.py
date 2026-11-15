@@ -85,8 +85,8 @@ def main():
         surge, _sway = _body_horizontal(env)
         d_xy, dx, dy = _horiz_disp(env, origin)
         anchor = math.exp(-(d_xy ** 2) / (float(cfg.sigma_anchor_m) ** 2))
-        drift_mag = float(env._drift_int[0].norm())
-        drift = math.exp(-(drift_mag ** 2) / (float(cfg.sigma_drift) ** 2))
+        drift_mag = float(env._visodom_m()[0].norm())  # visodom estimate (leaky integral removed 2026-11-15)
+        drift = math.exp(-(drift_mag ** 2) / (float(cfg.sigma_visodom_m) ** 2))
         a_px = float(env._flow_uniform[0, 0])
         k = float(env._flow_expand[0])
         v_axial = k * z_plane / dt

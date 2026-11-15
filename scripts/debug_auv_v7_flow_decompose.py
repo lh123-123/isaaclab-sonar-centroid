@@ -85,9 +85,8 @@ def main():
         k = float(env._flow_expand[0])
         v_axial = k * z_plane / dt
         v_lat = a_px / max(f_px, 1.0) * z_plane / dt
-        mean_u = float(env._drift_int[0, 0])  # not the instantaneous mean
         # Instantaneous normalized mean is not stored. Use uniform px / fw as the
-        # same quantity the counter adds each step.
+        # same quantity the integrators consume each step.
         mean_inst = a_px / fw
         if step % 10 == 0 or step in (args_cli.phase2_step - 1, args_cli.steps - 1):
             print(

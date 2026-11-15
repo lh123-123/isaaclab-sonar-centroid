@@ -335,6 +335,48 @@ class AUVTrackingV7FlowHoverGsrovEnvCfg(AUVTrackingEnvCfg):
     trim_roll_rad: float = 0.0
     trim_pitch_rad: float = float(-np.arctan2(0.040, 0.11))
 
+    # ---------------------------------------------------------------------------------
+    # DOMAIN RANDOMIZATION (sim→real).
+    #
+    # Sampling horizon differs by knob because the physics differs:
+    #   * water/pose terms are resampled EVERY EPISODE (a dive starts in a new current
+    #     and from a new hand-flown hover pose);
+    #   * hardware/image terms are sampled ONCE PER ENV and held for the whole run (one
+    #     camera, one battery pack, one hull — a real unit does not re-draw its sensor
+    #     noise level between dives).
+    # Ranges are conservative on purpose: the real ROV is qualitatively like the sim, so
+    # this should widen the basin around the current operating point, not invent a new
+    # distribution. `dr_enable=False` reproduces the 2026-11-15 boxed configuration
+    # exactly (the last three ablations were trained that way).
+    dr_enable: bool = True
+    # Uniform current in the horizontal plane. The fixed 0.3 m/s along [1, 0.3, 0] field
+    # was exactly one sample of this distribution.
+    dr_current_speed_range: tuple = (0.20, 0.45)   # m/s, per episode
+    dr_current_dir_full_circle: bool = True         # ±180° heading; False → fixed dir ± range
+    dr_current_dir_range_deg: float = 20.0          # only when dr_current_dir_full_circle=False
+    dr_current_vert_frac: float = 0.10              # |v_z| ≤ frac · speed (currents are ~horizontal)
+    # Thrust gain: a pack at 87–100 % of rated voltage scales thrust by (V/24)² ≈ 0.76–1.0.
+    # The gain is applied to the NORMALISED COMMAND, so thrust ∝ g² (u·|u| law): the range
+    # below spans roughly ±10 % of delivered thrust.
+    dr_thrust_gain_range: tuple = (0.90, 1.05)
+    # Extra linear drag on the hull, N per (m/s), per env. The real added-mass/viscous
+    # coefficients are estimates, so perturb the damping instead of pretending to know it.
+    dr_drag_gain_range: tuple = (0.0, 3.0)
+    # Camera: exposure/gain spread (multiplicative) and per-frame read noise, σ in [0,1]
+    # units (σ·255 ≈ LSB). Kept small enough that the texture mask (gradient > 8) and the
+    # template match stay meaningful — this is sensor realism, not a texture-loss test.
+    dr_cam_brightness_range: tuple = (0.92, 1.08)
+    dr_cam_noise_std_range: tuple = (0.004, 0.010)
+    # Spawn pose: the ROV starts at a hand-flown hover, not teleported to the exact origin.
+    # The anchor template is captured from wherever it starts, so an offset means the
+    # policy must return to a first frame that is NOT the nominal one.
+    dr_spawn_xy_range: float = 0.12      # m, ± on each horizontal axis
+    dr_spawn_yaw_range_deg: float = 8.0  # ± heading at capture
+    dr_spawn_depth_range: float = 0.04   # m, ± around starting_depth (the PI pulls it back)
+    # Per-env texture drawn from plane_texture_paths (needs that list non-empty). Off by
+    # default: the default run uses one seabed asset. Turn on for a texture sweep.
+    dr_texture_choice: bool = False
+
     # Reward weights.
     rew_flow: float = 1.0
     rew_alive: float = 0.3
@@ -344,17 +386,14 @@ class AUVTrackingV7FlowHoverGsrovEnvCfg(AUVTrackingEnvCfg):
     sigma_flow: float = 0.05  # calibrated: 1x std of measured flow_rms_n (≈0.047, clamped [0.05,0.5])
     sigma_depth: float = 1.5
     sigma_att: float = 0.3
-    # Slow-drift term — SECONDARY since the first-frame anchor landed: leaky integral of
-    # the SIGNED mean flow over textured pixels. Why it exists: the ~5 cm/s residual leak
-    # under current is 0.35 px/frame at flow-res, i.e. flow_rms_n ≈ 0.0055 — 8x below
-    # the hover frame-noise σ (0.047), so the RMS reward cannot separate "drifting" from
-    # "hovering" (flow_term ≈ 0.985 for both). The integral accumulates a one-way bias
-    # linearly while zero-mean noise averages out. Demoted 0.3 → 0.1: the anchor offset
-    # below measures the same drift ABSOLUTELY (no leak, no yaw-gaming) — this term now
-    # only denoises the fine sub-pixel regime inside the anchor basin.
-    rew_drift: float = 0.1
-    sigma_drift: float = 0.05  # ≈ steady-state |drift_int| of the 5 cm/s leak; calibrate via debug_auv_v7_drift_flow.py
-    drift_tau_s: float = 3.0  # leak time constant (s); steady state = mean_flow × τ/dt_step
+    # REMOVED 2026-11-15: the slow-drift term (rew_drift / sigma_drift / drift_tau_s) and
+    # its leaky integral of the signed mean flow. Leave-one-out (ablate_drift, 461k steps,
+    # best 25-window disp_end_m 0.0107 m — the best of all four ablations) showed the term
+    # is redundant: the first-frame anchor offset measures the same drift ABSOLUTELY, and
+    # the visodom position term already supplies the velocity-scale gradient that this
+    # term was introduced to provide. Dropping it also removes a per-step de-rotation +
+    # integration from the hot path. Do not reintroduce it without an ablation that shows
+    # a gap against this configuration.
 
     # First-frame visual anchor: hover = "make the camera see the episode's first frame
     # again". At reset the first textured frame is captured as a template (center crop at
@@ -401,7 +440,6 @@ class AUVTrackingV7FlowHoverGsrovEnvCfg(AUVTrackingEnvCfg):
     # reads the internal flow. ablate_template drops the match reward, the
     # similarity reward, and the capture-heading reward together.
     ablate_flow: bool = False
-    ablate_drift: bool = False
     ablate_template: bool = False
     ablate_visodom: bool = False
 
@@ -538,9 +576,7 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
             self._level_pitch_moment = 0.0
         print(
             "[v7-ablate] "
-            f"flow={int(bool(self.cfg.ablate_flow))} "
-            f"drift={int(bool(self.cfg.ablate_drift))} "
-            f"template={int(bool(self.cfg.ablate_template))} "
+            f"flow={int(bool(self.cfg.ablate_flow))} "          f"template={int(bool(self.cfg.ablate_template))} "
             f"visodom={int(bool(self.cfg.ablate_visodom))}",
             flush=True,
         )
@@ -663,14 +699,6 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
         self._flow_image = torch.zeros((self.num_envs, 2, h, w), dtype=torch.float32, device=self.device)
         self._texture_mask = torch.zeros((self.num_envs, 1, h, w), dtype=torch.float32, device=self.device)
         self._flow_rms = torch.zeros(self.num_envs, device=self.device)
-        # Leaky integral of signed mean flow (N,2): [du_int, dv_int], normalized by fw/fh.
-        # Zeroed on reset; updated once per policy step in _update_flow_and_texture.
-        self._drift_int = torch.zeros((self.num_envs, 2), dtype=torch.float32, device=self.device)
-        # Heading (yaw) at each env's last flow integration. The accumulator is stored in
-        # the CURRENT head frame and de-rotated by the heading change between integrations,
-        # so a world-fixed drift keeps a fixed direction in it (up to camera-geometry
-        # anisotropy) and cannot be cancelled by spinning the vehicle.
-        self._drift_yaw_prev = torch.zeros(self.num_envs, device=self.device)
         # Visual odometry: non-leaky de-rotated integral of the consecutive-flow
         # uniform component (u_px, v_px @ flow-res), the tracked plane distance
         # _visodom_z (m) and the surge displacement _visodom_x (m, from the
@@ -712,8 +740,6 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
         self._anchor_f_px = float(self.cfg.flow_render_width) / (
             2.0 * float(np.tan(np.radians(float(self.cfg.cam_hfov_deg)) * 0.5))
         )
-        _dt_step = float(self.cfg.decimation) * float(self.cfg.sim.dt)
-        self._drift_leak = float(np.exp(-_dt_step / max(float(self.cfg.drift_tau_s), 1e-6)))
         self._texture_count = torch.zeros(self.num_envs, device=self.device)
         self._prev_rgb = torch.zeros((self.num_envs, rh, rw, 3), dtype=torch.uint8, device=self.device)
         self._prev_rgb_ok = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
@@ -726,13 +752,44 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
         self._ep_flow_rms_sum = torch.zeros(self.num_envs, device=self.device)
         self._ep_present_sum = torch.zeros(self.num_envs, device=self.device)
         self._ep_flow_term_sum = torch.zeros(self.num_envs, device=self.device)
-        self._ep_drift_sum = torch.zeros(self.num_envs, device=self.device)
         self._ep_anchor_sum = torch.zeros(self.num_envs, device=self.device)
         # First-frame-anchor episode sums: mean visual displacement (m) and sim score.
         self._ep_anchor_vis_sum = torch.zeros(self.num_envs, device=self.device)
         self._ep_anchor_sim_sum = torch.zeros(self.num_envs, device=self.device)
         # cause order: [texture_lost, depth, attitude, timeout]
         self._ep_cause = torch.zeros(self.num_envs, 4, dtype=torch.bool, device=self.device)
+
+        # ---- domain-randomization state (ranges live in the cfg block) ----
+        # Water/pose draws are refreshed every episode in _reset_idx.
+        self._dr_cur_speed = torch.zeros(self.num_envs, device=self.device)
+        self._dr_cur_dir = torch.zeros((self.num_envs, 2), device=self.device)
+        self._dr_cur_dir[:, 0] = 1.0
+        self._dr_cur_vz = torch.zeros(self.num_envs, device=self.device)
+        # Hardware/image draws are held for the whole run (one camera, one pack).
+        self._dr_thrust_gain = torch.ones(self.num_envs, device=self.device)
+        self._dr_drag_gain = torch.zeros(self.num_envs, device=self.device)
+        self._dr_cam_bright = torch.ones(self.num_envs, device=self.device)
+        self._dr_cam_noise = torch.zeros(self.num_envs, device=self.device)
+        self._sample_domain_randomization(torch.arange(self.num_envs, device=self.device), per_episode=False)
+        if bool(getattr(self.cfg, "dr_enable", False)):
+            print(
+                "[v7][DR] enabled  current=%.2f-%.2f m/s (full-circle=%s)  thrust_gain=%.2f-%.2f"
+                "  drag=%.2f-%.2f N/(m/s)  cam_bright=%.2f-%.2f  cam_noise=%.3f-%.3f"
+                "  spawn_xy=±%.2fm yaw=±%.1f° depth=±%.2fm"
+                % (
+                    self.cfg.dr_current_speed_range[0], self.cfg.dr_current_speed_range[1],
+                    bool(self.cfg.dr_current_dir_full_circle),
+                    self.cfg.dr_thrust_gain_range[0], self.cfg.dr_thrust_gain_range[1],
+                    self.cfg.dr_drag_gain_range[0], self.cfg.dr_drag_gain_range[1],
+                    self.cfg.dr_cam_brightness_range[0], self.cfg.dr_cam_brightness_range[1],
+                    self.cfg.dr_cam_noise_std_range[0], self.cfg.dr_cam_noise_std_range[1],
+                    float(self.cfg.dr_spawn_xy_range), float(self.cfg.dr_spawn_yaw_range_deg),
+                    float(self.cfg.dr_spawn_depth_range),
+                ),
+                flush=True,
+            )
+        else:
+            print("[v7][DR] disabled (boxed 2026-11-15 configuration)", flush=True)
 
         # USD pose sync for camera.
         self._robot_usd = None
@@ -1165,7 +1222,24 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
         rgb = self._tiled_camera.data.output["rgb"]
         if rgb.dtype != torch.uint8:
             rgb = rgb.clamp(0, 255).to(torch.uint8)
-        return rgb[..., :3]
+        rgb = rgb[..., :3]
+        # Camera domain randomization at RENDER resolution, upstream of everything, so
+        # the flow, the template match, the texture mask and the policy frame all see the
+        # same imperfect sensor. The exposure/gain spread is fixed per env for the whole
+        # run (like a real unit); the read noise is per frame. Cached per sim step because
+        # both callers (_update_flow_and_texture and _get_observations) must see the SAME
+        # frame — drawing twice would make the policy's RGB and the flow disagree.
+        if bool(getattr(self.cfg, "dr_enable", False)) and hasattr(self, "_dr_cam_bright"):
+            key = int(getattr(self, "_sim_step_counter", -1))
+            if getattr(self, "_dr_frame_key", -1) == key:
+                return self._dr_frame_cache
+            out = rgb.to(torch.float32) * self._dr_cam_bright.view(-1, 1, 1, 1)
+            if float(self.cfg.dr_cam_noise_std_range[1]) > 0.0:
+                out = out + torch.randn_like(out) * (self._dr_cam_noise.view(-1, 1, 1, 1) * 255.0)
+            rgb = out.round().clamp_(0.0, 255.0).to(torch.uint8)
+            self._dr_frame_key = key
+            self._dr_frame_cache = rgb
+        return rgb
 
     def _read_camera_frame(self):
         rgb = self._camera_rgb().permute(0, 3, 1, 2).to(torch.float32)
@@ -1271,36 +1345,14 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
             rms_all = torch.sqrt(sq.mean(dim=-1))
             rms = torch.where(has_tex, rms_tex, rms_all)
             self._flow_rms[~fresh] = rms
-            # Signed mean flow over textured pixels -> leaky drift integrator.
-            # RMS is unsigned and hides a persistent one-way bias (a 0.35 px/frame leak
-            # reads as "hover" next to the σ≈0.047 frame noise); the integral accumulates
-            # the bias linearly while zero-mean noise averages out.
-            m = small.shape[0]
-            du_flat = small[:, 0, :, :].reshape(m, -1)
-            dv_flat = small[:, 1, :, :].reshape(m, -1)
-            denom = tex_flat.sum(dim=-1).clamp(min=1)
-            mean_u = (du_flat * tex_flat).sum(dim=-1) / denom / float(fw)
-            mean_v = (dv_flat * tex_flat).sum(dim=-1) / denom / float(fh)
-            # Axial vs lateral split of the same flow field. Diagnostic only.
+            # Axial vs lateral split of the same flow field: (a_px, b_px) drive the
+            # visodom integrator below, k_exp is the expansion coefficient (k ≈ ΔZ/Z).
             a_px, b_px, k_exp = self._fit_translational_flow(small[:, 0], small[:, 1], tex, fw, fh)
             self._flow_uniform[~fresh, 0] = a_px
             self._flow_uniform[~fresh, 1] = b_px
             self._flow_expand[~fresh] = k_exp
-            # De-rotate before leaking: rotate the accumulator by the heading change since
-            # this env's last integration, then add the (head-frame) measurement. Without
-            # this, steady yaw while drifting keeps the body-frame signature rotating and
-            # the leaky integral cancels to ~0 — exactly how the 287k model earned
-            # drift_mag≈0.018 while covering 2.8 m per episode.
             rows = ~fresh
             yaw_now = euler_xyz_from_quat(self._robot.data.root_quat_w)[2][rows]
-            dyaw = yaw_now - self._drift_yaw_prev[rows]
-            dyaw = torch.atan2(torch.sin(dyaw), torch.cos(dyaw))  # wrap to [-pi, pi]
-            cy, sy = torch.cos(dyaw), torch.sin(dyaw)
-            d0 = self._drift_int[rows, 0] * cy - self._drift_int[rows, 1] * sy
-            d1 = self._drift_int[rows, 0] * sy + self._drift_int[rows, 1] * cy
-            self._drift_int[rows, 0] = d0 * self._drift_leak + mean_u
-            self._drift_int[rows, 1] = d1 * self._drift_leak + mean_v
-            self._drift_yaw_prev[rows] = yaw_now
             # Visual odometry: same de-rotation, NO leak. The surge leg comes from
             # the expansion coefficient (k per frame ≈ ΔZ/Z): displacement += k·Z,
             # then Z shrinks by 1/(1+k). Sway px→m happens in _visodom_m via
@@ -1347,11 +1399,71 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
             yaw=yaw,
         )
 
+    def _sample_domain_randomization(self, env_ids, per_episode: bool) -> None:
+        """Draw the domain-randomization knobs for ``env_ids``.
+
+        Two horizons, because the physics differs:
+          * ``per_episode=True`` redraws the water current — every dive starts in a new
+            flow, which is what the fixed [1, 0.3, 0]·0.3 m/s field never did;
+          * ``per_episode=False`` draws the hardware/image terms once — a real unit keeps
+            its camera gain and its battery pack for the whole run.
+        """
+        if not bool(getattr(self.cfg, "dr_enable", False)):
+            return
+        n = int(env_ids.numel())
+        if n == 0:
+            return
+        dev = self.device
+
+        def _uniform(rng) -> torch.Tensor:
+            lo, hi = float(rng[0]), float(rng[1])
+            return lo + (hi - lo) * torch.rand(n, device=dev)
+
+        if per_episode:
+            speed = _uniform(self.cfg.dr_current_speed_range)
+            if bool(self.cfg.dr_current_dir_full_circle):
+                ang = (torch.rand(n, device=dev) * 2.0 - 1.0) * float(np.pi)
+            else:
+                d0 = self.cfg.ocean_current.params.get("direction", [1.0, 0.3, 0.0])
+                base = float(np.arctan2(float(d0[1]), float(d0[0])))
+                half = float(np.radians(float(self.cfg.dr_current_dir_range_deg)))
+                ang = base + (torch.rand(n, device=dev) * 2.0 - 1.0) * half
+            self._dr_cur_speed[env_ids] = speed
+            self._dr_cur_dir[env_ids, 0] = torch.cos(ang)
+            self._dr_cur_dir[env_ids, 1] = torch.sin(ang)
+            vf = float(self.cfg.dr_current_vert_frac)
+            self._dr_cur_vz[env_ids] = (torch.rand(n, device=dev) * 2.0 - 1.0) * vf * speed
+        else:
+            self._dr_thrust_gain[env_ids] = _uniform(self.cfg.dr_thrust_gain_range)
+            self._dr_drag_gain[env_ids] = _uniform(self.cfg.dr_drag_gain_range)
+            self._dr_cam_bright[env_ids] = _uniform(self.cfg.dr_cam_brightness_range)
+            self._dr_cam_noise[env_ids] = _uniform(self.cfg.dr_cam_noise_std_range)
+
     def _apply_action(self):
         """v7 applies PID (cmd_vel [surge, yaw, heave]) → PWM → thrust/moments."""
         dt = float(self.cfg.sim.dt)
         t = None
-        if getattr(self, "_ocean_current_field", None) is not None:
+        dr_on = bool(getattr(self.cfg, "dr_enable", False))
+        if dr_on:
+            # Per-episode uniform current, drawn in _reset_idx. This bypasses the
+            # OceanCurrentCfg field on purpose: under DR the per-episode draw IS the
+            # field, so a fixed direction/strength would just add a second, contradictory
+            # source of truth. The ramp is kept — frame 1 is still water, matching the
+            # handover story (thrusters already holding as the current builds).
+            t = self.episode_length_buf.to(dtype=torch.float32) * (dt * float(self.cfg.decimation))
+            v = torch.stack(
+                [
+                    self._dr_cur_dir[:, 0] * self._dr_cur_speed,
+                    self._dr_cur_dir[:, 1] * self._dr_cur_speed,
+                    self._dr_cur_vz,
+                ],
+                dim=-1,
+            )
+            ramp_s = float(getattr(self.cfg, "current_ramp_s", 0.0))
+            if ramp_s > 0.0:
+                v = v * (t / ramp_s).clamp(0.0, 1.0).unsqueeze(-1)
+            self.set_ocean_currents(None, v)
+        elif getattr(self, "_ocean_current_field", None) is not None:
             # episode_length_buf counts policy steps and is still 0 during the first
             # step's physics, so t = 0 at the handover frame. Multiply by the control
             # period, not sim.dt: sim.dt would stall the clock at ~2 s in a 15 s episode.
@@ -1373,7 +1485,17 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
             self._robot.data.root_ang_vel_w,
             dt=dt,
         )
+        if dr_on:
+            # Command-space thrust gain: motor thrust follows u·|u|, so multiplying the
+            # normalised command by g scales delivered thrust by g² — the same order as a
+            # pack sagging from 24 V to ~22 V.
+            self._pwm.mul_(self._dr_thrust_gain[:, None])
         thrust, moment = self._compute_dynamics(self._pwm)
+        if dr_on and float(self.cfg.dr_drag_gain_range[1]) > 0.0:
+            # Extra linear drag perturbation on the hull [N per (m/s), per kg-free]. The
+            # real added-mass/viscous coefficients are estimates, so perturb the damping
+            # instead of rescaling the buoyancy/drag split inside the force model.
+            thrust = thrust - self._dr_drag_gain[:, None] * self._robot.data.root_lin_vel_w[:, :3]
         self._thrust[:, 0, :] = thrust
         self._moment[:, 0, :] = moment
         self._robot.set_external_force_and_torque(self._thrust, self._moment)
@@ -1513,12 +1635,6 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
         flow_rms_n = (self._flow_rms / 64.0).clamp(0.0, 1.0)
         flow_term = present * torch.exp(-(flow_rms_n ** 2) / (self.cfg.sigma_flow ** 2))
 
-        # Slow-drift term: |leaky integral of signed flow|. present-gated like flow_term;
-        # with sigma_drift ≈ the 5 cm/s steady state, drifting costs ~exp(-1)≈0.37 of this
-        # term per step — a real gradient the RMS term (0.985 vs 1.0) never provided.
-        drift_mag = self._drift_int.norm(dim=-1)
-        drift_term = present * torch.exp(-(drift_mag ** 2) / (self.cfg.sigma_drift ** 2))
-
         # First-frame visual anchor — the goal-directed hover target. Distance term uses
         # the template-match offset converted to metres (in _update_anchor_state); sim
         # term is the match score itself ("current frame looks like frame 1"). Both
@@ -1557,7 +1673,6 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
         else:
             position_term = anchor_term
         w_flow = 0.0 if bool(self.cfg.ablate_flow) else float(self.cfg.rew_flow)
-        w_drift = 0.0 if bool(self.cfg.ablate_drift) else float(self.cfg.rew_drift)
         w_anchor_vis = 0.0 if bool(self.cfg.ablate_template) else float(self.cfg.rew_anchor_vis)
         w_sim = 0.0 if bool(self.cfg.ablate_template) else float(self.cfg.rew_sim)
         w_yaw = 0.0 if bool(self.cfg.ablate_template) else float(self.cfg.rew_yaw_anchor)
@@ -1567,7 +1682,6 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
         self._ep_flow_rms_sum += flow_rms_n
         self._ep_present_sum += present
         self._ep_flow_term_sum += flow_term
-        self._ep_drift_sum += drift_mag.clamp(0.0, 1.0)
         self._ep_anchor_sum += d_anchor
         self._ep_anchor_vis_sum += self._anchor_disp_m
         self._ep_anchor_sim_sum += sim_term
@@ -1590,7 +1704,6 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
 
         rew = (
             w_flow * flow_term
-            + w_drift * drift_term
             + w_anchor_vis * anchor_vis_term
             + w_sim * sim_term
             + w_yaw * yaw_anchor_term
@@ -1662,7 +1775,13 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
                 "flow_rms_n": float((self._ep_flow_rms_sum[ids] / ep_len).mean()),
                 "present_frac": float((self._ep_present_sum[ids] / ep_len).mean()),
                 "flow_term": float((self._ep_flow_term_sum[ids] / ep_len).mean()),
-                "drift_mag": float((self._ep_drift_sum[ids] / ep_len).mean()),
+                # Domain-randomization draw of this episode: you cannot tell a policy that
+                # copes with a 0.45 m/s beam current from one that only saw 0.2 m/s
+                # head-on unless the sampled current is on the same curve as disp_end_m.
+                "dr_cur_speed": float(self._dr_cur_speed[ids].mean()),
+                "dr_cur_deg": float(
+                    torch.atan2(self._dr_cur_dir[ids, 1], self._dr_cur_dir[ids, 0]).mean() * 57.2957795
+                ),
                 "disp_m": float((self._ep_anchor_sum[ids] / ep_len).mean()),
                 "disp_end_m": float(d_end.mean()),
                 "visodom_end_m": float(vo_end.mean()),
@@ -1677,7 +1796,6 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
             self._ep_flow_rms_sum[ids] = 0.0
             self._ep_present_sum[ids] = 0.0
             self._ep_flow_term_sum[ids] = 0.0
-            self._ep_drift_sum[ids] = 0.0
             self._ep_anchor_sum[ids] = 0.0
             self._ep_anchor_vis_sum[ids] = 0.0
             self._ep_anchor_sim_sum[ids] = 0.0
@@ -1688,18 +1806,37 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
             pass
         if not hasattr(self, "_default_root_state"):
             return
+        # Per-episode water draw (new current every dive) and spawn offsets: the ROV
+        # starts at a hand-flown hover, so the captured frame 1 is not the nominal one.
+        self._sample_domain_randomization(ids, per_episode=True)
+        dr_on = bool(getattr(self.cfg, "dr_enable", False))
+        _n = int(ids.numel())
+        if dr_on and float(self.cfg.dr_spawn_xy_range) > 0.0:
+            _off = (torch.rand((_n, 2), device=self.device) * 2.0 - 1.0) * float(self.cfg.dr_spawn_xy_range)
+        else:
+            _off = torch.zeros((_n, 2), device=self.device)
+        if dr_on and float(self.cfg.dr_spawn_depth_range) > 0.0:
+            _dz = (torch.rand(_n, device=self.device) * 2.0 - 1.0) * float(self.cfg.dr_spawn_depth_range)
+        else:
+            _dz = torch.zeros(_n, device=self.device)
         # robot spawn at env origin (keep multi-env placement correct)
         origins = self.scene.env_origins[ids]
-        self._default_root_state[ids, 0] = origins[:, 0]
-        self._default_root_state[ids, 1] = origins[:, 1]
-        self._default_root_state[ids, 2] = self.cfg.starting_depth
+        self._default_root_state[ids, 0] = origins[:, 0] + _off[:, 0]
+        self._default_root_state[ids, 1] = origins[:, 1] + _off[:, 1]
+        self._default_root_state[ids, 2] = float(self.cfg.starting_depth) + _dz
         # Spawn at the WORK attitude (level when level_attitude; free-floating trim
         # otherwise). Level is not a buoyancy equilibrium — the attitude PID carries
         # the leveling moment from step 0 (integrator pre-charged below).
         zeros_ang = torch.zeros(ids.numel(), device=self.device)
         spawn_pitch = torch.full((ids.numel(),), float(self._att_pitch_target), device=self.device)
         spawn_roll = torch.full((ids.numel(),), float(self._att_roll_target), device=self.device)
-        spawn_quat = quat_from_euler_xyz(spawn_roll, spawn_pitch, zeros_ang)
+        if dr_on and float(self.cfg.dr_spawn_yaw_range_deg) > 0.0:
+            spawn_yaw = (
+                torch.rand(ids.numel(), device=self.device) * 2.0 - 1.0
+            ) * float(np.radians(float(self.cfg.dr_spawn_yaw_range_deg)))
+        else:
+            spawn_yaw = zeros_ang
+        spawn_quat = quat_from_euler_xyz(spawn_roll, spawn_pitch, spawn_yaw)
         self._default_root_state[ids, 3:7] = spawn_quat
         self._robot.write_root_pose_to_sim(self._default_root_state[ids, :7], ids)
         self._robot.write_root_velocity_to_sim(self._default_root_state[ids, 7:], ids)
@@ -1707,7 +1844,6 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
         self._flow_image[ids] = 0.0
         self._texture_mask[ids] = 0.0
         self._flow_rms[ids] = 0.0
-        self._drift_int[ids] = 0.0
         # First-frame anchor: invalid until the next textured frame is captured (its
         # offset/ncc read 0 until then — one step at most). Seed the capture-reference
         # heading with the spawn heading so pre-capture yaw_err is not garbage.
@@ -1717,9 +1853,6 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
         self._anchor_ncc[ids] = 0.0
         self._anchor_disp_m[ids] = 0.0
         self._anchor_yaw[ids] = euler_xyz_from_quat(self._robot.data.root_quat_w[ids])[2]
-        # Re-seed the de-rotation heading so the first integration after reset computes
-        # dyaw from the (post-teleport) spawn heading, not a stale pre-reset one.
-        self._drift_yaw_prev[ids] = euler_xyz_from_quat(self._robot.data.root_quat_w[ids])[2]
         # Visual odometry: fresh episode → zero displacement, plane at the spawn
         # distance, de-rotation seeded at the spawn heading.
         self._visodom[ids] = 0.0

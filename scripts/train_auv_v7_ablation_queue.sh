@@ -33,5 +33,4 @@ run() {
 run no_visodom env.ablate_visodom=true
 run no_template env.ablate_template=true
 run no_flow env.ablate_flow=true
-run no_drift env.ablate_drift=true
 echo "=== queue done $(date -Is) ===" | tee -a "${QUEUE_LOG}"
