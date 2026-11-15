@@ -13,12 +13,12 @@
 
 | 项 | 当前 v7 GS-ROV 实现 |
 |---|---|
-| 相机 / 渲染 | 1280×720，部署输入分辨率；仿真 tiled camera 配置为 1280×720 |
+| 相机 / 渲染 | 仿真 tiled camera 渲染 640×360（`render_height/width`）；光流在 **176×320** 上计算；策略图 64×64 |
 | 相机 HFOV | 81.65° |
-| 策略频率 | `decimation=6`、`sim.dt=1/120 s` → 20 Hz（50 ms/步） |
-| 光流 | OpenCV Farneback `(pyr_scale=.5, levels=3, winsize=21, iterations=2, poly_n=5, poly_sigma=1.2, flags=0)` |
-| policy image | `(7,64,64)`：RGB(3)、du、dv、flow magnitude、texture mask |
-| state | `(9,)`：depth, roll, pitch, yaw, v_surge, v_sway, v_heave, yaw_rate, flow_rms |
+| 策略频率 | `decimation=8`、`sim.dt=1/120 s` → **15 Hz**（66.7 ms/步） |
+| 光流 | OpenCV Farneback `(pyr_scale=.5, levels=3, winsize=21, iterations=2, poly_n=5, poly_sigma=1.2, flags=0)` @ 176×320 |
+| policy image | `(11,64,64)`：RGB(3)、du、dv、flow magnitude、texture mask、anchor 偏移(2)、visodom(2) |
+| state | `(17,)`（仅 critic 用）|
 | action | `(3,)`：surge、sway、yaw，范围 `[-1,1]` |
 | 执行器 | 8 个推进器，4 vertical + 4 horizontal，`_pwm.shape=(num_envs,8)` |
 | heave | 策略动作不输出 heave；深度由 PID 以 `starting_depth` 保持 |
@@ -31,17 +31,19 @@
 ## 1. 观测契约
 
 ```python
-image = Box(low=-1, high=1, shape=(7, 64, 64), dtype=float32)
-state = Box(shape=(9,), dtype=float32)
+image = Box(low=-1, high=1, shape=(11, 64, 64), dtype=float32)   # actor 唯一输入
+state = Box(shape=(17,), dtype=float32)                          # critic only（非对称 AC）
 ```
 
 | 通道 | 内容 | 处理 |
 |---|---|---|
 | 0–2 | tiled camera RGB | `/255`，范围 `[0,1]` |
-| 3 | `du / 1280` | Farneback 位移下采样至 64×64 后，按原始相机宽度归一化，clip `[-1,1]` |
-| 4 | `dv / 720` | 同上，按原始相机高度归一化，clip `[-1,1]` |
+| 3 | `du / 320` | Farneback 位移下采样至 64×64 后，按 **flow-res 宽(320)** 归一化，clip `[-1,1]` |
+| 4 | `dv / 176` | 同上，按 **flow-res 高(176)** 归一化，clip `[-1,1]` |
 | 5 | `sqrt(du_norm²+dv_norm²)` | 由归一化后的 du/dv 计算 |
 | 6 | texture mask | render 分辨率算梯度阈值，再 adaptive max pool 至 64×64，值为 0/1 |
+| 7–8 | 首帧模板偏移 `du/margin_u`, `dv/margin_v` | 广播成常数通道，±1 = 匹配窗边缘（≈±0.9 m @ Z=2 m） |
+| 9–10 | visodom 位移 `x/σ`, `y/σ` | 广播成常数通道，σ=`sigma_visodom_m`=1.0 m；跨模板盆地仍继续计数 |
 
 `frame_stack=1`，无历史帧堆叠。Farneback 由 CPU OpenCV 执行；部署侧 OpenCL 速度数据不能直接视作训练端耗时。`state` 九维顺序如上，最后一维 `flow_rms` 是 64×64 降采样流场上纹理区域的像素 RMS；它不是部署侧原始 1280×720 流 RMS 的同量纲直接值。
 
@@ -211,3 +213,47 @@ TERM=xterm-256color ./isaaclab.sh -p scripts/debug_auv_v7_drift_flow.py --headle
 动作 3-D 不变；深度由本地整定的 PI 环（kp 12 / ki 1.5 / kd 6 / 限幅 6 N）自主保持出生深度。
 零动作实测：初沉至死区边 −6 cm，积分 ~12 s 清偏差，episode 末 z=+1.2 cm，单调收敛。
 策略的活儿只剩水平（洋流）——这正是第一帧锚定任务本来的自由度。
+
+---
+
+## 10. 2026-11-15：删除 drift 项 + 域随机化（以本节为最新契约）
+
+### 10.1 删除"慢漂移"奖励项及其积分器
+
+四组留一消融（各 170k–1.6M 步）的结论：`no_drift` 组**最优窗口 `disp_end_m` = 0.0107 m，是四组里最好的**（`no_flow` 0.0212 / `no_visodom` 0.0165 / `no_template` 0.0136）。该奖励项（`rew_drift` 0.1）冗余：首帧 anchor 偏移已经**绝对**度量同一种漂移，而 visodom 位置项提供了它当初被发明出来要补的速度尺度梯度。
+
+- 移除：`rew_drift`、`sigma_drift`、`drift_tau_s`、`ablate_drift`、`_drift_int`、`_drift_leak`、`_drift_yaw_prev`、`_ep_drift_sum`、日志 `drift_mag`、以及每步的去旋转+积分（热路径）。
+- **光流本身全部保留**：图像通道 du/dv/mag、`rew_flow=1.0`、visodom 积分器、`flow_rms` 状态量、texture mask 一律不动。
+- 副作用：`scripts/debug_auv_v7_drift_int.py` 删除；`debug_auv_v7_ablation.py` / `expand_vs_anchor.py` / `flow_decompose.py` 里的相关引用改为 visodom。
+
+### 10.2 域随机化（`dr_enable=True`，默认开启）
+
+按物理性质分成两种采样horizon：水与位姿**每回合**重采样；硬件/图像**每环境一次**（一台相机、一组电池不会每潜重抽）。
+
+| 旋钮 | 范围 | 采样 | 说明 |
+|---|---|---|---|
+| `dr_current_speed_range` | 0.20–0.45 m/s | 每回合 | 取代原来固定的 0.3 m/s |
+| `dr_current_dir_full_circle` | True（±180°） | 每回合 | 取代固定的 [1,0.3,0] |
+| `dr_current_vert_frac` | ≤10% 速度 | 每回合 | 池内洋流近似水平 |
+| `dr_thrust_gain_range` | 0.90–1.05 | 每环境 | 作用在归一化杆量上，推力 ∝ g² ≈ ±10% |
+| `dr_drag_gain_range` | 0–3.0 N/(m/s) | 每环境 | 附加线性阻力，扰动用阻尼而非缩放浮力 |
+| `dr_cam_brightness_range` | 0.92–1.08 | 每环境 | 曝光/增益 |
+| `dr_cam_noise_std_range` | 0.004–0.010 | 每帧 | 读出噪声，在 render 分辨率注入，flow/template/mask 与策略看到同一帧 |
+| `dr_spawn_xy_range` | ±0.12 m | 每回合 | 首帧不再正对名义位置 |
+| `dr_spawn_yaw_range_deg` | ±8° | 每回合 | |
+| `dr_spawn_depth_range` | ±0.04 m | 每回合 | 深度 PI 会把它拉回 |
+
+新增日志：`dr_cur_speed`、`dr_cur_deg`（与 `disp_end_m` 同曲线看，才知道策略是否只会应付顺流）。
+
+### 10.3 部署契约修正（本文档前几节已同步）
+
+| 项 | 旧文档（错） | 实际训练（以此为准） |
+|---|---|---|
+| 策略频率 | 20 Hz（decimation=6） | **15 Hz**（decimation=8, dt=1/120） |
+| 光流分辨率 | 1280×720 原生 | **176×320**（render 640×360 下采样后计算） |
+| du/dv 归一化分母 | 1280 / 720 | **320 / 176** |
+| policy image | (7,64,64) | **(11,64,64)** |
+| state | (9,) | **(17,)，且只喂 critic** |
+
+最后一条最容易被忽略：`CustomSACPolicy` 是非对称 AC，**actor 只吃 image**。所以实机推理**不需要 DVL、不需要 GT 速度/深度**，只需要相机 + IMU yaw（anchor/visodom 的去旋转用）。
+
