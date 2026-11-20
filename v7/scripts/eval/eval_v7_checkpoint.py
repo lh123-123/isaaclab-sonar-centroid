@@ -129,6 +129,17 @@ def main(env_cfg, agent_cfg):
         ),
         flush=True,
     )
+    # The dropout window is the one setting that changes what the comparison MEANS, so it is
+    # printed unconditionally: a 5 s blind run must never be mistaken for a clean one.
+    print(
+        "[eval][BLIND] visodom dropout at=%.2fs len=%.2fs (%s)"
+        % (
+            float(getattr(c, "blind_at_s", 0.0)),
+            float(getattr(c, "blind_len_s", 5.0)),
+            "ON" if float(getattr(c, "blind_at_s", 0.0)) > 0.0 else "off",
+        ),
+        flush=True,
+    )
 
     n = int(core.num_envs)
     peak = torch.zeros(n, device=core.device)
@@ -428,6 +439,9 @@ def main(env_cfg, agent_cfg):
         )
     print("[eval] GATE RESULT: %s" % gate_result, flush=True)
 
+    _out_dir = os.path.dirname(os.path.abspath(args_cli.out))
+    if _out_dir:
+        os.makedirs(_out_dir, exist_ok=True)
     with open(args_cli.out, "w") as f:
         json.dump(
             {
@@ -436,6 +450,8 @@ def main(env_cfg, agent_cfg):
                 "eval_redraw_per_run_dr": bool(int(args_cli.redraw_per_run_dr)),
                 "action_delay_steps": delay,
                 "action_delay_ms": delay * 66.7,
+                "blind_at_s": float(getattr(c, "blind_at_s", 0.0)),
+                "blind_len_s": float(getattr(c, "blind_len_s", 5.0)),
                 "episodes": records,
                 "summary": {
                     "disp_spawn_m_mean": m, "disp_spawn_m_median": md,

@@ -645,6 +645,24 @@ class AUVTrackingV7FlowHoverGsrovEnvCfg(AUVTrackingEnvCfg):
     ablate_flow: bool = False
     ablate_template: bool = False
     ablate_visodom: bool = False
+    # Cue dropout, TRANSIENT and eval-side (contrast with the ablate_* flags above, which
+    # are permanent and used for training). Inside [blind_at_s, blind_at_s + blind_len_s) of
+    # the episode clock the visodom cue stops updating: the two position channels the actor
+    # reads, the position reward and visodom_err_m all report the value latched when the
+    # window opened, while RGB, the flow image and the template match keep running. That is
+    # the exact failure `debug_auv_v7_baseline.py --blind_at` models for P / PID / LQR — their
+    # controller holds `env._visodom_m()` for the window and the estimator underneath keeps
+    # integrating — so the two sides can be compared. Without this the ablation table put a
+    # permanent blackout against a 5 s dropout and no ratio between them meant anything.
+    # blind_at_s = 0.0 disables it, bit-for-bit the pre-2026-11-20 behaviour, so every
+    # checkpoint saved before this flag evaluates identically.
+    blind_at_s: float = 0.0
+    blind_len_s: float = 5.0
+    # Appendix variant: also stop the integrator itself, so the travel during the gap is lost
+    # for good. Off by default because it charges the policy for a recovery the classical
+    # baselines never had to make; on, it answers the harder question "what if the cue does
+    # not come back clean?".
+    blind_freeze_integrator: bool = False
 
     # Privileged anchor (reward-only, ground truth from sim): penalize the horizontal
     # displacement from the episode spawn origin, in metres. The 287k-step model gamed
@@ -819,6 +837,19 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
             f"visodom={int(bool(self.cfg.ablate_visodom))}",
             flush=True,
         )
+        if float(getattr(self.cfg, "blind_at_s", 0.0)) > 0.0:
+            print(
+                "[v7-blind] visodom cue DROPPED for %.2f s from t=%.2f s of every episode "
+                "(%s; RGB / flow / template keep running)"
+                % (
+                    float(self.cfg.blind_len_s),
+                    float(self.cfg.blind_at_s),
+                    "integrator frozen, gap travel lost"
+                    if bool(getattr(self.cfg, "blind_freeze_integrator", False))
+                    else "reported value held, integrator live (same as the baselines)",
+                ),
+                flush=True,
+            )
 
     def _thruster_body_fz_my(self, fz_cmd: float, my_cmd: float) -> tuple[float, float]:
         """Body heave (N) and pitch moment (N·m) produced by one allocation command.
@@ -950,6 +981,10 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
             (self.num_envs,), float(self.cfg.plane_distance), dtype=torch.float32, device=self.device
         )
         self._visodom_yaw_prev = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
+        # Cue-dropout latch: the estimate reported when the blind window opened, and the
+        # previous window state so the latch fires on the rising edge only.
+        self._visodom_hold = torch.zeros((self.num_envs, 2), dtype=torch.float32, device=self.device)
+        self._visodom_blind_prev = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         # Diagnostic only (not in the observation or the reward): translational
         # flow split into a uniform field (lateral) and a radial field (along the
         # optical axis). Current-aligned creep is mostly axial and cancels in the
@@ -1759,18 +1794,23 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
             self._flow_uniform[~fresh, 1] = b_px
             self._flow_expand[~fresh] = k_exp
             rows = ~fresh
-            yaw_now = self._sensed_yaw()[rows]
-            # Visual odometry: same de-rotation, NO leak. The surge leg comes from
-            # the expansion coefficient (k per frame ≈ ΔZ/Z): displacement += k·Z,
-            # then Z shrinks by 1/(1+k). Sway px→m happens in _visodom_m via
-            # f_px and the tracked Z.
+            # Visual odometry: same de-rotation, NO leak. The surge leg comes from the
+            # expansion coefficient (k per frame ≈ ΔZ/Z): displacement += k·Z, then Z shrinks
+            # by 1/(1+k). Sway px→m happens in _visodom_m via f_px and the tracked Z.
+            vo = rows
+            if bool(getattr(self.cfg, "blind_freeze_integrator", False)):
+                # Appendix variant only: the estimator stops integrating through the gap, so
+                # the travel is lost for good. NOT the default -- it would make the RL number
+                # harsher than the one the classical baseline pays (see _visodom_m).
+                vo = rows & ~self._visodom_blind()
             if bool(getattr(self.cfg, "vis_odometry", False)):
-                dyaw_o = yaw_now - self._visodom_yaw_prev[rows]
+                yaw_now = self._sensed_yaw()[vo]
+                dyaw_o = yaw_now - self._visodom_yaw_prev[vo]
                 dyaw_o = torch.atan2(torch.sin(dyaw_o), torch.cos(dyaw_o))
                 co, so = torch.cos(dyaw_o), torch.sin(dyaw_o)
-                u0 = self._visodom[rows, 0] * co - self._visodom[rows, 1] * so
-                v0 = self._visodom[rows, 0] * so + self._visodom[rows, 1] * co
-                zz = self._visodom_z[rows]
+                u0 = self._visodom[vo, 0] * co - self._visodom[vo, 1] * so
+                v0 = self._visodom[vo, 0] * so + self._visodom[vo, 1] * co
+                zz = self._visodom_z[vo]
                 # Physical guard: between two control steps the hull cannot travel farther
                 # than v_max·dt. Heading bias, wall tilt and turbidity can each push a
                 # single flow fit far past that, and an unbounded increment accumulates
@@ -1780,15 +1820,15 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
                 step_m = float(getattr(self.cfg, "visodom_max_speed_mps", 1.0)) * (
                     float(self.cfg.sim.dt) * float(self.cfg.decimation)
                 )
-                px_lim = (step_m * self._visodom_f_px[rows] / zz.clamp(min=0.1)).clamp(min=1.0)
-                a_px = a_px.clamp(-px_lim, px_lim)
-                b_px = b_px.clamp(-px_lim, px_lim)
-                k_exp = (k_exp * zz).clamp(-step_m, step_m) / zz.clamp(min=0.1)
-                self._visodom[rows, 0] = u0 + a_px
-                self._visodom[rows, 1] = v0 + b_px
-                self._visodom_x[rows] = self._visodom_x[rows] + k_exp * zz
-                self._visodom_z[rows] = zz / (1.0 + k_exp).clamp(min=0.1)
-                self._visodom_yaw_prev[rows] = yaw_now
+                px_lim = (step_m * self._visodom_f_px[vo] / zz.clamp(min=0.1)).clamp(min=1.0)
+                a_vo = a_px[vo].clamp(-px_lim, px_lim)
+                b_vo = b_px[vo].clamp(-px_lim, px_lim)
+                k_vo = (k_exp[vo] * zz).clamp(-step_m, step_m) / zz.clamp(min=0.1)
+                self._visodom[vo, 0] = u0 + a_vo
+                self._visodom[vo, 1] = v0 + b_vo
+                self._visodom_x[vo] = self._visodom_x[vo] + k_vo * zz
+                self._visodom_z[vo] = zz / (1.0 + k_vo).clamp(min=0.1)
+                self._visodom_yaw_prev[vo] = yaw_now
         # First-frame anchor: capture (first textured frame) or match (every later frame).
         self._update_anchor_state(curr_raw)
         self._prev_rgb[:] = curr_raw
@@ -2071,12 +2111,34 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
         # Kept as a stub for API compatibility with parent class.
         return torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
 
+    def _visodom_blind(self) -> torch.Tensor:
+        """True for the envs whose visodom cue is dropped right now, (N,) bool.
+
+        Keyed off each env's own episode clock, not a global step counter: envs reset at
+        different times, and a shared counter would apply the window to the wrong part of
+        some episodes (the baseline loops all envs in lockstep, so there the two coincide).
+        """
+        at = float(getattr(self.cfg, "blind_at_s", 0.0))
+        if at <= 0.0:
+            return torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        dt = float(self.cfg.sim.dt) * float(self.cfg.decimation)
+        t = self.episode_length_buf.to(torch.float32) * dt
+        return (t >= at) & (t < at + float(getattr(self.cfg, "blind_len_s", 5.0)))
+
     def _visodom_m(self) -> torch.Tensor:
         """Visual-odometry displacement estimate, current body frame, metres, (N, 2).
 
         Column 0 is along the optical axis (from the expansion coefficient), column 1
         is lateral (u_px / f_px · Z — fronto-parallel geometry with the tracked Z).
         Returns zeros when vis_odometry is off, so callers can always concatenate.
+
+        While the cue is dropped (cfg.blind_at_s/blind_len_s) this returns the value the
+        estimator reported when the window opened, and the integrator underneath keeps
+        running. That is deliberately the same thing the classical baselines do: their
+        controller holds `env._visodom_m()` for the window and the env keeps integrating, so
+        after the window both sides are back on the live estimate. Freezing the integrator
+        instead would charge the policy for travel it can never recover (`blind_freeze_
+        integrator`), which is a harsher, separate experiment.
         """
         if not bool(getattr(self.cfg, "vis_odometry", False)):
             return torch.zeros((self.num_envs, 2), dtype=torch.float32, device=self.device)
@@ -2084,7 +2146,15 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
         # The additive bias is applied at READ time, not baked into the integrator: it is
         # what the estimator reports, so the actor's 2 channels, the position reward and
         # visodom_err_m must all see the same number.
-        return torch.stack([self._visodom_x, y_m], dim=-1) + self._visodom_bias
+        raw = torch.stack([self._visodom_x, y_m], dim=-1) + self._visodom_bias
+        blind = self._visodom_blind()
+        # Latch on the rising edge only, so calling this twice in one step (obs, reward,
+        # eval hook) cannot overwrite the held value with one latched a step later.
+        latch = blind & ~self._visodom_blind_prev
+        if bool(latch.any()):
+            self._visodom_hold[latch] = raw[latch]
+        self._visodom_blind_prev[:] = blind
+        return torch.where(blind.unsqueeze(-1), self._visodom_hold, raw)
 
     def _ego_vel_state(self):
         _, agent_yaw = self._agent_pose_2d()
@@ -2531,6 +2601,8 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
         self._visodom_x[ids] = 0.0
         self._visodom_z[ids] = float(self.cfg.plane_distance) * self._visodom_range_err[ids]
         self._visodom_yaw_prev[ids] = euler_xyz_from_quat(self._robot.data.root_quat_w[ids])[2]
+        self._visodom_hold[ids] = 0.0
+        self._visodom_blind_prev[ids] = False
         self._texture_count[ids] = 0.0
         self._prev_rgb_ok[ids] = False
         self._texture_lost_streak[ids] = 0
