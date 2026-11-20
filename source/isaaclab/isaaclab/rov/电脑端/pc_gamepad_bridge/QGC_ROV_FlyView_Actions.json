@@ -1,0 +1,41 @@
+{
+  "version": 1,
+  "fileType": "MavlinkActions",
+  "actions": [
+    {
+      "label": "云台 -80度",
+      "description": "云台快速转到最下观察位",
+      "mavCmd": 205,
+      "param1": -80,
+      "param7": 2
+    },
+    {
+      "label": "云台 -45度",
+      "description": "云台快速转到下方观察位",
+      "mavCmd": 205,
+      "param1": -45,
+      "param7": 2
+    },
+    {
+      "label": "云台 -20度",
+      "description": "云台快速转到近前观察位",
+      "mavCmd": 205,
+      "param1": -20,
+      "param7": 2
+    },
+    {
+      "label": "云台回正 0度",
+      "description": "云台快速回到正前方",
+      "mavCmd": 205,
+      "param1": 0,
+      "param7": 2
+    },
+    {
+      "label": "云台 +20度",
+      "description": "云台快速转到上方观察位",
+      "mavCmd": 205,
+      "param1": 20,
+      "param7": 2
+    }
+  ]
+}

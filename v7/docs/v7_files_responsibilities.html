@@ -1,0 +1,423 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Isaac-AUV-Tracking · 文件职责地图 · File Responsibility Map</title>
+<style>
+  :root {
+    --bg:#060b14; --panel:rgba(16,28,48,0.72); --border:rgba(64,160,200,0.18);
+    --border-strong:rgba(64,190,220,0.4); --txt:#dbe7f4; --txt-dim:#8ba3bd; --txt-faint:#5c7188;
+    --cyan:#3fd0e0; --teal:#26c6a6; --blue:#4d8ff5; --violet:#9a7bff; --amber:#f5b14d;
+    --rose:#ff6b8a; --green:#56d67b; --mono:"SFMono-Regular","JetBrains Mono",Menlo,Consolas,monospace;
+    --sans:"Inter",-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html{scroll-behavior:smooth}
+  body{font-family:var(--sans);background:radial-gradient(1200px 700px at 12% -8%,rgba(38,120,180,.22),transparent 60%),radial-gradient(1000px 600px at 95% 0%,rgba(38,198,166,.14),transparent 55%),radial-gradient(900px 800px at 50% 120%,rgba(77,143,245,.12),transparent 60%),var(--bg);color:var(--txt);line-height:1.6;min-height:100vh}
+  a{color:var(--cyan);text-decoration:none}
+  code,.mono{font-family:var(--mono)}
+  header.top{position:sticky;top:0;z-index:50;backdrop-filter:blur(14px);background:linear-gradient(180deg,rgba(6,11,20,.92),rgba(6,11,20,.66));border-bottom:1px solid var(--border)}
+  .top-inner{max-width:1360px;margin:0 auto;padding:14px 28px;display:flex;align-items:center;gap:18px;flex-wrap:wrap}
+  .brand{display:flex;align-items:center;gap:12px;font-weight:700}
+  .brand .dot{width:12px;height:12px;border-radius:50%;background:radial-gradient(circle at 30% 30%,#7ff0ff,var(--cyan));box-shadow:0 0 14px var(--cyan)}
+  .brand small{color:var(--txt-dim);font-weight:500;font-size:12px}
+  nav.toc{margin-left:auto;display:flex;gap:6px;flex-wrap:wrap}
+  nav.toc a{font-size:12.5px;color:var(--txt-dim);padding:6px 11px;border-radius:8px;border:1px solid transparent;transition:all .18s;white-space:nowrap}
+  nav.toc a:hover{color:var(--txt);border-color:var(--border);background:rgba(40,120,160,.12)}
+  main{max-width:1360px;margin:0 auto;padding:40px 28px 120px}
+  .hero{margin-bottom:30px}
+  .hero .kicker{display:inline-flex;align-items:center;gap:8px;font-size:12px;letter-spacing:2px;text-transform:uppercase;color:var(--teal);font-weight:700;margin-bottom:16px;padding:6px 14px;border:1px solid var(--border-strong);border-radius:999px;background:rgba(38,198,166,.08)}
+  .hero h1{font-size:clamp(28px,4vw,46px);line-height:1.08;font-weight:800;letter-spacing:-.8px;background:linear-gradient(120deg,#eaf6ff 0%,#7fe6ff 40%,#3fd0e0 70%,#26c6a6 100%);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:10px}
+  .hero p.lead{color:var(--txt-dim);font-size:16px;max-width:900px}
+  .searchbox{margin:22px 0;display:flex;gap:10px;align-items:center}
+  .searchbox input{flex:1;background:#0a1526;border:1px solid var(--border);border-radius:10px;padding:12px 16px;color:var(--txt);font-size:14px;font-family:var(--mono);outline:none}
+  .searchbox input:focus{border-color:var(--border-strong)}
+  .searchbox .cnt{color:var(--txt-faint);font-size:12.5px;min-width:60px;text-align:right}
+
+  section{margin:48px 0;scroll-margin-top:80px}
+  .sec-head{display:flex;align-items:baseline;gap:14px;margin-bottom:16px}
+  .sec-head .num{font-family:var(--mono);font-size:13px;color:var(--cyan);font-weight:700;padding:3px 9px;border:1px solid var(--border-strong);border-radius:7px;background:rgba(63,208,224,.08)}
+  .sec-head h2{font-size:22px;font-weight:800;letter-spacing:-.3px}
+  .sec-head .desc{color:var(--txt-faint);font-size:13px;margin-left:6px}
+
+  .card{background:var(--panel);border:1px solid var(--border);border-radius:16px;padding:18px 20px;margin-bottom:16px;box-shadow:0 10px 40px -24px rgba(0,0,0,.9)}
+  .card h3{font-size:14px;font-weight:700;color:#eaf6ff;margin-bottom:12px;display:flex;align-items:center;gap:9px}
+  .card h3 .ic{width:24px;height:24px;border-radius:7px;display:grid;place-items:center;background:rgba(63,208,224,.12);border:1px solid var(--border);font-size:13px}
+
+  /* file table */
+  table.ft{width:100%;border-collapse:collapse;font-size:13px}
+  table.ft th,table.ft td{text-align:left;padding:8px 10px;border-bottom:1px solid rgba(64,160,200,.08);vertical-align:top}
+  table.ft th{color:var(--txt-faint);font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.8px}
+  table.ft td.f{font-family:var(--mono);font-size:12.5px;color:var(--cyan);white-space:nowrap;min-width:260px}
+  table.ft td.t{color:var(--txt-dim);font-size:13px;line-height:1.5}
+  table.ft tr:last-child td{border-bottom:none}
+  table.ft tr:hover td{background:rgba(63,208,224,.03)}
+
+  .tag{display:inline-block;font-family:var(--mono);font-size:10.5px;padding:1px 7px;border-radius:6px;border:1px solid var(--border);color:var(--cyan);background:rgba(63,208,224,.08);margin-right:6px}
+  .tag.g{color:var(--green);background:rgba(86,214,123,.08);border-color:rgba(86,214,123,.3)}
+  .tag.a{color:var(--amber);background:rgba(245,177,77,.08);border-color:rgba(245,177,77,.3)}
+  .tag.r{color:var(--rose);background:rgba(255,107,138,.08);border-color:rgba(255,107,138,.3)}
+  .tag.v{color:var(--violet);background:rgba(154,123,255,.08);border-color:rgba(154,123,255,.3)}
+  .tag.b{color:var(--blue);background:rgba(77,143,245,.08);border-color:rgba(77,143,245,.3)}
+
+  .canvas-wrap{position:relative;border-radius:14px;overflow:hidden;background:#060d18;border:1px solid var(--border)}
+  canvas{display:block;width:100%;height:auto}
+  .legend{display:flex;flex-wrap:wrap;gap:14px;margin-top:12px;font-size:12px;color:var(--txt-dim)}
+  .legend span{display:inline-flex;align-items:center;gap:6px}
+  .legend i{width:12px;height:12px;border-radius:3px;display:inline-block}
+
+  footer{text-align:center;color:var(--txt-faint);font-size:12.5px;padding:40px 0 0;border-top:1px solid var(--border);margin-top:60px}
+  .hidden{display:none !important}
+</style>
+</head>
+<body>
+
+<header class="top">
+  <div class="top-inner">
+    <div class="brand"><span class="dot"></span> AUV Tracking <small>· 文件职责地图 · File Map</small></div>
+    <nav class="toc">
+      <a href="#direct">Direct 环境</a>
+      <a href="#manager">Manager-based</a>
+      <a href="#agents">Agents/网络</a>
+      <a href="#dyn">动力学/控制</a>
+      <a href="#perception">感知/观测</a>
+      <a href="#assets">资产/USD</a>
+      <a href="#config">配置/训练</a>
+      <a href="#scripts">脚本</a>
+      <a href="#legacy">历史变体</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+  <div class="hero">
+    <span class="kicker">● 项目文件职责 · v7 GS-ROV 为主</span>
+    <h1>文件职责地图<br>File Responsibility Map</h1>
+    <p class="lead">
+      按目录分组列出本项目（AUV 水下跟踪 / 悬停）相关文件及其任务。<b>以 v7 光流悬停 GS-ROV 变体为主</b>，
+      同时覆盖 Direct & Manager-based 两套实现、动力学/控制、感知、资产 USD、RL 配置与训练、脚本与测试。
+    </p>
+  </div>
+
+  <div class="searchbox">
+    <input id="q" type="text" placeholder="过滤：输入文件名或关键词（如 gsrov / reward / flow / pid）…" oninput="filterRows()" />
+    <span class="cnt" id="cnt"></span>
+  </div>
+
+  <!-- flow diagram -->
+  <div class="card" style="margin-bottom:24px">
+    <h3><span class="ic">⇄</span>文件协作总览</h3>
+    <div class="canvas-wrap"><canvas id="flowCanvas" width="1320" height="300" data-w="1320" data-h="300"></canvas></div>
+    <div class="legend">
+      <span><i style="background:#4d8ff5"></i>环境定义</span>
+      <span><i style="background:#9a7bff"></i>MDP 项</span>
+      <span><i style="background:#3fd0e0"></i>Agents/网络</span>
+      <span><i style="background:#f5b14d"></i>动力学/控制</span>
+      <span><i style="background:#26c6a6"></i>资产/USD</span>
+      <span><i style="background:#56d67b"></i>训练/脚本</span>
+    </div>
+  </div>
+
+  <!-- 1 DIRECT -->
+  <section id="direct">
+    <div class="sec-head"><span class="num">01</span><h2>Direct 环境 · DirectRLEnv 实现</h2><span class="desc">source/.../direct/isaac_auv_tracking/</span></div>
+
+    <div class="card">
+      <h3><span class="ic">D</span>核心环境文件</h3>
+      <table class="ft" id="t1">
+        <tr><th>文件</th><th>负责的任务</th></tr>
+        <tr><td class="f">auv_tracking_v7_flow_hover_gsrov_env.py</td><td class="t"><span class="tag r">v7 主实现</span>DirectRLEnv 子类：全局光流零化悬停；搭建场景（立方体代理刚体、相机、纹理平面、池壁、参考球）、光流/纹理缓冲、观测、奖励、终止、重置、动作→PID；Farneback/RAFT 流估计。</td></tr>
+        <tr><td class="f">auv_tracking_env.py</td><td class="t"><span class="tag b">基类</span>AUVTrackingEnv / AUVTrackingEnvCfg：目标追踪基环境（ sonar/KF/目标运动/洋流/奖励/终止），v7 继承其动力学与 PID 装配。</td></tr>
+        <tr><td class="f">__init__.py</td><td class="t">Gym 任务注册表：注册 `Isaac-AUV-Tracking-Direct-v7-flow-hover` 与 `...-gsrov`，绑定 cfg 与 SB3 yaml。</td></tr>
+      </table>
+    </div>
+
+    <div class="card">
+      <h3><span class="ic">H</span>动力学 / 控制 / 流体</h3>
+      <table class="ft" id="t2">
+        <tr><th>文件</th><th>负责的任务</th></tr>
+        <tr><td class="f">batch_pid.py</td><td class="t">BatchPIDController：[surge,sway,yaw]+深度/姿态→8 PWM；warpauv6 与 gsrov8 两套分配；kp/ki/kd、伪逆矩阵。</td></tr>
+        <tr><td class="f">thruster_dynamics.py</td><td class="t">GSROV_THRUSTERS 几何、8 推进器位置/朝向、GSROV_ACTION_TO_MAIN 通道映射、DynamicsFirstOrder 一阶滞后、ConversionFunction 推力曲线。</td></tr>
+        <tr><td class="f">rigid_body_hydrodynamics.py</td><td class="t">浮力/拖曳力矩计算（water_rho/water_beta），供 _compute_dynamics 调用。</td></tr>
+        <tr><td class="f">ocean_current.py</td><td class="t">create_ocean_current_field：uniform/vortex/sine_wave/random 四种流场，时间调制、裁剪。</td></tr>
+        <tr><td class="f">batch_lqr.py</td><td class="t">HoloOcean 风格目标运动（RRT+LQR），用于 v0/v1/v4 等追踪任务。</td></tr>
+      </table>
+    </div>
+
+    <div class="card">
+      <h3><span class="ic">P</span>感知 / 测量 / KF / 流</h3>
+      <table class="ft" id="t3">
+        <tr><th>文件</th><th>负责的任务</th></tr>
+        <tr><td class="f">cam_meas.py</td><td class="t">相机 (r,α) 测量：由 GT 目标位置生成 bearing/range，含噪声与 KF 先验门。</td></tr>
+        <tr><td class="f">sonar_meas.py</td><td class="t">声纳 (r,α) 测量：极坐标峰值检测、belief 门控、冷启动。</td></tr>
+        <tr><td class="f">kalman_filter_batch.py</td><td class="t">批量 KF/EKF 目标状态估计（GPU）。</td></tr>
+        <tr><td class="f">flow_obs.py</td><td class="t">Direct-v2 堆叠极坐标残差 + 质心位移。</td></tr>
+        <tr><td class="f">sparse_flow.py</td><td class="t">稀疏金字塔 Lucas-Kanade（v4 光流 3 维向量）。</td></tr>
+        <tr><td class="f">teach_match.py</td><td class="t">基于颜色模板的 teach 图像匹配（NCC）。</td></tr>
+      </table>
+    </div>
+  </section>
+
+  <!-- 2 MANAGER -->
+  <section id="manager">
+    <div class="sec-head"><span class="num">02</span><h2>Manager-based 实现 · manager_based/isaac_auv_tracking/v7_flow_hover/</h2><span class="desc">行为等价移植</span></div>
+    <div class="card">
+      <table class="ft" id="t4">
+        <tr><th>文件</th><th>负责的任务</th></tr>
+        <tr><td class="f">v7_flow_hover_env_cfg.py</td><td class="t">ManagerBasedRLEnvCfg：场景/观测/动作/奖励/终止/事件的声明式配置；GS-ROV 物理常数；奖励权重按 dt 修正。</td></tr>
+        <tr><td class="f">v7_flow_hover_env.py</td><td class="t">环境类：命令式生成相机/纹理平面/池壁/参考球等 USD 资产；维护光流/纹理缓冲；读取 TiledCamera 帧。</td></tr>
+        <tr><td class="f">dynamics.py</td><td class="t">GSROVPlant：PID + 推进器 + 浮力/拖曳的共享物理内核（被 VelocityPIDAction 调用）。</td></tr>
+        <tr><td class="f">mdp/actions.py</td><td class="t">VelocityPIDAction：3-D 杆量→cmd_vel→PID→推进器 wrench，含 rate limit。</td></tr>
+        <tr><td class="f">mdp/observations.py</td><td class="t">image（RGB+du+dv+mag+mask）、ego_state（9 维）观测项。</td></tr>
+        <tr><td class="f">mdp/rewards.py</td><td class="t">flow_nulling / alive / depth_hold / attitude_hold / action_smoothness。</td></tr>
+        <tr><td class="f">mdp/terminations.py</td><td class="t">texture_lost / depth_exceeded / attitude_exceeded / out_of_bounds / reset_auv_buffers。</td></tr>
+        <tr><td class="f">mdp/__init__.py</td><td class="t">导出 actions/observations/rewards/terminations 子模块。</td></tr>
+        <tr><td class="f">__init__.py</td><td class="t">Manager-based 任务注册。</td></tr>
+      </table>
+    </div>
+  </section>
+
+  <!-- 3 AGENTS -->
+  <section id="agents">
+    <div class="sec-head"><span class="num">03</span><h2>Agents / 网络 · direct/.../agents/</h2><span class="desc">SAC 策略、编码器、流估计</span></div>
+    <div class="card">
+      <table class="ft" id="t5">
+        <tr><th>文件</th><th>负责的任务</th></tr>
+        <tr><td class="f">custom_sac_policy.py</td><td class="t"><span class="tag r">v7 所用</span>CustomSACPolicy（Actor=图像 encoder，Critic=状态 MLP）；含 Hybrid/ImageState/Gated 等变体。</td></tr>
+        <tr><td class="f">cam_encoder.py</td><td class="t">MidCNNExtractor：7→32→64→64→128→128 卷积 + GAP⊕SpatialSoftmax→256； bearing 可读。</td></tr>
+        <tr><td class="f">raft_flow.py</td><td class="t">RAFT-Small GPU 光流（可选方法）。</td></tr>
+        <tr><td class="f">gate_log_callback.py</td><td class="t">EpisodeRewardLogCallback / CriticGateLogCallback：TB 日志刷新。</td></tr>
+        <tr><td class="f">sb3_sac_v7_flow_hover_cfg.yaml</td><td class="t"><span class="tag r">v7 配置</span>SAC 全部超参数（lr/buffer/batch/tau/gamma/网络结构/flow_method 等）。</td></tr>
+        <tr><td class="f">flow_sac_policy.py</td><td class="t">Direct-v2：Actor/Critic 共享 flow image⊕几何状态。</td></tr>
+        <tr><td class="f">flow_vec_encoder.py</td><td class="t">Direct-v6：预结构化 6 维 flow 向量编码器（无卷积）。</td></tr>
+        <tr><td class="f">sonar_encoder.py</td><td class="t">Sonar 极坐标图像 encoder（ResNet50）供 v1 非对称 SAC。</td></tr>
+        <tr><td class="f">play_metrics.py</td><td class="t">回合级 play 指标（numpy）。</td></tr>
+        <tr><td class="f">rsl_rl_ppo_cfg.py</td><td class="t">RSL-RL PPO 配置。</td></tr>
+        <tr><td class="f">drqv2/*</td><td class="t">DrQ-v2 代理（agent/frame_stack/replay_buffer/utils）供 v1 声纳任务。</td></tr>
+      </table>
+    </div>
+  </section>
+
+  <!-- 4 DYNAMICS -->
+  <section id="dyn">
+    <div class="sec-head"><span class="num">04</span><h2>动力学 / 控制 / 流体（汇总）</h2><span class="desc">batch_pid · thruster_dynamics · hydrodynamics · ocean_current</span></div>
+    <div class="card">
+      <table class="ft" id="t6">
+        <tr><th>文件</th><th>负责的任务</th></tr>
+        <tr><td class="f">batch_pid.py</td><td class="t">BatchPIDController：surge/sway/yaw + 深度/姿态 PID，warpauv6 与 gsrov8 分配，伪逆矩阵。</td></tr>
+        <tr><td class="f">thruster_dynamics.py</td><td class="t">8 推进器几何/通道映射、一阶滞后、推力曲线 T∝u·|u|。</td></tr>
+        <tr><td class="f">rigid_body_hydrodynamics.py</td><td class="t">浮力与粘性拖曳力/矩。</td></tr>
+        <tr><td class="f">ocean_current.py</td><td class="t">流场构建器（uniform/vortex/sine/random + 时间调制）。</td></tr>
+        <tr><td class="f">batch_lqr.py</td><td class="t">目标运动（RRT+LQR）。</td></tr>
+        <tr><td class="f">residual_rl/thruster_allocation.py</td><td class="t">推力分配矩阵与伪逆。</td></tr>
+      </table>
+    </div>
+  </section>
+
+  <!-- 5 PERCEPTION -->
+  <section id="perception">
+    <div class="sec-head"><span class="num">05</span><h2>感知 / 测量 / KF / 光流</h2><span class="desc">cam_meas · sonar_meas · kalman · flow_obs · sparse_flow · teach_match</span></div>
+    <div class="card">
+      <table class="ft" id="t7">
+        <tr><th>文件</th><th>负责的任务</th></tr>
+        <tr><td class="f">cam_meas.py</td><td class="t">相机 (r,α) 测量生成。</td></tr>
+        <tr><td class="f">sonar_meas.py</td><td class="t">声纳极坐标峰值检测与 belief 门控。</td></tr>
+        <tr><td class="f">kalman_filter_batch.py</td><td class="t">批量 KF/EKF。</td></tr>
+        <tr><td class="f">flow_obs.py</td><td class="t">Direct-v2 极坐标残差/质心位移。</td></tr>
+        <tr><td class="f">sparse_flow.py</td><td class="t">稀疏 LK 光流。</td></tr>
+        <tr><td class="f">teach_match.py</td><td class="t">模板颜色匹配 NCC。</td></tr>
+      </table>
+    </div>
+  </section>
+
+  <!-- 6 ASSETS -->
+  <section id="assets">
+    <div class="sec-head"><span class="num">06</span><h2>资产 / USD · assets/ 与 rov/tools/</h2><span class="desc">GS-ROV 几何、CAD→USD、准备训练 USD</span></div>
+    <div class="card">
+      <table class="ft" id="t8">
+        <tr><th>文件</th><th>负责的任务</th></tr>
+        <tr><td class="f">assets/gsrov.py</td><td class="t">GS-ROV asset：USD 路径、mass=13.15、gsrov_robot_cfg() 工厂。</td></tr>
+        <tr><td class="f">assets/warpauv.py / warpauv_cam.py</td><td class="t">WarpAUV 代理资产（含相机版）。</td></tr>
+        <tr><td class="f">rov/tools/prepare_gsrov_usd.py</td><td class="t">准备训练用 GS-ROV USD（中心化、mass/inertia/COM 烘焙）。</td></tr>
+        <tr><td class="f">rov/tools/build_rov_data.py</td><td class="t">从 USD 构建训练用 ROV data JSON。</td></tr>
+        <tr><td class="f">rov/tools/cad_to_usd.py</td><td class="t">CAD STEP/STP → USD（Hoops 转换）。</td></tr>
+        <tr><td class="f">rov/tools/extract_rov_json.py</td><td class="t">几何 + 8 推进器变换 → JSON。</td></tr>
+        <tr><td class="f">rov/tools/analyze_*.py / thruster_*.py (≈20)</td><td class="t">推进器几何分析工具链（PCA/Kabsch/法向/平面检测等）。</td></tr>
+        <tr><td class="f">rov/tools/render_views.py</td><td class="t">多视角 USD 渲染。</td></tr>
+      </table>
+    </div>
+  </section>
+
+  <!-- 7 CONFIG/TRAIN -->
+  <section id="config">
+    <div class="sec-head"><span class="num">07</span><h2>配置 / 训练 / 推理</h2><span class="desc">registry · SB3 yaml · train.py · play.py · sb3.py</span></div>
+    <div class="card">
+      <table class="ft" id="t9">
+        <tr><th>文件</th><th>负责的任务</th></tr>
+        <tr><td class="f">direct/.../__init__.py</td><td class="t">Gym 注册表（v7/v7-gsrov 等）。</td></tr>
+        <tr><td class="f">agents/sb3_sac_v7_flow_hover_cfg.yaml</td><td class="t">SAC 超参数。</td></tr>
+        <tr><td class="f">scripts/reinforcement_learning/sb3/train.py</td><td class="t">SB3 训练入口（--task/--agent/--num_envs）。</td></tr>
+        <tr><td class="f">scripts/reinforcement_learning/sb3/play.py</td><td class="t">加载 checkpoint 推理/可视化。</td></tr>
+        <tr><td class="f">source/isaaclab_rl/isaaclab_rl/sb3.py</td><td class="t">Isaac→SB3 向量化环境包装。</td></tr>
+        <tr><td class="f">v7/scripts/train/train_auv_tracking_sb3_sac_v7_flow_hover_gsrov.sh</td><td class="t">远端训练启动脚本（conda + 单进程守护）。</td></tr>
+      </table>
+    </div>
+  </section>
+
+  <!-- 8 SCRIPTS -->
+  <section id="scripts">
+    <div class="sec-head"><span class="num">08</span><h2>脚本 · scripts/（v7 相关）</h2><span class="desc">bench / calibrate / debug / probe</span></div>
+    <div class="card">
+      <table class="ft" id="t10">
+        <tr><th>文件</th><th>负责的任务</th></tr>
+        <tr><td class="f">bench_auv_v7_flow_hover_gsrov.py</td><td class="t">吞吐基准（envs/steps/FPS）。</td></tr>
+        <tr><td class="f">calibrate_v7_sigma_flow.py</td><td class="t">标定 σ_flow（采集 flow_rms）。</td></tr>
+        <tr><td class="f">debug_auv_v7_flow_hover_gsrov.py</td><td class="t">单环境调试（纹理平面+光流）。</td></tr>
+        <tr><td class="f">debug_auv_v7_flow_hover_gsrov_ui.py</td><td class="t">UI 视口查看器（AUV+4 橙球）。</td></tr>
+        <tr><td class="f">debug_auv_v7_flow_hover.py / _ui.py</td><td class="t">旧版（WarpAUV）调试。</td></tr>
+        <tr><td class="f">debug_v7_flow_hover_proxy_ui.py</td><td class="t">立方体代理 UI 查看器。</td></tr>
+        <tr><td class="f">debug_v7_step0.py</td><td class="t">step 0 原始图像/纹理/状态打印。</td></tr>
+        <tr><td class="f">probe_auv_v7_gsrov_thrusters.py</td><td class="t">推进器路径探测（PID→wrench→8 PWM）。</td></tr>
+        <tr><td class="f">_v7_runcheck.py</td><td class="t">最小运行检查。</td></tr>
+        <tr><td class="f">check_texture.py</td><td class="t">纹理/平面检查工具。</td></tr>
+      </table>
+    </div>
+    <p class="desc" style="color:var(--txt-faint);font-size:13px;margin-left:4px">
+      其余 scripts/debug_auv_v4…v6、debug_centroid_*、eval_*、train_auv_* 均为历史变体/其它任务的调试与训练脚本。
+    </p>
+  </section>
+
+  <!-- 9 LEGACY -->
+  <section id="legacy">
+    <div class="sec-head"><span class="num">09</span><h2>历史环境变体 · Direct 版本演进</h2><span class="desc">v0→v7</span></div>
+    <div class="card">
+      <table class="ft" id="t11">
+        <tr><th>文件</th><th>负责的任务</th></tr>
+        <tr><td class="f">auv_tracking_cam_env.py</td><td class="t">Direct-v3-cam：前视相机+帧堆叠。</td></tr>
+        <tr><td class="f">auv_tracking_v4_cam_env.py</td><td class="t">Direct-v4-cam：v0+相机+目标。</td></tr>
+        <tr><td class="f">auv_tracking_v5_flow_env.py</td><td class="t">Direct-v5-flow：RGB 堆叠→GT 光流。</td></tr>
+        <tr><td class="f">auv_tracking_v6_flowvec_env.py</td><td class="t">Direct-v6-flowvec：光流光栅→6 维向量。</td></tr>
+        <tr><td class="f">auv_tracking_vision_env.py</td><td class="t">Holo v1 风格：声纳图像 Actor + belief Critic。</td></tr>
+        <tr><td class="f">auv_tracking_flow_env.py</td><td class="t">Direct-v2：堆叠极坐标残差。</td></tr>
+        <tr><td class="f">auv_tracking_env.py</td><td class="t">Direct-v0 基础追踪环境。</td></tr>
+      </table>
+    </div>
+  </section>
+
+  <!-- 10 TESTS -->
+  <section id="tests">
+    <div class="sec-head"><span class="num">10</span><h2>测试 · test/</h2><span class="desc">tests/test_auv_tracking_flow_*.py</span></div>
+    <div class="card">
+      <table class="ft" id="t12">
+        <tr><th>文件</th><th>负责的任务</th></tr>
+        <tr><td class="f">test/test_auv_tracking_flow_policy.py</td><td class="t">Flow 策略单测。</td></tr>
+        <tr><td class="f">test/test_auv_tracking_flow_obs.py</td><td class="t">Flow 观测单测。</td></tr>
+        <tr><td class="f">test/test_ocean_current.py</td><td class="t">洋流字段单测。</td></tr>
+        <tr><td class="f">test/test_multi_agent_environments.py / test_environments.py</td><td class="t">环境冒烟/注册。</td></tr>
+        <tr><td class="f">test/test_environment_determinism.py</td><td class="t">确定性检查。</td></tr>
+      </table>
+    </div>
+  </section>
+
+  <footer>
+    文件职责地图 · 以 v7 光流悬停 GS-ROV 为主 · 数据源：源码 docstring + 工程命名约定<br>
+    Direct: auv_tracking_v7_flow_hover_gsrov_env.py · Manager: v7_flow_hover/* · 配置：sb3_sac_v7_flow_hover_cfg.yaml
+  </footer>
+</main>
+
+<script>
+(function(){
+  function fitCanvas(cv){
+    const dpr=window.devicePixelRatio||1;
+    const w=parseInt(cv.dataset.w||cv.getAttribute('width'),10);
+    const h=parseInt(cv.dataset.h||cv.getAttribute('height'),10);
+    cv.style.width='100%'; cv.style.height='auto'; cv.style.aspectRatio=w+' / '+h;
+    cv.width=w*dpr; cv.height=h*dpr;
+    const ctx=cv.getContext('2d'); ctx.setTransform(dpr,0,0,dpr,0,0);
+  }
+  function roundRect(ctx,x,y,w,h,r){ctx.beginPath();ctx.moveTo(x+r,y);ctx.arcTo(x+w,y,x+w,y+h,r);ctx.arcTo(x+w,y+h,x,y+h,r);ctx.arcTo(x,y+h,x,y,r);ctx.arcTo(x,y,x+w,y,r);ctx.closePath()}
+  function box(ctx,x,y,w,h,color,label,sub){
+    ctx.save(); roundRect(ctx,x,y,w,h,9);
+    ctx.fillStyle=color+'1f'; ctx.fill();
+    ctx.strokeStyle=color; ctx.lineWidth=1.5; ctx.stroke();
+    ctx.fillStyle='#dbe7f4'; ctx.font='600 12px sans-serif'; ctx.textAlign='center'; ctx.textBaseline='middle';
+    ctx.fillText(label,x+w/2,y+h/2-(sub?7:0));
+    if(sub){ctx.fillStyle='#8ba3bd';ctx.font='10px monospace';ctx.fillText(sub,x+w/2,y+h/2+9)}
+    ctx.restore();
+  }
+  function arrow(ctx,x1,y1,x2,y2,color,dash){
+    ctx.save(); if(dash) ctx.setLineDash(dash);
+    ctx.strokeStyle=color; ctx.fillStyle=color; ctx.lineWidth=1.5;
+    ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2); ctx.stroke();
+    const a=Math.atan2(y2-y1,x2-x1),s=6;
+    ctx.beginPath(); ctx.moveTo(x2,y2);
+    ctx.lineTo(x2-s*Math.cos(a-.35),y2-s*Math.sin(a-.35));
+    ctx.lineTo(x2-s*Math.cos(a+.35),y2-s*Math.sin(a+.35));
+    ctx.closePath(); ctx.fill(); ctx.restore();
+  }
+  function drawFlow(){
+    const cv=document.getElementById('flowCanvas'); if(!cv) return;
+    fitCanvas(cv); const ctx=cv.getContext('2d'); ctx.clearRect(0,0,1320,300);
+    // background
+    ctx.strokeStyle='rgba(64,160,200,.06)'; ctx.lineWidth=1;
+    for(let x=0;x<1320;x+=40){ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,300);ctx.stroke()}
+    for(let y=0;y<300;y+=40){ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(1320,y);ctx.stroke()}
+
+    const C={env:'#4d8ff5',mdp:'#9a7bff',agent:'#3fd0e0',dyn:'#f5b14d',asset:'#26c6a6',train:'#56d67b'};
+    // Row 1: env -> mdp -> agent
+    box(ctx,40,40,150,56,C.env,'Direct Env','v7-gsrov');
+    box(ctx,230,40,150,56,C.env,'Manager Env','v7_flow_hover');
+    box(ctx,420,40,150,56,C.mdp,'MDP Terms','obs/rew/term');
+    box(ctx,610,40,150,56,C.agent,'CustomSACPolicy','Actor/Critic');
+    box(ctx,800,40,150,56,C.agent,'MidCNNExtractor','7→256');
+    box(ctx,990,40,150,56,C.agent,'SB3 SAC','train');
+    // Row 2: dynamics
+    box(ctx,40,170,180,56,C.dyn,'BatchPIDController','8 PWM');
+    box(ctx,260,170,180,56,C.dyn,'thruster_dynamics','geometry');
+    box(ctx,480,170,180,56,C.dyn,'hydrodynamics','buoyancy/drag');
+    box(ctx,700,170,180,56,C.dyn,'ocean_current','flow field');
+    box(ctx,920,170,180,56,C.asset,'GS-ROV USD','prepare_gsrov');
+    box(ctx,1140,170,140,56,C.train,'scripts','bench/debug');
+
+    // arrows row1
+    arrow(ctx,190,68,230,68,C.env);
+    arrow(ctx,380,68,420,68,C.mdp);
+    arrow(ctx,570,68,610,68,C.mdp);
+    arrow(ctx,760,68,800,68,C.agent);
+    arrow(ctx,950,68,990,68,C.agent);
+    // env -> dynamics
+    arrow(ctx,115,96,130,170,C.dyn,[4,4]);
+    arrow(ctx,305,96,350,170,C.dyn,[4,4]);
+    // dynamics chain
+    arrow(ctx,220,198,260,198,C.dyn);
+    arrow(ctx,440,198,480,198,C.dyn);
+    arrow(ctx,660,198,700,198,C.dyn);
+    arrow(ctx,880,198,920,198,C.asset);
+    arrow(ctx,1100,198,1140,198,C.train);
+
+    ctx.fillStyle='#5c7188'; ctx.font='11px sans-serif'; ctx.textAlign='left';
+    ctx.fillText('数据流：env 组装场景 → MDP 项 → Actor/Critic → 训练；物理由 PID/推进器/浮力链路驱动。',40,270);
+  }
+
+  function filterRows(){
+    const q=document.getElementById('q').value.toLowerCase().trim();
+    let visible=0,total=0;
+    document.querySelectorAll('table.ft tr').forEach(tr=>{
+      if(tr.querySelector('th')) return;
+      total++;
+      const txt=tr.textContent.toLowerCase();
+      const hide = q && !txt.includes(q);
+      tr.classList.toggle('hidden', hide);
+      if(!hide) visible++;
+    });
+    document.getElementById('cnt').textContent = q? `${visible}/${total}` : `${total} rows`;
+  }
+  window.filterRows=filterRows;
+
+  window.addEventListener('load',()=>{drawFlow();filterRows()});
+  window.addEventListener('resize',()=>{const c=document.getElementById('flowCanvas'); if(c){c._l=null; drawFlow()}});
+})();
+</script>
+</body>
+</html>

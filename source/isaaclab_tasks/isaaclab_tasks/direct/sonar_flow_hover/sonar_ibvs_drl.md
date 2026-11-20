@@ -180,8 +180,8 @@ FAST 提取特征           →     station_ref.npz         →     SAC 输出 s
 | `scripts/eval_lateral1d_checkpoints.py` | Lateral1D checkpoint 评估 |
 | `scripts/run_lateral1d_p_control.py` | **P 控制基线**（hybrid/ibvs 对比，不训练） |
 | `scripts/debug_ibvs_modules.py` | **离线**逐层测试（无需 Isaac Sim） |
-| `scripts/debug_sonar_flow_hover.py` | GUI 声呐 + 特征 debug |
-| `scripts/eval_sonar_flow_hover.py` | 策略评估 / 冒烟测试 |
+| `v7/scripts/debug/debug_sonar_flow_hover.py` | GUI 声呐 + 特征 debug |
+| `v7/scripts/eval/eval_sonar_flow_hover.py` | 策略评估 / 冒烟测试 |
 | `skrl/train.py --task Isaac-SonarIbvsDrl-Stage1-Direct-v0` | 全 4D SAC 课程训练 |
 
 ---

@@ -25,7 +25,7 @@ from isaaclab.envs import DirectRLEnv
 from isaaclab.sensors import TiledCamera, TiledCameraCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.configclass import field
-from isaaclab.utils.math import euler_xyz_from_quat, quat_apply, quat_from_euler_xyz
+from isaaclab.utils.math import euler_xyz_from_quat, quat_apply, quat_apply_inverse, quat_from_euler_xyz
 from isaaclab.sim import SimulationCfg
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 
@@ -349,9 +349,60 @@ class AUVTrackingV7FlowHoverGsrovEnvCfg(AUVTrackingEnvCfg):
     # distribution. `dr_enable=False` reproduces the 2026-11-15 boxed configuration
     # exactly (the last three ablations were trained that way).
     dr_enable: bool = True
+    # EVALUATION ONLY. Redraw the per-run ("hardware") knobs on every episode reset so each
+    # episode is an independent sample of the unit distribution. Without it, N episodes on
+    # 4 envs are 4 hardware draws x N/4 episodes: the effective sample size is 4 and every
+    # confidence interval computed from them is optimistic. Must stay False for training —
+    # a real unit keeps its camera gain and compass offset for the whole run.
+    eval_redraw_per_run_dr: bool = False
+    # Actuator-side latency, in control steps (1 step = 66.7 ms @ 15 Hz). Sampled per episode
+    # as a uniform integer in [0, max]; 0 disables it. The real vehicle's sensor->compute->
+    # link->ESC path measured 21.8 Hz command pacing plus a 50 Hz PWM frame and an
+    # unmeasured thruster spin-up, so its dead time is 1-3 control periods, while the policy
+    # below was trained with none. A zero-delay eval sweep on 2026-11-16 (model_960000) gave
+    # 30.7 / 32.7 / 58.9 / 80.4 mm at 0 / 67 / 133 / 200 ms, i.e. the cliff starts between
+    # one and two steps. Evaluation must leave this at 0 and use eval_v7_checkpoint.py's own
+    # --action_delay, otherwise the two delays stack and the number is uninterpretable.
+    train_action_delay_max_steps: int = 0
+    # A single constant dead time for every episode; takes priority when >= 0. The [0, 3]
+    # randomized arm was abandoned at 374k steps (2026-11-16): it plateaued at 130-165 mm
+    # against 22-25 mm with no delay, then collapsed from 250k with critic_loss climbing
+    # 0.48 -> 5.5. A hidden per-episode delay makes the MDP partially observable, so the
+    # policy has to hedge between mutually incompatible compensations. The real vehicle's
+    # dead time is a fixed property of the hardware rather than a per-dive draw, so a
+    # constant is the faithful model, and training at the worst plausible value leaves any
+    # shorter deployment delay inside the trained operating point.
+    train_action_delay_fixed_steps: int = -1
+    # ---- payload DR (tier 1: wrench emulation, no USD rework) --------------------------
+    # A tool/sensor pod adds weight and moves the CG. Emulated as a world-frame weight
+    # applied at a body-frame offset: F_body = R^T (-m_p g z), tau = r x F_body. Buoyancy
+    # is deliberately left alone, so the vehicle gets heavier and the depth loop has to pay
+    # for it — which is what actually happens when you bolt hardware onto a real ROV.
+    # Draws are per episode (the payload changes between dives, not between control ticks),
+    # matching the existing physical-DR convention (thrust gain, drag, ...).
+    # Enable with e.g. (0.0, 0.30) / (±0.08) / (-0.15, 0.20). All-zero = disabled, bit-
+    # identical to the current behaviour.
+    dr_payload_mass_frac_range: tuple = (0.0, 0.0)   # fraction of cfg.mass
+    dr_payload_offset_xy_range: tuple = (0.0, 0.0)   # m, body frame
+    dr_payload_offset_z_range: tuple = (0.0, 0.0)    # m, body frame
+    # ---- vision latency ---------------------------------------------------------------
+    # Camera -> policy latency, FIXED for the run rather than drawn per episode. Per-episode
+    # randomisation of a hidden sensor/actuator delay already failed here: the [0, 3] action
+    # delay arm plateaued at 130-165 mm against 22-25 mm and then collapsed (see the note
+    # above), because a hidden per-dive lag forces the policy to hedge between incompatible
+    # compensations. Constants are also what the hardware gives: the camera pipeline does not
+    # change between dives. Realistic budget: exposure/readout 10-30 ms + link 10-50 ms +
+    # flow/odom 5-15 ms + inference 5-10 ms => 50-200 ms. 0.0 = disabled.
+    vision_delay_ms: float = 0.0
     # Uniform current in the horizontal plane. The fixed 0.3 m/s along [1, 0.3, 0] field
     # was exactly one sample of this distribution.
     dr_current_speed_range: tuple = (0.20, 0.45)   # m/s, per episode
+    # Ceiling kept at 0.45 on purpose. Measured 2026-11-20 with
+    # debug_auv_v7_thrust_budget.py --sweep: the four horizontals reach only 38% of their
+    # range at 0.45 m/s (right at the DR ceiling), 50% at 0.60, 84% at 1.00 — saturation is
+    # around ~1.0 m/s, i.e. 2.4x authority in reserve at the ceiling. So the gate's
+    # high-current failures are a control-precision problem, NOT an authority limit. Do not
+    # narrow this range to make the gate pass: that lowers the task with no physical basis.
     dr_current_dir_full_circle: bool = True         # ±180° heading; False → fixed dir ± range
     dr_current_dir_range_deg: float = 20.0          # only when dr_current_dir_full_circle=False
     dr_current_vert_frac: float = 0.10              # |v_z| ≤ frac · speed (currents are ~horizontal)
@@ -373,16 +424,101 @@ class AUVTrackingV7FlowHoverGsrovEnvCfg(AUVTrackingEnvCfg):
     dr_spawn_xy_range: float = 0.12      # m, ± on each horizontal axis
     dr_spawn_yaw_range_deg: float = 8.0  # ± heading at capture
     dr_spawn_depth_range: float = 0.04   # m, ± around starting_depth (the PI pulls it back)
-    # Per-env texture drawn from plane_texture_paths (needs that list non-empty). Off by
-    # default: the default run uses one seabed asset. Turn on for a texture sweep.
-    dr_texture_choice: bool = False
+    # Per-env texture drawn from plane_texture_paths (needs that list non-empty). One
+    # seabed per env for the whole run, seeded from cfg.seed. On by default since
+    # 2026-11-18: with a single asset the template matcher never sees an unfamiliar wall,
+    # and the measured jump rate (0–2 %) was measured on exactly one texture.
+    dr_texture_choice: bool = True
+
+    # ---- Perception-calibration DR: the scale visodom turns pixels into metres with ----
+    # visodom converts pixels to metres through three numbers that on a real hull get
+    # measured once, by hand: the pixel focal length f_px, the initial standoff Z(0), and
+    # the camera mount angles. All three are wrong by a few percent on a real build, and
+    # the error lands DIRECTLY on the reported displacement — Δ = Δpx·Z/f laterally,
+    # Δ_axial = k·Z along the axis. Until now they were exact in sim, so visodom_err
+    # measured the integrator while pretending the ruler under it was perfect.
+    #
+    # These perturb the CALIBRATION THE ESTIMATOR BELIEVES IN, not the hardware: the true
+    # focal stays at cam_hfov_deg and the true wall stays at plane_distance. That is what
+    # an uncalibrated intrinsics / unknown standoff actually looks like — the world is
+    # fine, your numbers about it are not. 1.0 = exact no-op, so the 2026-11-15
+    # configuration is reproduced bit-for-bit and no existing result moves.
+    # 2026-11-17 REVERTED to no-op after one run showed it makes the position reward
+    # WORSE. With these at (0.90,1.10) / (0.90,1.10) / 0.05 / 0.020 (train_visodom_dr.log,
+    # E 200k→286k, 47 points) disp_spawn_m went 48.8 → 61.2 mm while ep_rew_mean sat frozen
+    # at 548-550 — precisely the symptom the DR was supposed to remove. Mechanism: the
+    # injected error reached 15-58 mm, the same order as the 50-88 mm displacement being
+    # optimised, so the reward turned noise-dominated. A policy cannot chase a 30 mm
+    # improvement through a 50 mm error.
+    #
+    # If this is ever turned back on: perturbing the ruler only helps when the ruler's
+    # error is SMALLER than the target precision. It is not, here — the real estimator's
+    # own error (24 mm at hover, 586 mm at a 0.87 m excursion) is already larger than the
+    # 3-30 mm accuracy we want, which is why this whole lever is closed.
+    #
+    # The modelling is still right in principle (one hand calibration per hull, and a real
+    # integrator's error does move with standoff/lighting/flow-fit), so the code paths and
+    # the per-episode draws stay — only the magnitudes are back to no-op.
+    # 1.0 / 0.0 = exact no-op: the 2026-11-15 configuration is reproduced bit-for-bit.
+    dr_visodom_focal_rel_range: tuple = (1.0, 1.0)   # × the estimator's f_px,  per env
+    dr_visodom_range_rel_range: tuple = (1.0, 1.0)   # × the estimator's Z(0), per env
+    dr_visodom_ep_scale_rel: float = 0.0    # ±, per episode, on the lateral scale
+    dr_visodom_bias_m: float = 0.0          # ±, per episode, per axis, additive (m)
+    # Camera mount, realised in the WALL's frame: on a planar target only the relative
+    # camera-plane transform is observable, so tilting the textured plane is the same
+    # image as mis-aligning the camera — and it cannot corrupt the camera prim. Degrees,
+    # ± about the wall centre, col 0 = pitch (wall leans top toward/away), col 1 = roll
+    # (image rotates). Baked into the mesh at setup, so per-ENV and fixed for the run,
+    # like a real mount. The estimator is never told: this is what actually breaks the
+    # fronto-parallel assumption _fit_translational_flow leans on, because a tilted wall
+    # makes du vary with x and the (a, k) fit reads part of that gradient as surge.
+    # 0.0 = exact no-op.
+    dr_cam_mount_deg_range: float = 0.6
+
+    # ---- Sensor-side DR: the two numbers the estimator borrows from the IMU ----
+    # De-rotation and anchor-yaw used the ground-truth quaternion, i.e. a perfect compass
+    # that no real hull has. A biased/flaky heading lands directly on the visodom integral
+    # (a wrong dyaw rotates the whole accumulated displacement) and on the template window.
+    # Bias is per env and held for the run (a real compass has one heading offset after
+    # calibration); noise is per frame. Degrees. 0.0 = exact no-op.
+    dr_imu_yaw_bias_deg: float = 1.0
+    dr_imu_yaw_noise_deg: float = 0.15
+    # ---- Hull drag anisotropy: the single scalar drag_gain above assumes the added mass
+    # is the same along all three axes, which is false for a boxy hull. Per-axis
+    # multipliers on the drag gain, ± fraction, per env, held for the run. 0.0 = no-op.
+    dr_drag_aniso_range: float = 0.15
+    # ---- Water visibility: turbidity attenuates contrast and softens edges, which is how
+    # real flow RMS drops without the vehicle moving. Left/right bounds are the fraction
+    # of contrast REMOVED (0 = crystal clear, 0.6 = 40 % of the original contrast); sampled
+    # per episode because a dive drifts through different water. 0.0 = exact no-op.
+    dr_turbidity_range: tuple = (0.0, 0.25)
 
     # Reward weights.
     rew_flow: float = 1.0
     rew_alive: float = 0.3
     rew_depth: float = 0.1
     rew_att: float = 0.1
-    rew_action: float = 0.01
+    rew_action: float = 0.02
+    # Bounded action-rate penalty, borrowed from MarineGym (IROS 2025). Their effort term is
+    # ``0.1 * exp(-|a|)``, i.e. range [0, 0.1]: a penalty term that cannot exceed its weight.
+    # The previous unbounded hinge ``3.0 * sum(relu(|da|-0.08)^2)`` reached ~33/step during
+    # SAC's random exploration against a ~2.45/step reward and killed arm J at 26.9 k steps
+    # (critic_loss 2.47). Saturating forms make that class of failure impossible.
+    # With scale=0.15 the term goes 0.10 at |da|=0.05, 0.13 at 0.15, and saturates at 0.2.
+    rew_action_rate: float = 0.2
+    action_rate_scale: float = 0.15
+    # Effort (not rate): rewards low continuous thrust, same form as MarineGym's
+    # ``0.1 * exp(-effort)``. Rate alone cannot separate "steady push against the current"
+    # from "buzzing": both move the stick every step. Missing half of the signal.
+    #
+    # ARM L RESULT (2026-11-20): 0.1 -> 0.0 was tested as a single-variable change and it
+    # COLLAPSED the policy -- path_m 2627 mm (K: 285-363), late_drift 172 mm/s (K: 12.4),
+    # est_err p90 192 mm, gate 3-11% on every bar. Signature identical to arm G (2475 mm).
+    # So the effort term is NOT making the policy lazy: it is suppressing a real limit cycle.
+    # Removing it buys nothing at high current and loses the hover outright. Keep 0.1.
+    # (The high-current drift gap is therefore not an under-command problem -- 2.4x thrust
+    # reserve was measured but the issue is control/perception, not reward weight.)
+    rew_effort: float = 0.1
     sigma_flow: float = 0.05  # calibrated: 1x std of measured flow_rms_n (≈0.047, clamped [0.05,0.5])
     sigma_depth: float = 1.5
     sigma_att: float = 0.3
@@ -409,6 +545,35 @@ class AUVTrackingV7FlowHoverGsrovEnvCfg(AUVTrackingEnvCfg):
     anchor_crop_height: int = 96   # template crop @ flow-res 176×320; 96×160 → window ±40/±80 px
     anchor_crop_width: int = 160
     rew_anchor_vis: float = 0.3      # exp(-d_vis²/σ²) on the anchor offset, in metres
+    # --- two-scale twins (2026-11-16) -----------------------------------------------
+    # A single Gaussian stops discriminating once the error is a few sigma out: at 30 mm
+    # it reads 0.96-0.99, i.e. "5 mm hover" and "38 mm hover" differ by ~0.5% of the
+    # episode return, below the DR noise. These finer twins are added ON TOP of the broad
+    # terms rather than replacing them — arm A (broad sigma replaced by sharp sigma)
+    # collapsed at 105k steps from ~25 mm to 872 mm, because sharpening had also removed
+    # the only global restoring force while the flow term stays aliased at range
+    # (receding from the plane reduces image motion, so flow_term held 0.966 at 0.87 m).
+    # 2026-11-17 REVERTED after it diverged. Trial: move the fine weight off the estimator
+    # and onto the template (rew_position_fine 0.15→0.0, rew_anchor_vis_fine 0.15→0.30,
+    # total still 2.55). Over 61 points (200k→309k) disp_spawn_m held 20-50 mm to ~260k,
+    # then left the basin: 1.1 m at 268k, 2.9 m at 284k, 5.1 m at 300k. ep_rew_mean peaked
+    # 541 at ~250k, then fell to 421.
+    #
+    # What that proves: the sigma=0.1 m visodom term was load-bearing for STABILITY, not
+    # only accuracy. It is the single cue with a usable gradient across 50 mm → the
+    # template's ±0.9 m window edge; the sigma=0.05 template twin is near step-like
+    # (≈0.30 inside ~10 mm, ≈0 past 70 mm), and position(sigma=1.0) / anchor_vis(sigma=0.2)
+    # are both nearly flat in that band. Remove the 0.1 term and there is a blind gap the
+    # policy drifts through; once it is past the window edge every position cue reads zero
+    # and nothing pulls it home. Being "the noisy cue billed twice" is not the same as
+    # being redundant — it was the only medium-grain term.
+    #
+    # Two reward-level attempts are now on record as failed (this one, and the visodom
+    # error-DR run before it). The reward is not the lever. Reverted to the E-arm values.
+    rew_anchor_vis_fine: float = 0.15
+    sigma_anchor_vis_fine_m: float = 0.05
+    rew_position_fine: float = 0.15
+    sigma_visodom_fine_m: float = 0.1
     sigma_anchor_vis_m: float = 0.2  # ≈ half the working basin (d=0.4 ⇒ exp(-4)≈0.02)
     rew_sim: float = 0.2             # (ncc+1)/2, present-gated: "how much the image matches frame 1"
     rew_yaw_anchor: float = 0.1       # yaw error to the capture heading — image matching is only
@@ -422,7 +587,7 @@ class AUVTrackingV7FlowHoverGsrovEnvCfg(AUVTrackingEnvCfg):
     # Integrating its uniform component (a_px, b_px) without leak, de-rotated by
     # yaw so heading changes cannot cancel it, plus the expansion coefficient k
     # with a tracked Z for the surge leg, gives a body-frame displacement
-    # estimate. Probe (scripts/debug_auv_v7_visodom.py): corr vs GT = 1.000 on
+    # estimate. Probe (v7/scripts/debug/debug_auv_v7_visodom.py): corr vs GT = 1.000 on
     # both axes; a plain P servo on it returns from 0.57 m to 0.044 m under the
     # full 0.3 m/s current ramp while zero-action drifts to 1.02 m. It
     # overestimates ~15–20 % (113.5 px/m sway vs 92.6 geometric; surge 1.14x) —
@@ -431,6 +596,44 @@ class AUVTrackingV7FlowHoverGsrovEnvCfg(AUVTrackingEnvCfg):
     # the logs (disp_end_m / visodom_err_m) and nowhere else.
     vis_odometry: bool = True
     sigma_visodom_m: float = 1.0  # basin of the visodom reward term (≈ sigma_anchor_m)
+    # Observation normalization for the visodom channels, kept SEPARATE from the reward
+    # basin above. If they shared one field, sweeping the reward sharpness would also
+    # change what the actor sees (±1 saturates at sigma_visodom_m metres), and a win or
+    # loss could no longer be attributed to reward sharpness alone. Default 1.0 = the
+    # observation semantics every run before 2026-11-16 was trained with.
+    sigma_visodom_obs_m: float = 1.0
+    # Hard physical bound on the visodom integrator, expressed as a speed (m/s). Between
+    # two control steps the hull cannot travel farther than v_max·dt, so any single flow
+    # fit that claims more is corrupt by definition. Arm F (2026-11-18) showed the cost of
+    # leaving it unbounded: with heading bias + wall tilt + turbidity the estimator went
+    # from 0.03 m to 1.8 m of error, and because the reward pays that estimate, the policy
+    # degenerated into a bimodal "either 46 mm or 2.6 m" strategy. 1.0 m/s is far above the
+    # vehicle's real speed while still bounding the damage of one bad frame.
+    visodom_max_speed_mps: float = 1.0
+    # Which displacement the POSITION REWARD pays: "gt" (true horizontal offset from this
+    # episode's spawn point) or "visodom" (the estimator's own integral).
+    #
+    # "gt" is the default since 2026-11-18, and it is not a relaxation of the task: the
+    # actor still sees ONLY the image, the estimate, the anchor channels — never the true
+    # pose. Difficulty is unchanged. What changes is the learning signal: paying the
+    # estimate made the reward noise-dominated exactly when the DR got harder, because the
+    # injected error (0.3-1.8 m) reached the same order as the 30-50 mm being optimised.
+    # That is what killed arm F (~70 k) and arm G (~190 k): critic_loss 0.06 -> 0.6 in one
+    # block, then the policy split into "46 mm or 2.6 m" episodes. Rewarding truth keeps
+    # the harder distribution while giving the critic a signal it can actually fit.
+    # "visodom" reproduces the old behaviour bit-for-bit (use it for the ablation that
+    # answers "how much does an uncalibrated ruler hurt?").
+    #
+    # 2026-11-19 REVERTED to "visodom" after arm H measured the opposite of what I expected.
+    # Paying truth made the TRAINING LOG look great (disp_spawn 21-28 mm at 100 k vs arm G's
+    # 33-37 mm) and made the 40-episode eval WORSE (mean 63.6 mm vs 51.7 mm). Mechanism: the
+    # actor only perceives the estimate, so rewarding truth asks it to optimise a quantity it
+    # cannot observe; the proxy mapping it learns does not survive a fresh set of DR draws,
+    # whereas "drive your own estimate to zero" is a target it can actually see and control at
+    # deployment. The pretty log number was self-deception. The collapse arms F/G/H suffered
+    # is also not caused by this — F, G and H collapsed at 130-200 k with three different
+    # reward sources, so that failure lives in late-training stability, not in the reward.
+    rew_position_source: str = "visodom"
     # Leave-one-out. All default False, which is the system trained on 2026-11-13.
     # A True flag zeros that cue's reward and the observation channels the policy
     # reads. Image stays (11, 64, 64) and state stays 17-D, so the network shape
@@ -545,7 +748,43 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
         dev = self.device
         self._actions = torch.zeros(self.num_envs, 3, device=dev)
         self._prev_actions = torch.zeros(self.num_envs, 3, device=dev)
+        # Actuator delay: one slot per possible delay, newest at index -1. With max=0 the
+        # buffer is just the pass-through and costs one clone per step.
+        _delay_max = int(getattr(self.cfg, "train_action_delay_max_steps", 0))
+        self._act_delay_steps = torch.zeros(self.num_envs, dtype=torch.long, device=dev)
+        self._action_hist = torch.zeros((self.num_envs, _delay_max + 1, 3), device=dev)
         self._cmd_vel = torch.zeros(self.num_envs, 3, device=dev)
+        # Control period, so latencies can be expressed in control steps.
+        self._ctrl_dt = float(self.cfg.sim.dt) * float(self.cfg.decimation)
+        # Vision latency (fixed, see cfg): the whole visual observation is delayed, because
+        # image, flow, anchor and visodom all come out of the same frame. The ego-velocity
+        # state is NOT delayed — IMU/DVL latency is a different, much smaller number, and
+        # delaying it would silently double-count the lag.
+        self._vis_delay_steps = max(
+            0,
+            int(round(float(getattr(self.cfg, "vision_delay_ms", 0.0)) / (self._ctrl_dt * 1e3))),
+        )
+        self._vis_hist = None
+        self._vis_push_needed = False
+        self._vis_fresh = torch.zeros(self.num_envs, dtype=torch.bool, device=dev)
+        # Payload wrench (tier 1). Zero until _sample_domain_randomization draws it.
+        self._payload_mass = torch.zeros(self.num_envs, device=dev)
+        self._payload_off = torch.zeros((self.num_envs, 3), device=dev)
+        if self._vis_delay_steps > 0 or float(self.cfg.dr_payload_mass_frac_range[1]) > 0.0:
+            # Banner so every run log states the latency/payload regime it was trained under.
+            print(
+                "[v7][LAT] vision_delay=%.0f ms (%d step(s)) | payload up to %.2f kg, "
+                "xy +-%.3f m, z [%.3f, %.3f] m"
+                % (
+                    self._vis_delay_steps * self._ctrl_dt * 1e3,
+                    self._vis_delay_steps,
+                    float(self.cfg.dr_payload_mass_frac_range[1]) * float(self.cfg.mass),
+                    float(self.cfg.dr_payload_offset_xy_range[1]),
+                    float(self.cfg.dr_payload_offset_z_range[0]),
+                    float(self.cfg.dr_payload_offset_z_range[1]),
+                ),
+                flush=True,
+            )
         self._prev_cmd_vel = torch.zeros(self.num_envs, 3, device=dev)
         # v7-local depth-loop retune (see cfg comment for the Routh analysis).
         # Class defaults in batch_pid.py are untouched — other tasks keep the old law.
@@ -681,6 +920,7 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
         # Camera (adopted prim inside asset).
         self._spawn_robot_camera()
         self._apply_camera_intrinsics()
+        self._spawn_cam_mount_dr()
         self._spawn_view_camera()
         self._tiled_camera = TiledCamera(self.cfg.tiled_camera)
         self.scene.sensors["tiled_camera"] = self._tiled_camera
@@ -752,10 +992,20 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
         self._ep_flow_rms_sum = torch.zeros(self.num_envs, device=self.device)
         self._ep_present_sum = torch.zeros(self.num_envs, device=self.device)
         self._ep_flow_term_sum = torch.zeros(self.num_envs, device=self.device)
+        # Action-rate / effort diagnostics. Rate is what the penalty bounds; effort is what
+        # separates "holding against the current" from "buzzing", so both are logged.
+        self._ep_action_delta_sum = torch.zeros(self.num_envs, device=self.device)
+        self._ep_rate_pen_sum = torch.zeros(self.num_envs, device=self.device)
+        self._ep_effort_sum = torch.zeros(self.num_envs, device=self.device)
         self._ep_anchor_sum = torch.zeros(self.num_envs, device=self.device)
         # First-frame-anchor episode sums: mean visual displacement (m) and sim score.
         self._ep_anchor_vis_sum = torch.zeros(self.num_envs, device=self.device)
         self._ep_anchor_sim_sum = torch.zeros(self.num_envs, device=self.device)
+        # Fraction of steps where the first-frame template was actually captured. Capture
+        # is refused while the centre crop is nearly textureless, and a refused episode has
+        # anchor_ncc == 0 the whole way, which reads as "bad match" when it is really "no
+        # template at all" — the two need to be distinguishable before any policy eval.
+        self._ep_anchor_valid_sum = torch.zeros(self.num_envs, device=self.device)
         # cause order: [texture_lost, depth, attitude, timeout]
         self._ep_cause = torch.zeros(self.num_envs, 4, dtype=torch.bool, device=self.device)
 
@@ -765,12 +1015,40 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
         self._dr_cur_dir = torch.zeros((self.num_envs, 2), device=self.device)
         self._dr_cur_dir[:, 0] = 1.0
         self._dr_cur_vz = torch.zeros(self.num_envs, device=self.device)
+        # Spawn point per episode (x, y): the "home" the anchor defines and the origin
+        # that disp_end_m must be measured against under spawn randomization.
+        self._spawn_xy = torch.zeros((self.num_envs, 2), device=self.device)
+        # Spawn depth offset, kept as state (not just applied to the root pose) so the
+        # coverage audit can verify it is redrawn every episode like the other pose draws.
+        self._dr_spawn_depth = torch.zeros(self.num_envs, device=self.device)
         # Hardware/image draws are held for the whole run (one camera, one pack).
         self._dr_thrust_gain = torch.ones(self.num_envs, device=self.device)
         self._dr_drag_gain = torch.zeros(self.num_envs, device=self.device)
         self._dr_cam_bright = torch.ones(self.num_envs, device=self.device)
         self._dr_cam_noise = torch.zeros(self.num_envs, device=self.device)
+        # Sensor/actuator draws added 2026-11-18: heading belief and drag anisotropy are
+        # per-env constants (one compass offset, one hull), turbidity moves per episode.
+        self._imu_yaw_bias = torch.zeros(self.num_envs, device=self.device)
+        self._imu_yaw_noise = torch.zeros(self.num_envs, device=self.device)
+        self._drag_aniso = torch.ones((self.num_envs, 3), device=self.device)
+        self._turbidity = torch.zeros(self.num_envs, device=self.device)
+        self._sensed_yaw_cache = torch.zeros(self.num_envs, device=self.device)
+        self._sensed_yaw_key = -1
+        # Perception-calibration draws. The camera and the wall stay nominal; these two
+        # multipliers bias only the numbers the estimator divides/multiplies by, so the
+        # scale error is a belief error, not a geometry change.
+        self._visodom_f_err = torch.ones(self.num_envs, device=self.device)
+        self._visodom_range_err = torch.ones(self.num_envs, device=self.device)
+        # Per-episode residual on the scale and the additive offset: redrawn every reset
+        # so no single bias survives long enough for the policy to settle into it.
+        self._visodom_ep_scale = torch.ones(self.num_envs, device=self.device)
+        self._visodom_bias = torch.zeros((self.num_envs, 2), dtype=torch.float32, device=self.device)
+        self._visodom_f_px = torch.full(
+            (self.num_envs,), float(self._anchor_f_px), dtype=torch.float32, device=self.device
+        )
         self._sample_domain_randomization(torch.arange(self.num_envs, device=self.device), per_episode=False)
+        # _visodom_z exists already; rewrite it from the freshly drawn range error.
+        self._refresh_visodom_calibration()
         if bool(getattr(self.cfg, "dr_enable", False)):
             print(
                 "[v7][DR] enabled  current=%.2f-%.2f m/s (full-circle=%s)  thrust_gain=%.2f-%.2f"
@@ -788,8 +1066,59 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
                 ),
                 flush=True,
             )
+            print(
+                "[v7][DR] calibration  visodom f_px=%.3f-%.3f ×, Z(0)=%.3f-%.3f ×"
+                "  cam_mount=±%.2f° pitch/roll (wall baked)   -> drawn f_px %.1f-%.1f px,"
+                " range_err %.3f-%.3f, tilt max %.2f°"
+                % (
+                    self.cfg.dr_visodom_focal_rel_range[0], self.cfg.dr_visodom_focal_rel_range[1],
+                    self.cfg.dr_visodom_range_rel_range[0], self.cfg.dr_visodom_range_rel_range[1],
+                    float(self.cfg.dr_cam_mount_deg_range),
+                    float(self._visodom_f_px.min()), float(self._visodom_f_px.max()),
+                    float(self._visodom_range_err.min()), float(self._visodom_range_err.max()),
+                    float(self._cam_tilt_deg.abs().max()) if hasattr(self, "_cam_tilt_deg") else 0.0,
+                ),
+                flush=True,
+            )
         else:
             print("[v7][DR] disabled (boxed 2026-11-15 configuration)", flush=True)
+
+        # Reward-sharpness banner. These sigmas set the precision the return is ABLE to ask
+        # for: with sigma_visodom=1.0 m and sigma_anchor_vis=0.2 m a 5 mm hover and a 38 mm
+        # hover differ by ~0.5% of the episode return, which is below the DR-induced noise,
+        # so the policy has no gradient to go past ~30 mm (measured 2026-11-16). Printed on
+        # every run so the reward configuration of a checkpoint is never a matter of guesswork.
+        print(
+            "[v7][REW] sigma_flow=%.3f  sigma_anchor_vis=%.3f m  sigma_visodom=%.3f m"
+            "  sigma_visodom_obs=%.3f m | rew flow/anchor_vis/sim/yaw/pos = %.2f/%.2f/%.2f/%.2f/%.2f"
+            % (
+                float(self.cfg.sigma_flow),
+                float(self.cfg.sigma_anchor_vis_m),
+                float(self.cfg.sigma_visodom_m),
+                float(getattr(self.cfg, "sigma_visodom_obs_m", 1.0)),
+                float(self.cfg.rew_flow),
+                float(self.cfg.rew_anchor_vis),
+                float(self.cfg.rew_sim),
+                float(self.cfg.rew_yaw_anchor),
+                float(self.cfg.rew_anchor),
+            ),
+            flush=True,
+        )
+        print(
+            "[v7][REW] fine twins: rew_anchor_vis_fine=%.2f (sigma=%.3f m)"
+            "  rew_position_fine=%.2f (sigma=%.3f m)  -> max %.2f/step"
+            % (
+                float(self.cfg.rew_anchor_vis_fine),
+                float(self.cfg.sigma_anchor_vis_fine_m),
+                float(self.cfg.rew_position_fine),
+                float(self.cfg.sigma_visodom_fine_m),
+                float(self.cfg.rew_flow + self.cfg.rew_anchor_vis + self.cfg.rew_anchor_vis_fine
+                      + self.cfg.rew_sim + self.cfg.rew_yaw_anchor + self.cfg.rew_anchor
+                      + self.cfg.rew_position_fine + self.cfg.rew_alive
+                      + self.cfg.rew_depth + self.cfg.rew_att),
+            ),
+            flush=True,
+        )
 
         # USD pose sync for camera.
         self._robot_usd = None
@@ -976,6 +1305,8 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
     def _resolve_plane_texture(self, rng_choice=None):
         """Resolve a texture path for the plane."""
         import random
+        if isinstance(rng_choice, str) and rng_choice and os.path.isfile(rng_choice):
+            return rng_choice
         p = getattr(self.cfg, "plane_texture_path", "") or ""
         if p and os.path.isfile(p):
             base = p
@@ -1005,6 +1336,42 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
             if cands:
                 base = random.choice(cands)
         return base
+
+    def _spawn_cam_mount_dr(self):
+        """Draw the per-env camera-mount misalignment, in degrees, shape (N, 2).
+
+        Called once from _setup_scene before the wall mesh exists, because the tilt is
+        baked into the geometry and cannot be changed afterwards. Kept separate from
+        _sample_domain_randomization (which runs later, from __init__) for that reason.
+        """
+        span = float(getattr(self.cfg, "dr_cam_mount_deg_range", 0.0))
+        if not bool(getattr(self.cfg, "dr_enable", False)) or span <= 0.0:
+            self._cam_tilt_deg = torch.zeros((self.num_envs, 2), device=self.device)
+            return
+        self._cam_tilt_deg = (torch.rand((self.num_envs, 2), device=self.device) * 2.0 - 1.0) * span
+
+    def _dr_texture_for_env(self, ei: int):
+        """Deterministic per-env seabed texture when ``dr_texture_choice`` is on.
+
+        One wall asset per env for the whole run (a site does not change its seabed
+        mid-dive), seeded from ``cfg.seed`` + env index so the draw is reproducible.
+        Returns None when the knob is off, which reproduces the single-asset default.
+        """
+        if not bool(getattr(self.cfg, "dr_enable", False)):
+            return None
+        if not bool(getattr(self.cfg, "dr_texture_choice", False)):
+            return None
+        import random
+
+        cands = [
+            c for c in (getattr(self.cfg, "plane_texture_paths", ()) or ()) if isinstance(c, str) and os.path.isfile(c)
+        ]
+        if not cands:
+            cands = self._default_plane_texture_candidates()
+        if not cands:
+            return None
+        seed = int(getattr(self.cfg, "seed", 0) or 0) + 7919 * int(ei)
+        return random.Random(seed).choice(cands)
 
     def _spawn_textured_plane(self):
         """Spawn a 4x4 (configurable) textured plane per env, in front of the AUV camera.
@@ -1036,6 +1403,29 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
                     Gf.Vec3f(dist,  half_w, depth + half_h),
                     Gf.Vec3f(dist, -half_w, depth + half_h),
                 ]
+                # Camera-mount DR, applied to the wall instead of the camera: on a planar
+                # target only the RELATIVE camera-plane transform is observable, so tilting
+                # the wall is the same image as tilting the camera — and the camera prim is
+                # left untouched. Pitch rotates about world Y (wall leans top toward/away),
+                # roll about world X (wall spins about its own normal -> rotated image).
+                pitch = roll = 0.0
+                tilt = getattr(self, "_cam_tilt_deg", None)
+                if tilt is not None and float(tilt[ei].abs().max()) > 0.0:
+                    pitch = float(tilt[ei, 0]) * np.pi / 180.0
+                    roll = float(tilt[ei, 1]) * np.pi / 180.0
+                    cp, sp = float(np.cos(pitch)), float(np.sin(pitch))
+                    cr, sr = float(np.cos(roll)), float(np.sin(roll))
+                    tilted = []
+                    for corner in (-1.0, 1.0):
+                        for side in (-1.0, 1.0):
+                            dy, dz = side * half_w, corner * half_h
+                            # pitch about Y through the wall centre
+                            dx_p, dz_p = dz * sp, dz * cp
+                            # roll about X (the wall normal)
+                            dy_r = dy * cr - dz_p * sr
+                            dz_r = dy * sr + dz_p * cr
+                            tilted.append(Gf.Vec3f(dist + dx_p, dy_r, depth + dz_r))
+                    pts = [tilted[0], tilted[1], tilted[3], tilted[2]]
                 mesh.GetPointsAttr().Set(pts)
                 mesh.GetFaceVertexCountsAttr().Set([4])
                 mesh.GetFaceVertexIndicesAttr().Set([0, 1, 2, 3])
@@ -1043,13 +1433,20 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
                 # UVs: V flipped so image "up" matches world +Z; 180° rotated.
                 stp.Set([Gf.Vec2f(tile, 0), Gf.Vec2f(0, 0), Gf.Vec2f(0, tile), Gf.Vec2f(tile, tile)])
                 mesh.GetPrim().CreateAttribute("doubleSided", Sdf.ValueTypeNames.Bool).Set(True)
-                # compute normals
+                # compute normals — rotated with the wall so the tilt does not fake a
+                # shading gradient that the texture mask / Farneback could read as motion
                 try:
-                    mesh.GetNormalsAttr().Set([Gf.Vec3f(-1.0, 0.0, 0.0)] * 4)
+                    if pitch or roll:
+                        _cp, _sp = float(np.cos(pitch)), float(np.sin(pitch))
+                        _cr, _sr = float(np.cos(roll)), float(np.sin(roll))
+                        n = Gf.Vec3f(-_cp, -_sp * _sr, _sp * _cr)
+                    else:
+                        n = Gf.Vec3f(-1.0, 0.0, 0.0)
+                    mesh.GetNormalsAttr().Set([n] * 4)
                 except Exception:
                     pass
 
-                tex = self._resolve_plane_texture()
+                tex = self._resolve_plane_texture(self._dr_texture_for_env(ei))
                 mat_path = f"{env_prim}/FlowPlaneMat"
                 mat = UsdShade.Material.Define(self.sim.stage, mat_path)
                 sh = UsdShade.Shader.Define(self.sim.stage, mat_path + "/Preview")
@@ -1236,6 +1633,16 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
             out = rgb.to(torch.float32) * self._dr_cam_bright.view(-1, 1, 1, 1)
             if float(self.cfg.dr_cam_noise_std_range[1]) > 0.0:
                 out = out + torch.randn_like(out) * (self._dr_cam_noise.view(-1, 1, 1, 1) * 255.0)
+            turb = self._turbidity.view(-1, 1, 1, 1)
+            if bool((turb > 0.0).any()):
+                # Scattering water attenuates contrast and softens edges: what reaches the
+                # sensor is a washed-out, low-gradient frame. This is real sensor realism
+                # and the reason flow RMS can read near-zero while the hull is moving —
+                # the policy must learn to distrust a quiet image in murky water.
+                mean = out.mean(dim=(1, 2, 3), keepdim=True)
+                out = mean + (out - mean) * (1.0 - 0.7 * turb)
+                o = F.avg_pool2d(out.permute(0, 3, 1, 2), 3, stride=1, padding=1)
+                out = o.permute(0, 2, 3, 1)
             rgb = out.round().clamp_(0.0, 255.0).to(torch.uint8)
             self._dr_frame_key = key
             self._dr_frame_cache = rgb
@@ -1352,7 +1759,7 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
             self._flow_uniform[~fresh, 1] = b_px
             self._flow_expand[~fresh] = k_exp
             rows = ~fresh
-            yaw_now = euler_xyz_from_quat(self._robot.data.root_quat_w)[2][rows]
+            yaw_now = self._sensed_yaw()[rows]
             # Visual odometry: same de-rotation, NO leak. The surge leg comes from
             # the expansion coefficient (k per frame ≈ ΔZ/Z): displacement += k·Z,
             # then Z shrinks by 1/(1+k). Sway px→m happens in _visodom_m via
@@ -1363,9 +1770,22 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
                 co, so = torch.cos(dyaw_o), torch.sin(dyaw_o)
                 u0 = self._visodom[rows, 0] * co - self._visodom[rows, 1] * so
                 v0 = self._visodom[rows, 0] * so + self._visodom[rows, 1] * co
+                zz = self._visodom_z[rows]
+                # Physical guard: between two control steps the hull cannot travel farther
+                # than v_max·dt. Heading bias, wall tilt and turbidity can each push a
+                # single flow fit far past that, and an unbounded increment accumulates
+                # into metres of phantom travel (visodom_err 0.03 → 1.8 m, arm F). Clamping
+                # the increment stops one corrupted frame from poisoning the integrator,
+                # the actor's two channels and the position reward at the same time.
+                step_m = float(getattr(self.cfg, "visodom_max_speed_mps", 1.0)) * (
+                    float(self.cfg.sim.dt) * float(self.cfg.decimation)
+                )
+                px_lim = (step_m * self._visodom_f_px[rows] / zz.clamp(min=0.1)).clamp(min=1.0)
+                a_px = a_px.clamp(-px_lim, px_lim)
+                b_px = b_px.clamp(-px_lim, px_lim)
+                k_exp = (k_exp * zz).clamp(-step_m, step_m) / zz.clamp(min=0.1)
                 self._visodom[rows, 0] = u0 + a_px
                 self._visodom[rows, 1] = v0 + b_px
-                zz = self._visodom_z[rows]
                 self._visodom_x[rows] = self._visodom_x[rows] + k_exp * zz
                 self._visodom_z[rows] = zz / (1.0 + k_exp).clamp(min=0.1)
                 self._visodom_yaw_prev[rows] = yaw_now
@@ -1378,7 +1798,7 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
     def _update_anchor_state(self, curr_raw):
         """First-frame template match. The algorithm lives in template_anchor.py."""
         local_x = self._robot.data.root_pos_w[:, 0] - self.scene.env_origins[:, 0]
-        yaw = euler_xyz_from_quat(self._robot.data.root_quat_w)[2]
+        yaw = self._sensed_yaw()
         update_template_anchor(
             curr_raw,
             texture_count=self._texture_count,
@@ -1393,8 +1813,8 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
             flow_w=int(self.cfg.flow_render_width),
             crop_h=int(self.cfg.anchor_crop_height),
             crop_w=int(self.cfg.anchor_crop_width),
-            f_px=float(self._anchor_f_px),
-            plane_distance=float(self.cfg.plane_distance),
+            f_px=self._visodom_f_px,
+            plane_distance=float(self.cfg.plane_distance) * self._visodom_range_err,
             local_x=local_x,
             yaw=yaw,
         )
@@ -1433,11 +1853,140 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
             self._dr_cur_dir[env_ids, 1] = torch.sin(ang)
             vf = float(self.cfg.dr_current_vert_frac)
             self._dr_cur_vz[env_ids] = (torch.rand(n, device=dev) * 2.0 - 1.0) * vf * speed
+            # Estimator error that moves with the dive rather than with the hull. Kept
+            # out of the per_env branch on purpose: a run-long constant is what the
+            # policy settles into, which is the failure this DR exists to remove.
+            ep = (torch.rand(n, device=dev) * 2.0 - 1.0) * float(self.cfg.dr_visodom_ep_scale_rel)
+            self._visodom_ep_scale[env_ids] = 1.0 + ep
+            self._visodom_bias[env_ids] = (
+                (torch.rand((n, 2), device=dev) * 2.0 - 1.0) * float(self.cfg.dr_visodom_bias_m)
+            )
+            # Water visibility moves with the dive, so it belongs to the episode horizon.
+            self._turbidity[env_ids] = _uniform(self.cfg.dr_turbidity_range)
+            # Payload (tier 1): the pod changes between dives, so mass and CG offset belong
+            # to the episode horizon. Guards the WHOLE block, not just the draw: the parent
+            # __init__ runs one _reset_idx (and therefore this draw) before this subclass has
+            # allocated its buffers, so the else-branch would touch a missing attribute.
+            if hasattr(self, "_payload_mass"):
+                if float(self.cfg.dr_payload_mass_frac_range[1]) > 0.0:
+                    self._payload_mass[env_ids] = _uniform(
+                        self.cfg.dr_payload_mass_frac_range
+                    ) * float(self.cfg.mass)
+                else:
+                    self._payload_mass[env_ids] = 0.0
+                hi_xy = float(self.cfg.dr_payload_offset_xy_range[1])
+                if hi_xy > 0.0:
+                    self._payload_off[env_ids, 0:2] = (
+                        torch.rand((n, 2), device=dev) * 2.0 - 1.0
+                    ) * hi_xy
+                else:
+                    self._payload_off[env_ids, 0:2] = 0.0
+                lo_z = float(self.cfg.dr_payload_offset_z_range[0])
+                hi_z = float(self.cfg.dr_payload_offset_z_range[1])
+                if hi_z > lo_z:
+                    self._payload_off[env_ids, 2] = _uniform(self.cfg.dr_payload_offset_z_range)
+                else:
+                    self._payload_off[env_ids, 2] = lo_z
+            self._refresh_visodom_calibration(env_ids)
         else:
             self._dr_thrust_gain[env_ids] = _uniform(self.cfg.dr_thrust_gain_range)
             self._dr_drag_gain[env_ids] = _uniform(self.cfg.dr_drag_gain_range)
             self._dr_cam_bright[env_ids] = _uniform(self.cfg.dr_cam_brightness_range)
             self._dr_cam_noise[env_ids] = _uniform(self.cfg.dr_cam_noise_std_range)
+            # Heading belief of this unit: one compass offset for the run, one noise level.
+            self._imu_yaw_bias[env_ids] = (
+                torch.rand(n, device=dev) * 2.0 - 1.0
+            ) * float(np.radians(float(self.cfg.dr_imu_yaw_bias_deg)))
+            self._imu_yaw_noise[env_ids] = torch.rand(n, device=dev) * float(
+                np.radians(float(self.cfg.dr_imu_yaw_noise_deg))
+            )
+            # Added-mass anisotropy: one hull, one set of axis multipliers, for the run.
+            aniso = (torch.rand((n, 3), device=dev) * 2.0 - 1.0) * float(
+                self.cfg.dr_drag_aniso_range
+            )
+            self._drag_aniso[env_ids] = (1.0 + aniso).clamp(min=0.0)
+            # Calibration beliefs: same horizon as the camera itself (one unit, one
+            # intrinsics calibration, one standoff estimate, for the whole run).
+            self._visodom_f_err[env_ids] = _uniform(self.cfg.dr_visodom_focal_rel_range)
+            self._visodom_range_err[env_ids] = _uniform(self.cfg.dr_visodom_range_rel_range)
+            self._refresh_visodom_calibration(env_ids)
+
+    def _refresh_visodom_calibration(self, env_ids=None) -> None:
+        """Rewrite the metric conversions the estimator believes in, from the drawn errors.
+
+        Called once at init and again on every reset, so a run cannot start with a
+        _visodom_z that disagrees with the multiplier it was drawn from.
+        """
+        ids = slice(None) if env_ids is None else env_ids
+        self._visodom_f_px[ids] = (
+            float(self._anchor_f_px) * self._visodom_f_err[ids] * self._visodom_ep_scale[ids]
+        )
+        self._visodom_z[ids] = float(self.cfg.plane_distance) * self._visodom_range_err[ids]
+
+    def _sensed_yaw(self) -> torch.Tensor:
+        """Heading the estimator is allowed to see, shape (N,).
+
+        Ground truth plus this unit's compass offset and per-frame noise, so de-rotation
+        and the anchor window stop being free information. A wrong dyaw rotates the whole
+        visodom integral, which is exactly the failure a real compass bias produces.
+        Cached per sim step: every caller within one step must agree, otherwise the flow
+        de-rotation and the anchor bookkeeping would drift apart.
+        """
+        key = int(getattr(self, "_sim_step_counter", -1))
+        if self._sensed_yaw_key == key:
+            return self._sensed_yaw_cache
+        yaw = euler_xyz_from_quat(self._robot.data.root_quat_w)[2]
+        if bool(getattr(self.cfg, "dr_enable", False)):
+            yaw = yaw + self._imu_yaw_bias
+            if float(getattr(self.cfg, "dr_imu_yaw_noise_deg", 0.0)) > 0.0:
+                yaw = yaw + torch.randn_like(yaw) * self._imu_yaw_noise
+        self._sensed_yaw_cache = yaw
+        self._sensed_yaw_key = key
+        return yaw
+
+    def _payload_wrench(self):
+        """Body-frame weight force and CG torque of the payload (tier-1 emulation).
+
+        F_world = [0, 0, -m_p g]; the wrench is applied at the link origin, so a CG offset r
+        shows up as tau = r x F_body. Buoyancy is untouched on purpose: a real tool pod is
+        not neutrally buoyant, and the depth loop paying for that is the point.
+        """
+        zero = torch.zeros((self.num_envs, 3), device=self.device)
+        # hasattr: the parent __init__ drives one step before this subclass has allocated
+        # its buffers, so the payload is undefined during construction.
+        if not hasattr(self, "_payload_mass") or float(self._payload_mass.abs().max()) <= 0.0:
+            return zero, zero
+        f_world = torch.zeros_like(zero)
+        f_world[:, 2] = -self._payload_mass * 9.81
+        f_body = quat_apply_inverse(self._robot.data.root_quat_w, f_world)
+        return f_body, torch.linalg.cross(self._payload_off, f_body)
+
+    def _apply_vision_delay(self, image):
+        """Return the visual observation captured ``_vis_delay_steps`` control steps ago.
+
+        Newest frame is pushed at the end and read from the front, mirroring the action
+        history convention. The push is gated on ``_vis_push_needed`` (set once per control
+        step in ``_pre_physics_step``) so the extra ``_get_observations`` calls that happen
+        on reset cannot advance the queue twice and shrink the effective latency.
+        """
+        if self._vis_hist is None:
+            self._vis_hist = torch.zeros(
+                (self.num_envs, self._vis_delay_steps + 1) + tuple(image.shape[1:]),
+                device=image.device,
+                dtype=image.dtype,
+            )
+        if bool(self._vis_fresh.any()):
+            # A freshly reset env has no history; duplicating the current frame is the only
+            # honest choice (the alternative — a zero frame — injects a fake blackout).
+            self._vis_hist[self._vis_fresh] = image[self._vis_fresh].unsqueeze(1)
+            self._vis_fresh[:] = False
+        if self._vis_push_needed:
+            self._vis_push_needed = False
+            self._vis_hist[:, :-1] = self._vis_hist[:, 1:].clone()
+            self._vis_hist[:, -1] = image
+        if self._vis_delay_steps <= 0:
+            return image
+        return self._vis_hist[:, 0]
 
     def _apply_action(self):
         """v7 applies PID (cmd_vel [surge, yaw, heave]) → PWM → thrust/moments."""
@@ -1495,7 +2044,18 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
             # Extra linear drag perturbation on the hull [N per (m/s), per kg-free]. The
             # real added-mass/viscous coefficients are estimates, so perturb the damping
             # instead of rescaling the buoyancy/drag split inside the force model.
-            thrust = thrust - self._dr_drag_gain[:, None] * self._robot.data.root_lin_vel_w[:, :3]
+            thrust = (
+                thrust
+                - self._dr_drag_gain[:, None]
+                * self._drag_aniso
+                * self._robot.data.root_lin_vel_w[:, :3]
+            )
+        # Payload (tier 1): constant weight at a body-frame CG offset. No-op when the DR
+        # ranges are all zero, so default runs stay bit-identical.
+        if hasattr(self, "_payload_mass") and float(self._payload_mass.abs().max()) > 0.0:
+            f_p, tau_p = self._payload_wrench()
+            thrust = thrust + f_p
+            moment = moment + tau_p
         self._thrust[:, 0, :] = thrust
         self._moment[:, 0, :] = moment
         self._robot.set_external_force_and_torque(self._thrust, self._moment)
@@ -1520,8 +2080,11 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
         """
         if not bool(getattr(self.cfg, "vis_odometry", False)):
             return torch.zeros((self.num_envs, 2), dtype=torch.float32, device=self.device)
-        y_m = self._visodom[:, 0] * self._visodom_z / float(self._anchor_f_px)
-        return torch.stack([self._visodom_x, y_m], dim=-1)
+        y_m = self._visodom[:, 0] * self._visodom_z / self._visodom_f_px
+        # The additive bias is applied at READ time, not baked into the integrator: it is
+        # what the estimator reports, so the actor's 2 channels, the position reward and
+        # visodom_err_m must all see the same number.
+        return torch.stack([self._visodom_x, y_m], dim=-1) + self._visodom_bias
 
     def _ego_vel_state(self):
         _, agent_yaw = self._agent_pose_2d()
@@ -1595,7 +2158,7 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
         # Visodom broadcast: integrated consecutive-flow displacement, metres / sigma,
         # ±1 clamped. Unlike the anchor channels this keeps counting past the
         # template-match window; ±1 ≈ the reward basin (sigma_visodom_m).
-        sig_vo = float(getattr(self.cfg, "sigma_visodom_m", 1.0)) or 1.0
+        sig_vo = float(getattr(self.cfg, "sigma_visodom_obs_m", 1.0)) or 1.0
         vo = self._visodom_m()
         visodom_ch = torch.stack([
             (vo[:, 0] / sig_vo).clamp(-1.0, 1.0),
@@ -1623,6 +2186,9 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
 
         state = self._ego_vel_state()
 
+        if self._vis_delay_steps > 0:
+            image = self._apply_vision_delay(image)
+
         return {"policy": {"image": image, "state": state}}
 
     def _compute_step_reward(self):
@@ -1643,10 +2209,13 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
         anchor_vis_term = present * torch.exp(
             -(self._anchor_disp_m ** 2) / (self.cfg.sigma_anchor_vis_m ** 2)
         )
+        anchor_vis_fine_term = present * torch.exp(
+            -(self._anchor_disp_m ** 2) / (float(self.cfg.sigma_anchor_vis_fine_m) ** 2)
+        )
         sim_term = present * ((self._anchor_ncc + 1.0) * 0.5).clamp(0.0, 1.0)
         # Heading to the anchor frame: the template match (and "same image as frame 1")
         # is only well-defined at the capture heading — reward re-aligning yaw.
-        yaw_now_r = euler_xyz_from_quat(self._robot.data.root_quat_w)[2]
+        yaw_now_r = self._sensed_yaw()
         yaw_err_anchor = torch.atan2(
             torch.sin(yaw_now_r - self._anchor_yaw), torch.cos(yaw_now_r - self._anchor_yaw)
         )
@@ -1663,20 +2232,39 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
             # Cue removed. Do not substitute the GT term: that would measure a
             # different question (privileged position) instead of "no visodom".
             position_term = torch.zeros_like(anchor_term)
+            position_fine_term = torch.zeros_like(anchor_term)
         elif bool(getattr(self.cfg, "vis_odometry", False)):
-            # Deployable position: integrated consecutive flow (vision only). Same
-            # shape/basin as the GT term it replaces.
-            d_visodom = self._visodom_m().norm(dim=-1)
+            # Which displacement gets paid. See rew_position_source in the cfg block: "gt"
+            # pays the true offset from this episode's spawn point, "visodom" pays the
+            # estimator's integral (the pre-2026-11-18 behaviour). The actor sees only the
+            # estimate either way, so "gt" does not make the task easier — it makes the
+            # reward fitable, which is what the harder DR distribution needs.
+            if str(getattr(self.cfg, "rew_position_source", "gt")).lower() == "visodom":
+                d_reward = self._visodom_m().norm(dim=-1)
+            else:
+                d_reward = torch.norm(self._robot.data.root_pos_w[:, :2] - self._spawn_xy, dim=-1)
             position_term = present * torch.exp(
-                -(d_visodom ** 2) / (float(self.cfg.sigma_visodom_m) ** 2)
+                -(d_reward ** 2) / (float(self.cfg.sigma_visodom_m) ** 2)
+            )
+            # Fine twin. Only meaningful near zero, and that is the point: the estimator
+            # itself degrades far out (measured 0.586 m error at a 0.87 m excursion vs
+            # 1-6 mm while hovering), so the broad term owns the basin and this one owns
+            # the last millimetre.
+            position_fine_term = present * torch.exp(
+                -(d_reward ** 2) / (float(self.cfg.sigma_visodom_fine_m) ** 2)
             )
         else:
             position_term = anchor_term
+            position_fine_term = anchor_term
         w_flow = 0.0 if bool(self.cfg.ablate_flow) else float(self.cfg.rew_flow)
         w_anchor_vis = 0.0 if bool(self.cfg.ablate_template) else float(self.cfg.rew_anchor_vis)
         w_sim = 0.0 if bool(self.cfg.ablate_template) else float(self.cfg.rew_sim)
         w_yaw = 0.0 if bool(self.cfg.ablate_template) else float(self.cfg.rew_yaw_anchor)
         w_position = 0.0 if bool(self.cfg.ablate_visodom) else float(self.cfg.rew_anchor)
+        # Fine twins follow the same ablation switches as their broad counterparts, so a
+        # cue-removal run still removes the whole cue rather than half of it.
+        w_anchor_vis_fine = 0.0 if bool(self.cfg.ablate_template) else float(self.cfg.rew_anchor_vis_fine)
+        w_position_fine = 0.0 if bool(self.cfg.ablate_visodom) else float(self.cfg.rew_position_fine)
 
         # per-episode diagnostics (flushed in _reset_idx)
         self._ep_flow_rms_sum += flow_rms_n
@@ -1685,6 +2273,7 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
         self._ep_anchor_sum += d_anchor
         self._ep_anchor_vis_sum += self._anchor_disp_m
         self._ep_anchor_sim_sum += sim_term
+        self._ep_anchor_valid_sum += self._anchor_valid.to(torch.float32)
 
         depth = self._robot.data.root_pos_w[:, 2]
         depth_err = depth - self.cfg.starting_depth
@@ -1700,19 +2289,32 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
 
         alive = present
         # action smoothness on raw action (杆量), not remapped cmd_vel
-        smooth = torch.sum((self._actions - self._prev_actions) ** 2, dim=-1)
+        da = self._actions - self._prev_actions
+        smooth = torch.sum(da ** 2, dim=-1)
+        # Both terms below are BOUNDED, so neither can dominate the reward the way the old
+        # unbounded hinge did. rate_pen sits in [0, 1] and effort in [0, 1].
+        rate_scale = float(getattr(self.cfg, "action_rate_scale", 0.15))
+        rate_pen = torch.mean(1.0 - torch.exp(-((da / rate_scale) ** 2)), dim=-1)
+        effort = torch.mean(self._actions.abs(), dim=-1)
 
         rew = (
             w_flow * flow_term
             + w_anchor_vis * anchor_vis_term
+            + w_anchor_vis_fine * anchor_vis_fine_term
             + w_sim * sim_term
             + w_yaw * yaw_anchor_term
             + w_position * position_term
+            + w_position_fine * position_fine_term
             + self.cfg.rew_alive * alive
             + self.cfg.rew_depth * depth_term
             + self.cfg.rew_att * att_term
             - self.cfg.rew_action * smooth
+            - float(getattr(self.cfg, "rew_action_rate", 0.0)) * rate_pen
+            + float(getattr(self.cfg, "rew_effort", 0.0)) * torch.exp(-effort)
         )
+        self._ep_action_delta_sum += torch.sqrt(torch.mean(da ** 2, dim=-1))
+        self._ep_rate_pen_sum += rate_pen
+        self._ep_effort_sum += effort
         rew = torch.nan_to_num(rew, nan=0.0, posinf=5.0, neginf=0.0)
 
         # texture-lost streak
@@ -1765,9 +2367,18 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
             ep_len = self.episode_length_buf[ids].clamp(min=1).to(torch.float32)
             # End-of-episode horizontal displacement from spawn (before the parent reset
             # teleports the root back) — the real station-keeping metric.
-            d_end = torch.norm(
+            # Two distances on purpose — never redefine a logged key in place, or the
+            # runs that already emitted it stop being comparable:
+            #  - disp_end_m   : from the env ORIGIN. Semantics unchanged since the first
+            #                   ablation run, so the pre-DR table stays valid.
+            #  - disp_spawn_m : from THIS episode's spawn = the frame-1 template's home.
+            #                   This is the honest station-keeping error once
+            #                   dr_spawn_xy_range is nonzero: the origin-based value has a
+            #                   ~0.1 m floor that is spawn offset, not control error.
+            d_origin = torch.norm(
                 self._robot.data.root_pos_w[ids, :2] - self.scene.env_origins[ids, :2], dim=-1
             )
+            d_end = torch.norm(self._robot.data.root_pos_w[ids, :2] - self._spawn_xy[ids], dim=-1)
             # Visodom estimate at the same instant — logged next to the GT so the
             # estimator's error is on TensorBoard every episode.
             vo_end = self._visodom_m()[ids].norm(dim=-1)
@@ -1775,6 +2386,11 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
                 "flow_rms_n": float((self._ep_flow_rms_sum[ids] / ep_len).mean()),
                 "present_frac": float((self._ep_present_sum[ids] / ep_len).mean()),
                 "flow_term": float((self._ep_flow_term_sum[ids] / ep_len).mean()),
+                # Is the action-rate penalty actually biting? Without these two, "we
+                # added a smoothing term" would be an assumption, not a measurement.
+                "action_delta_rms": float((self._ep_action_delta_sum[ids] / ep_len).mean()),
+                "action_rate_pen": float((self._ep_rate_pen_sum[ids] / ep_len).mean()),
+                "effort_mean": float((self._ep_effort_sum[ids] / ep_len).mean()),
                 # Domain-randomization draw of this episode: you cannot tell a policy that
                 # copes with a 0.45 m/s beam current from one that only saw 0.2 m/s
                 # head-on unless the sampled current is on the same curve as disp_end_m.
@@ -1783,11 +2399,26 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
                     torch.atan2(self._dr_cur_dir[ids, 1], self._dr_cur_dir[ids, 0]).mean() * 57.2957795
                 ),
                 "disp_m": float((self._ep_anchor_sum[ids] / ep_len).mean()),
-                "disp_end_m": float(d_end.mean()),
+                # Legacy key: from the env origin, unchanged semantics since the first
+                # ablation run. Under spawn DR its floor is the spawn offset (~0.1 m).
+                "disp_end_m": float(d_origin.mean()),
+                # Honest station-keeping error: from this episode's spawn, which is where
+                # the frame-1 template was captured. Equals disp_end_m when DR is off.
+                "disp_spawn_m": float(d_end.mean()),
                 "visodom_end_m": float(vo_end.mean()),
                 "visodom_err_m": float((vo_end - d_end).abs().mean()),
+                # Calibration actually in force, so a sensitivity point is never guessed
+                # from the command line that produced it.
+                "visodom_f_err": float(self._visodom_f_err[ids].mean()),
+                "visodom_range_err": float(self._visodom_range_err[ids].mean()),
+                "cam_tilt_deg": (
+                    float(self._cam_tilt_deg[ids].abs().mean()) if hasattr(self, "_cam_tilt_deg") else 0.0
+                ),
                 "anchor_disp_m": float((self._ep_anchor_vis_sum[ids] / ep_len).mean()),
                 "anchor_sim": float((self._ep_anchor_sim_sum[ids] / ep_len).mean()),
+                # caps at 1.0 = template captured on time; 0 = capture refused all episode
+                # (textureless crop), in which case anchor_sim is 0 by construction.
+                "anchor_valid_frac": float((self._ep_anchor_valid_sum[ids] / ep_len).mean()),
                 "term_tex_lost": float(self._ep_cause[ids, 0].to(torch.float32).mean()),
                 "term_depth": float(self._ep_cause[ids, 1].to(torch.float32).mean()),
                 "term_att": float(self._ep_cause[ids, 2].to(torch.float32).mean()),
@@ -1796,9 +2427,13 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
             self._ep_flow_rms_sum[ids] = 0.0
             self._ep_present_sum[ids] = 0.0
             self._ep_flow_term_sum[ids] = 0.0
+            self._ep_action_delta_sum[ids] = 0.0
+            self._ep_rate_pen_sum[ids] = 0.0
+            self._ep_effort_sum[ids] = 0.0
             self._ep_anchor_sum[ids] = 0.0
             self._ep_anchor_vis_sum[ids] = 0.0
             self._ep_anchor_sim_sum[ids] = 0.0
+            self._ep_anchor_valid_sum[ids] = 0.0
             self._ep_cause[ids] = False
         try:
             DirectRLEnv._reset_idx(self, env_ids)
@@ -1809,6 +2444,38 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
         # Per-episode water draw (new current every dive) and spawn offsets: the ROV
         # starts at a hand-flown hover, so the captured frame 1 is not the nominal one.
         self._sample_domain_randomization(ids, per_episode=True)
+        # EVALUATION ONLY. The per-run knobs (thrust gain, drag, camera noise/brightness,
+        # compass bias, mount angle) are drawn once per env at init, so N episodes spread
+        # over 4 envs are really 4 hardware samples x N/4 episodes: the effective sample
+        # size is 4, not N, and every confidence interval computed from them is optimistic.
+        # Measured 2026-11-19 on the same K150k weights: env1 est_err median 9 mm vs env3
+        # 38 mm, end median 21 vs 50 -- that spread is the hardware draw, not the policy.
+        # Redrawing per episode turns each episode into an independent sample of the unit
+        # distribution, which is the quantity the gate is trying to estimate.
+        # Default False, so training behaviour is bit-identical to before.
+        if bool(getattr(self.cfg, "eval_redraw_per_run_dr", False)):
+            self._sample_domain_randomization(ids, per_episode=False)
+        # Hold the actuator delay for the whole episode: a fixed offset per dive, so the
+        # policy must compensate for a lag it cannot average away, exactly like the real
+        # vehicle whose delay does not change between control ticks.
+        _delay_max = int(getattr(self.cfg, "train_action_delay_max_steps", 0))
+        _delay_fix = int(getattr(self.cfg, "train_action_delay_fixed_steps", -1))
+        # The parent __init__ runs one _reset_idx before this subclass has built its buffers,
+        # so skip the draw there — the buffer already starts at zero, which is the same state.
+        if hasattr(self, "_act_delay_steps"):
+            if _delay_fix >= 0:
+                self._act_delay_steps[ids] = _delay_fix
+            elif _delay_max > 0:
+                self._act_delay_steps[ids] = torch.randint(
+                    0, _delay_max + 1, (int(ids.numel()),), device=self.device
+                )
+            else:
+                self._act_delay_steps[ids] = 0
+            self._action_hist[ids] = 0.0
+            if hasattr(self, "_vis_fresh"):
+                # Flag the reset so the vision ring buffer is refilled with the new first
+                # frame instead of serving the previous dive's imagery.
+                self._vis_fresh[ids] = True
         dr_on = bool(getattr(self.cfg, "dr_enable", False))
         _n = int(ids.numel())
         if dr_on and float(self.cfg.dr_spawn_xy_range) > 0.0:
@@ -1824,6 +2491,11 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
         self._default_root_state[ids, 0] = origins[:, 0] + _off[:, 0]
         self._default_root_state[ids, 1] = origins[:, 1] + _off[:, 1]
         self._default_root_state[ids, 2] = float(self.cfg.starting_depth) + _dz
+        # Remember where this episode's "home" is — the anchor is captured from here and
+        # disp_end_m is measured against it.
+        self._spawn_xy[ids, 0] = self._default_root_state[ids, 0]
+        self._spawn_xy[ids, 1] = self._default_root_state[ids, 1]
+        self._dr_spawn_depth[ids] = _dz
         # Spawn at the WORK attitude (level when level_attitude; free-floating trim
         # otherwise). Level is not a buoyancy equilibrium — the attitude PID carries
         # the leveling moment from step 0 (integrator pre-charged below).
@@ -1857,7 +2529,7 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
         # distance, de-rotation seeded at the spawn heading.
         self._visodom[ids] = 0.0
         self._visodom_x[ids] = 0.0
-        self._visodom_z[ids] = float(self.cfg.plane_distance)
+        self._visodom_z[ids] = float(self.cfg.plane_distance) * self._visodom_range_err[ids]
         self._visodom_yaw_prev[ids] = euler_xyz_from_quat(self._robot.data.root_quat_w[ids])[2]
         self._texture_count[ids] = 0.0
         self._prev_rgb_ok[ids] = False
@@ -1884,6 +2556,21 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
         if getattr(self, "_robot_usd", None) is not None:
             self._sync_robot_usd_pose()
 
+    def _apply_action_delay(self, actions):
+        """Return the command issued ``delay`` steps ago (per env, held for the episode).
+
+        Slot -1 is the newest command, so a delay of d reads slot max-d. Resetting the
+        history to zeros on episode reset means each dive starts from a standstill command
+        rather than inheriting the previous episode's thrust.
+        """
+        max_d = self._action_hist.shape[1] - 1
+        if max_d <= 0:
+            return actions
+        self._action_hist[:, :-1] = self._action_hist[:, 1:].clone()
+        self._action_hist[:, -1] = actions.to(self._action_hist.dtype)
+        idx = (max_d - self._act_delay_steps).view(-1, 1, 1).expand(-1, 1, 3)
+        return self._action_hist.gather(1, idx).squeeze(1).to(actions.dtype)
+
     def _pre_physics_step(self, actions):
         """v7 action: 3-D杆量 [surge, sway, yaw] ∈ [-1, 1].
 
@@ -1892,7 +2579,10 @@ class AUVTrackingV7FlowHoverGsrovEnv(AUVTrackingEnv):
         held by the retuned PI depth branch at starting_depth (first-frame depth).
         """
         self._prev_actions[:] = self._actions
+        actions = self._apply_action_delay(actions)
         self._actions[:] = torch.clip(actions, -1.0, 1.0)
+        # Exactly one vision push per control step; see _apply_vision_delay.
+        self._vis_push_needed = True
         # Normalize the raw joystick-like action to a bounded target velocity. The scale
         # maps unit policy actions to cmd_vel targets (m/s per horizontal axis, rad/s yaw)
         # — see cfg.cmd_vel_scale for why it must cover the ocean-current peak.

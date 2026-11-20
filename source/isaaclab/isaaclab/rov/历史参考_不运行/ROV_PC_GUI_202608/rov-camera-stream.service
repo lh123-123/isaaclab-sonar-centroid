@@ -1,0 +1,16 @@
+[Unit]
+Description=USST ROV USB camera MJPEG stream
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/usst
+ExecStart=/home/pi/usst/start_usb_camera_stream.sh
+Restart=always
+RestartSec=2
+TimeoutStopSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,74 @@
+[
+  {
+    "name": "ChibiOS",
+    "repo": "ArduPilot/ChibiOS",
+    "sha": "d103983f4362e5506bcf7062ccacf345fc0c0859",
+    "path": "modules/ChibiOS"
+  },
+  {
+    "name": "waf",
+    "repo": "ArduPilot/waf",
+    "sha": "35eadbb64e2052099a853b571e507c33032b392c",
+    "path": "modules/waf"
+  },
+  {
+    "name": "mavlink",
+    "repo": "ArduPilot/mavlink",
+    "sha": "288b907c384a892c8519bfe271682424b1e1a3a0",
+    "path": "modules/mavlink"
+  },
+  {
+    "name": "lwip",
+    "repo": "ArduPilot/lwip",
+    "sha": "a6bf350c679ed8ba042ad58bf81cc540d61bb605",
+    "path": "modules/lwip"
+  },
+  {
+    "name": "DSDL",
+    "repo": "DroneCAN/DSDL",
+    "sha": "04e0e818b06c180eb1720fcdf16484d0f12895ee",
+    "path": "modules/DroneCAN/DSDL"
+  },
+  {
+    "name": "libcanard",
+    "repo": "DroneCAN/libcanard",
+    "sha": "601ed35467e0ac38819df17cd7c918de19f62d58",
+    "path": "modules/DroneCAN/libcanard"
+  },
+  {
+    "name": "dronecan_dsdlc",
+    "repo": "DroneCAN/dronecan_dsdlc",
+    "sha": "de47a8972b7d8c59e50c3acfab5754db29798caa",
+    "path": "modules/DroneCAN/dronecan_dsdlc"
+  },
+  {
+    "name": "pydronecan",
+    "repo": "DroneCAN/pydronecan",
+    "sha": "08cda37aaf2958657399606653b99ceb5a6beae0",
+    "path": "modules/DroneCAN/pydronecan"
+  },
+  {
+    "name": "pymavlink",
+    "repo": "ArduPilot/pymavlink",
+    "sha": "ec06837a50688b5974094876c3c9d1b8bf86629d",
+    "path": "modules/mavlink/pymavlink"
+  },
+  {
+    "name": "CrashDebug",
+    "repo": "ardupilot/CrashDebug",
+    "sha": "599965086437137ec0fe66e185611f43f335f889",
+    "path": "modules/CrashDebug"
+  },
+  {
+    "name": "CrashCatcher",
+    "repo": "ardupilot/CrashCatcher",
+    "sha": "4cf6e11df3a081b0f573a7834ed8e1e4000af73e",
+    "path": "modules/CrashDebug/CrashCatcher"
+  },
+  {
+    "name": "littlefs",
+    "repo": "ArduPilot/littlefs",
+    "sha": "34be692aafaaf4319a18e415b08aa4332697408b",
+    "path": "modules/littlefs"
+  }
+]

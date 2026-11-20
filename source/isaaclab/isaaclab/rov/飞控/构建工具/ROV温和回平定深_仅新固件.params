@@ -1,0 +1,8 @@
+# 仅供 prepared_gentle_depth_20261008 固件使用；旧固件无 MOT_RP_MAX/MOT_DH_MAX
+# 定深垂推单台约5N的未标定保守试用值；15%是归一化输出比例，不是已验证的5N。
+# 只限制松开升降输入后的定深阶段；主动升降不受此项限制。若浮力失衡可能无法定深。
+1	1	ATC_ANG_RLL_P	2	9
+1	1	ATC_ANG_PIT_P	2	9
+1	1	MOT_RP_MAX	25	9
+1	1	MOT_DH_MAX	15	9
+1	1	MOT_ATT_PRIO	1	2

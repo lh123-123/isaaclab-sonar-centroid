@@ -1,0 +1,15 @@
+# Read back from the flashed board on 2026-10-04. Water acceptance still pending.
+# APJ SHA256: 1049c4e96d8e4aa81b21dffe5dd069395d4c4d1bf376110d13960d3b3353246b
+# Only enhancement parameters; preserves hardware mapping, direction, servo endpoints and PID.
+# STABILIZE / ALT_HOLD: centered tilt returns level, yaw release stops and holds heading.
+# MANUAL has no automatic attitude hold. Enable ALT_HOLD only after pressure/attitude checks.
+1	1	ROV_EN	1	2
+1	1	ROV_T_RATE	30	9
+1	1	ROV_T_ACC	90	9
+1	1	ROV_Y_RATE	45	9
+1	1	ROV_Y_ACC	120	9
+1	1	ROV_Y_LEAD	12	9
+1	1	ROV_IN_TMO	0.35	9
+1	1	MOT_ATT_PRIO	1	2
+1	1	MOT_DZ_PWM	50	4
+1	1	MOT_DZ_IN	0.01	9

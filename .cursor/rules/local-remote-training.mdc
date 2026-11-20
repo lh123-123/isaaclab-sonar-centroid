@@ -1,0 +1,59 @@
+---
+description: Local single Isaac run vs remote training host + file transfer routing
+alwaysApply: true
+---
+
+# 本机 / 远端训练分工（AUV / IsaacLab）
+
+## 1. 本机：同一时刻只允许一个 Isaac 进程
+
+- 本机（`pc`，tailscale `100.64.207.21`）GPU/显存与 Omniverse kit 文件锁限制，
+  **同一时刻只允许一个** Isaac Lab / Isaac Sim 进程（训练、eval、debug、play 任意一种都算）。
+- 不要并行起两个 `isaaclab.sh -p ...`，不要 GUI + headless 各开一个。
+- 详见 `single-isaac-terminal-process.mdc`；启动前用 `pgrep` 或
+  `./scripts/kill_isaac_lab_processes.sh` 确认干净，hook `.cursor/hooks/block-second-isaac.sh`
+  会拦截第二个进程。
+
+## 2. 远端训练机：raypc（lab / tsray）
+
+- 远端主机名 `raypc`，家目录同样是 `/home/lh`，同样有一份 `/home/lh/IsaacLab`，
+  训练脚本路径与本机一致（`scripts/train_auv_tracking_*.sh`）。
+- 显卡：`NVIDIA GeForce RTX 3090 24GB`（`nvidia-smi` 实测），可独立跑训练，不占本机单进程名额。
+- SSH 有两种走法，**按用途二选一，不混用**：
+
+| 用途 | Host 别名 | 实际地址 | 命令示例 |
+|---|---|---|---|
+| 跑训练 / 看日志 / `nvidia-smi` 等轻量交互 | `lab` | `47.101.175.205:8001`（公网） | `ssh lab '...'` |
+| 传文件（checkpoint / log / 大体积资产） | `tsray` | `100.97.55.12`（tailscale 内网） | `rsync -avz -e ssh <src> tsray:<dst>` |
+
+- `~/.ssh/config` 已配好（均用 `~/.ssh/id_ed25519_20260923`）：
+  `lab → 47.101.175.205:8001`，`tsray → 100.97.55.12`。
+  用户原话：`ssh -p 8001 lh@47.101.175.205` 等价于 `ssh lab`；**传文件一律走 tailscale**。
+- Agent 行为：
+  1. 在远端起训练：`ssh lab 'cd ~/IsaacLab && ./scripts/train_auv_tracking_sb3_sac_v4.sh --num_envs 8 --headless'`，
+     长跑加 `nohup ... > /home/lh/auv_v4_16env/train.log 2>&1 &` 或用已有 watchdog 脚本。
+  2. 查远端是否已有训练：`ssh lab 'pgrep -af "isaaclab.sh|train.py" | head'`，同样遵守"远端一次一个"，
+     起新的之前先确认/ kill 旧的。
+  3. 拉回 checkpoint / log：走 `tsray`，例如
+     `rsync -avz --progress tsray:~/IsaacLab/models/auv_tracking/v4_cam/ ./models/auv_tracking/v4_cam/`。
+  4. 往远端推代码/配置小改动：优先 `git push + ssh lab git pull`；二进制大文件才用 `rsync` 经 `tsray` 推。
+  5. **禁止用公网 IP（`lab` / `47.101.175.205`）传大文件**：慢且费流量，大文件只走 `tsray`。
+  6. 注意 `pkill -f` 自杀坑：模式串出现在自己 ssh 命令行里会把自己杀掉（exit 255），
+     用 `[t]rain[.]py` 括号技巧或精确 PID（见 `auv-tracking-holo-design.mdc` 第 8 条）。
+
+## 3. 速查
+
+```bash
+# 远端：看卡 / 看进程
+ssh lab 'nvidia-smi; echo ---; pgrep -af "isaaclab.sh|train.py" | head'
+
+# 远端：起训练（示例 v4-cam）
+ssh lab 'cd ~/IsaacLab && nohup ./scripts/train_auv_tracking_sb3_sac_v4.sh --num_envs 8 --headless > /home/lh/auv_v4_16env/train.log 2>&1 &'
+
+# 传文件一律走 tailscale（远端 100.97.55.12，本机 100.64.207.21）
+rsync -avz --progress tsray:~/IsaacLab/models/auv_tracking/v4_cam/ ./models/auv_tracking/v4_cam/
+rsync -avz --progress ./source/isaaclab_tasks/isaaclab_tasks/direct/isaac_auv_tracking/ tsray:~/IsaacLab/source/isaaclab_tasks/isaaclab_tasks/direct/isaac_auv_tracking/
+
+# tailscale 通了吗
+tailscale status | head -n 10
+```

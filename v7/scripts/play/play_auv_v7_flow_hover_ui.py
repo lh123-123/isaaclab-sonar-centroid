@@ -1,0 +1,241 @@
+#!/usr/bin/env python3
+"""GUI playback of a Direct-v7-flow-hover SAC checkpoint (deterministic).
+
+  ./isaaclab.sh -p v7/scripts/play/play_auv_v7_flow_hover_ui.py --checkpoint PATH
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import time
+
+from isaaclab.app import AppLauncher
+
+parser = argparse.ArgumentParser(description="Play v7 flow-hover checkpoint in the GUI.")
+parser.add_argument("--checkpoint", type=str, required=True)
+parser.add_argument("--num_envs", type=int, default=1)
+parser.add_argument("--steps", type=int, default=450)
+parser.add_argument("--pace_hz", type=float, default=15.0)
+parser.add_argument(
+    "--current",
+    type=str,
+    default="random",
+    help="Ocean-current field type. Training used random.",
+)
+parser.add_argument(
+    "--action_delay_fixed",
+    type=int,
+    default=3,
+    help="Fixed actuator delay in control steps. The 2026-11-16 run trained with 3 (=200 ms); 0 disables it.",
+)
+parser.add_argument(
+    "--visodom_cal_dr",
+    type=str,
+    default="off",
+    choices=["off", "on"],
+    help="Estimator-calibration DR. 'off' reproduces the 2026-11-16 run (focal/range 1.0, no per-episode bias).",
+)
+parser.add_argument(
+    "--save_frames",
+    type=str,
+    default="",
+    help="Directory to dump policy-camera frames as PNG. Works headless; empty disables.",
+)
+parser.add_argument(
+    "--frame_every",
+    type=int,
+    default=0,
+    help="Dump one frame every N control steps (only with --save_frames).",
+)
+AppLauncher.add_app_launcher_args(parser)
+args_cli = parser.parse_args()
+args_cli.enable_cameras = True
+
+app_launcher = AppLauncher(args_cli)
+
+import numpy as np
+import torch
+from stable_baselines3 import SAC
+
+import isaaclab_tasks  # noqa: F401
+import gymnasium as gym
+
+from isaaclab_rl.sb3 import Sb3VecEnvWrapper
+from isaaclab_tasks.direct.isaac_auv_tracking.agents.cam_encoder import MidCNNExtractor  # noqa: F401
+from isaaclab_tasks.direct.isaac_auv_tracking.agents.custom_sac_policy import CustomSACPolicy  # noqa: F401
+from isaaclab_tasks.direct.isaac_auv_tracking.auv_tracking_v7_flow_hover_gsrov_env import (
+    AUVTrackingV7FlowHoverGsrovEnvCfg,
+)
+from isaaclab_tasks.direct.isaac_auv_tracking.thruster_dynamics import GSROV_THRUSTERS
+
+_NAMES = [t[0] for t in GSROV_THRUSTERS]
+_OFFSETS = np.array([t[1] for t in GSROV_THRUSTERS], dtype=np.float64)
+_AXES = np.array([t[2] for t in GSROV_THRUSTERS], dtype=np.float64)
+
+
+def _thrust_n(pwm: np.ndarray, fwd: float, rev: float, deadband: float) -> np.ndarray:
+    out = np.where(pwm >= 0.0, fwd, rev) * pwm * np.abs(pwm)
+    return np.where(np.abs(pwm) < deadband, 0.0, out)
+
+
+def _print_thrusters(tag: str, pwm: np.ndarray, fwd: float, rev: float, deadband: float) -> None:
+    thrust = _thrust_n(pwm, fwd, rev, deadband)
+    forces = thrust[:, None] * _AXES
+    torques = np.cross(_OFFSETS, forces)
+    print(f"[v7-play] {tag} thrusters", flush=True)
+    for name, u, force in zip(_NAMES, pwm, thrust):
+        cap = fwd if u >= 0.0 else rev
+        pct = abs(force) / cap * 100.0 if cap > 0.0 else 0.0
+        print(f"[v7-play]   {name:>3}  pwm={u:+.3f}  {force:+7.2f} N  {pct:5.1f}%", flush=True)
+    print(
+        f"[v7-play]   sums  pitch={float(torques[:, 1].sum()):+.2f} N·m  "
+        f"heave={float(forces[:, 2].sum()):+.2f} N  "
+        f"surge={float(forces[:, 0].sum()):+.2f} N  sway={float(forces[:, 1].sum()):+.2f} N",
+        flush=True,
+    )
+
+cfg = AUVTrackingV7FlowHoverGsrovEnvCfg()
+cfg.scene.num_envs = args_cli.num_envs
+cfg.use_real_usd = False
+cfg.ocean_current.type = args_cli.current
+cfg.train_action_delay_fixed_steps = int(args_cli.action_delay_fixed)
+if args_cli.visodom_cal_dr == "off":
+    cfg.dr_visodom_focal_rel_range = (1.0, 1.0)
+    cfg.dr_visodom_range_rel_range = (1.0, 1.0)
+    cfg.dr_visodom_ep_scale_rel = 0.0
+    cfg.dr_visodom_bias_m = 0.0
+print(
+    f"[v7-play] cfg current={cfg.ocean_current.type} "
+    f"speed_dr={tuple(cfg.dr_current_speed_range)} full_circle={cfg.dr_current_dir_full_circle} "
+    f"vert_frac={cfg.dr_current_vert_frac} | delay={cfg.train_action_delay_fixed_steps} step(s) | "
+    f"visodom_cal_dr={args_cli.visodom_cal_dr} f_px_rel={tuple(cfg.dr_visodom_focal_rel_range)} "
+    f"range_rel={tuple(cfg.dr_visodom_range_rel_range)} ep_scale={cfg.dr_visodom_ep_scale_rel} "
+    f"bias={cfg.dr_visodom_bias_m}",
+    flush=True,
+)
+env = gym.make("Isaac-AUV-Tracking-Direct-v7-flow-hover", cfg=cfg)
+vec = Sb3VecEnvWrapper(env, fast_variant=True)
+raw = env.unwrapped
+
+if not args_cli.headless:
+    try:
+        from omni.kit.viewport.utility import get_viewport_from_window_name
+
+        cam_path = f"{raw.scene.env_prim_paths[0]}/Robot/{raw.cfg.view_camera_name}"
+        vp = get_viewport_from_window_name("Viewport")
+        if vp is not None:
+            vp.set_active_camera(cam_path)
+            print(f"[v7-play] viewport camera -> {cam_path}", flush=True)
+    except Exception as exc:
+        print(f"[v7-play] viewport camera switch failed: {exc}", flush=True)
+
+print(f"[v7-play] loading {args_cli.checkpoint}", flush=True)
+agent = SAC.load(args_cli.checkpoint, vec, print_system_info=False)
+obs = vec.reset()
+pos0 = raw._robot.data.root_pos_w[0].detach().cpu().clone()
+print("[v7-play] viewport open. deterministic policy, ocean current on.", flush=True)
+
+t0 = time.perf_counter()
+pace_dt = 1.0 / args_cli.pace_hz if args_cli.pace_hz > 0 else 0.0
+last_pos = pos0.clone()
+ep_rows: list[dict] = []
+pwm_samples: list[np.ndarray] = []
+deadband = float(getattr(raw.cfg, "thruster_deadband", 0.05))
+fwd_n = float(raw._thrust_fwd_n)
+rev_n = float(raw._thrust_rev_n)
+for step in range(args_cli.steps):
+    with torch.inference_mode():
+        actions, _ = agent.predict(obs, deterministic=True)
+    actions = np.asarray(actions, dtype=np.float32).reshape(vec.num_envs, -1)
+    with torch.inference_mode():
+        obs, rewards, dones, infos = vec.step(actions)
+    if pace_dt > 0.0:
+        sleep_for = (t0 + (step + 1) * pace_dt) - time.perf_counter()
+        if sleep_for > 0.0:
+            time.sleep(sleep_for)
+    if args_cli.save_frames and args_cli.frame_every > 0 and step % args_cli.frame_every == 0:
+        import cv2
+
+        os.makedirs(args_cli.save_frames, exist_ok=True)
+        frame, _ = raw._camera_rgb()
+        cv2.imwrite(
+            os.path.join(args_cli.save_frames, f"step_{step:04d}.png"),
+            cv2.cvtColor(frame[0].detach().cpu().numpy(), cv2.COLOR_RGB2BGR),
+        )
+    done = bool(np.asarray(dones).reshape(-1)[0])
+    # On the terminating step the env has already reset, so root_pos_w is the new spawn.
+    # last_pos is the pose after the previous control step.
+    if step % 30 == 0 and not done:
+        pos = raw._robot.data.root_pos_w[0].detach().cpu()
+        drift = pos - pos0
+        st = obs["state"][0] if isinstance(obs, dict) else obs[0]["state"]
+        st = np.asarray(st).reshape(-1)
+        flow_n = float(st[8])
+        pwm = raw._pwm[0].detach().cpu().numpy().copy()
+        pwm_samples.append(pwm)
+        print(
+            f"[v7-play] step={step:4d} rew={float(np.asarray(rewards).reshape(-1)[0]):.3f} "
+            f"act=({actions[0,0]:+.2f},{actions[0,1]:+.2f},{actions[0,2]:+.2f}) "
+            f"flow_n={flow_n:.4f} drift=({float(drift[0]):+.3f},{float(drift[1]):+.3f},{float(drift[2]):+.3f})",
+            flush=True,
+        )
+        _print_thrusters(f"step={step}", pwm, fwd_n, rev_n, deadband)
+        last_pos = pos.clone()
+    elif not done:
+        last_pos = raw._robot.data.root_pos_w[0].detach().cpu().clone()
+        pwm_samples.append(raw._pwm[0].detach().cpu().numpy().copy())
+    if done:
+        end = last_pos - pos0
+        ep = {}
+        if isinstance(infos, (list, tuple)) and infos:
+            ep = infos[0].get("episode") or {}
+        horiz = float(torch.linalg.norm(end[:2]))
+        print(
+            f"[v7-play] episode {len(ep_rows)} end step={step} "
+            f"len={ep.get('l', float('nan'))} rew={ep.get('r', float('nan'))} "
+            f"drift_mag={ep.get('drift_mag', float('nan'))} flow_n={ep.get('flow_rms_n', float('nan'))} "
+            f"log_disp_end={ep.get('disp_end_m', float('nan'))}m "
+            f"anchor_sim={ep.get('anchor_sim', float('nan'))} "
+            f"anchor_disp={ep.get('anchor_disp_m', float('nan'))}m "
+            f"disp=({float(end[0]):+.3f},{float(end[1]):+.3f},{float(end[2]):+.3f}) horiz={horiz:.3f}m "
+            f"timeout={ep.get('term_timeout', float('nan'))} att={ep.get('term_att', float('nan'))}",
+            flush=True,
+        )
+        if pwm_samples:
+            _print_thrusters(
+                f"episode {len(ep_rows)} mean",
+                np.mean(np.stack(pwm_samples), axis=0),
+                fwd_n,
+                rev_n,
+                deadband,
+            )
+        pwm_samples.clear()
+        ep_rows.append({
+            "horiz": horiz,
+            "z": float(end[2]),
+            "rew": ep.get("r"),
+            "drift_mag": ep.get("drift_mag"),
+            "disp_end": ep.get("disp_end_m"),
+            "anchor_sim": ep.get("anchor_sim"),
+            "anchor_disp": ep.get("anchor_disp_m"),
+        })
+        pos0 = raw._robot.data.root_pos_w[0].detach().cpu().clone()
+        last_pos = pos0.clone()
+
+if ep_rows:
+    horiz = np.array([r["horiz"] for r in ep_rows], dtype=np.float64)
+    rews = np.array([r["rew"] if r["rew"] is not None else np.nan for r in ep_rows], dtype=np.float64)
+    dm = np.array([r["drift_mag"] if r["drift_mag"] is not None else np.nan for r in ep_rows], dtype=np.float64)
+    de = np.array([r["disp_end"] if r["disp_end"] is not None else np.nan for r in ep_rows], dtype=np.float64)
+    asim = np.array([r["anchor_sim"] if r["anchor_sim"] is not None else np.nan for r in ep_rows], dtype=np.float64)
+    adisp = np.array([r["anchor_disp"] if r["anchor_disp"] is not None else np.nan for r in ep_rows], dtype=np.float64)
+    print(
+        f"[v7-play] SUMMARY n={len(ep_rows)} horiz={horiz.mean():.3f}±{horiz.std():.3f} m "
+        f"rew={np.nanmean(rews):.1f} drift_mag={np.nanmean(dm):.4f} log_disp_end={np.nanmean(de):.3f} m "
+        f"anchor_sim={np.nanmean(asim):.3f} anchor_disp={np.nanmean(adisp):.3f} m",
+        flush=True,
+    )
+
+env.close()
+print("[v7-play] done", flush=True)

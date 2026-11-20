@@ -1,0 +1,1396 @@
+diff --git a/ArduSub/Attitude.cpp b/ArduSub/Attitude.cpp
+--- a/ArduSub/Attitude.cpp
++++ b/ArduSub/Attitude.cpp
+@@ -47,6 +47,7 @@
+     uint32_t new_ekfYawReset_ms = ahrs.getLastYawResetAngle(yaw_angle_change_rad);
+     if (new_ekfYawReset_ms != ekfYawReset_ms) {
+         attitude_control.inertial_frame_reset();
++        g2.rov_pilot.shift_yaw(degrees(yaw_angle_change_rad));
+         ekfYawReset_ms = new_ekfYawReset_ms;
+     }
+ }
+diff --git a/ArduSub/GCS_MAVLink_Sub.cpp b/ArduSub/GCS_MAVLink_Sub.cpp
+--- a/ArduSub/GCS_MAVLink_Sub.cpp
++++ b/ArduSub/GCS_MAVLink_Sub.cpp
+@@ -12,7 +12,8 @@
+ 
+ uint8_t GCS_MAVLINK_Sub::base_mode() const
+ {
+-    uint8_t _base_mode = MAV_MODE_FLAG_STABILIZE_ENABLED;
++    uint8_t _base_mode = (sub.control_mode == Mode::Number::MANUAL ||
++                          sub.control_mode == Mode::Number::DEPTH_ONLY) ? 0 : MAV_MODE_FLAG_STABILIZE_ENABLED;
+ 
+     // work out the base_mode. This value is not very useful
+     // for APM, but we calculate it as best we can so a generic
+@@ -162,6 +163,24 @@
+     CHECK_PAYLOAD_SIZE(NAMED_VALUE_FLOAT);
+     send_named_float("RFTarget", sub.mode_surftrak.get_rangefinder_target_cm() * 0.01f);
+ 
++    CHECK_PAYLOAD_SIZE(NAMED_VALUE_FLOAT);
++    send_named_float("ROV_EN", sub.g2.rov_pilot.enabled() ? 1.0f : 0.0f);
++    CHECK_PAYLOAD_SIZE(NAMED_VALUE_FLOAT);
++    send_named_float("ROV_DONLY", 1.0f);
++    const auto &rov_target = sub.g2.rov_pilot.output();
++    const bool rov_active = sub.g2.rov_pilot.enabled() && rov_target.valid && sub.motors.armed() &&
++        (sub.control_mode == Mode::Number::STABILIZE || sub.control_mode == Mode::Number::ALT_HOLD);
++    CHECK_PAYLOAD_SIZE(NAMED_VALUE_FLOAT);
++    send_named_float("ROV_ACT", rov_active ? 1.0f : 0.0f);
++    if (rov_active) {
++        CHECK_PAYLOAD_SIZE(NAMED_VALUE_FLOAT);
++        send_named_float("ROV_PTGT", rov_target.pitch);
++        CHECK_PAYLOAD_SIZE(NAMED_VALUE_FLOAT);
++        send_named_float("ROV_YTGT", rov_target.yaw);
++    }
++
++
++
+     return true;
+ }
+ 
+@@ -413,6 +432,22 @@
+ MAV_RESULT GCS_MAVLINK_Sub::handle_command_int_packet(const mavlink_command_int_t &packet, const mavlink_message_t &msg)
+ {
+     switch(packet.command) {
++
++    // Private ROV command, sent as COMMAND_INT. Never calibrates the AHRS.
++    case MAV_CMD_USER_1: {
++        if (::fabsf(packet.param1 - 61007.0f) > 0.01f || ::fabsf(packet.param2 - 1.0f) > 0.01f) {
++            return MAV_RESULT_UNSUPPORTED;
++        }
++        const Vector3f gyro = sub.ahrs.get_gyro();
++        if (sub.motors.armed() || sub.control_mode != Mode::Number::MANUAL ||
++            !sub.ahrs.healthy() || !std::isfinite(gyro.length()) || gyro.length() > 0.05f) {
++            return MAV_RESULT_TEMPORARILY_REJECTED;
++        }
++        if (!sub.g2.rov_pilot.capture_level(sub.ahrs.roll_sensor * 0.01f, sub.ahrs.pitch_sensor * 0.01f)) {
++            return MAV_RESULT_DENIED;
++        }
++        return MAV_RESULT_ACCEPTED;
++    }
+ 
+     case MAV_CMD_CONDITION_YAW:
+         return handle_MAV_CMD_CONDITION_YAW(packet);
+@@ -841,6 +876,7 @@
+         &sub.mode_stabilize,
+         &sub.mode_acro,
+         &sub.mode_althold,
++        &sub.mode_depth_only,
+         &sub.mode_surftrak,
+         &sub.mode_poshold,
+         &sub.mode_auto,
+diff --git a/ArduSub/Parameters.cpp b/ArduSub/Parameters.cpp
+--- a/ArduSub/Parameters.cpp
++++ b/ArduSub/Parameters.cpp
+@@ -771,6 +771,10 @@
+     // Hidden param used as a flag for param conversion
+     // This allows one time conversion while allowing user to flash between versions with and without converted params
+     AP_GROUPINFO_FLAGS("PARM_FMT_VER", 24, ParametersG2, param_conversion_increment, 0, AP_PARAM_FLAG_HIDDEN),
++
++    // @Group: ROV_
++    // @Path: ROV_PilotHold.cpp
++    AP_SUBGROUPINFO(rov_pilot, "ROV_", 25, ParametersG2, ROV_PilotHold),
+ 
+     AP_GROUPEND
+ };
+diff --git a/ArduSub/Parameters.h b/ArduSub/Parameters.h
+--- a/ArduSub/Parameters.h
++++ b/ArduSub/Parameters.h
+@@ -407,6 +407,7 @@
+ 
+     AP_Float surface_nobaro_thrust;
+     Actuators actuators;
++    ROV_PilotHold rov_pilot;
+ 
+     // Used to track parameter conversions
+     AP_Int8 param_conversion_increment;
+diff --git a/ArduSub/ROV_DepthHold.h b/ArduSub/ROV_DepthHold.h
+new file mode 100644
+--- /dev/null
++++ b/ArduSub/ROV_DepthHold.h
+@@ -0,0 +1,59 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++// Release-reference latch only; native pressure/velocity/acceleration PID owns outputs.
++#pragma once
++#include <cmath>
++#include <cstdint>
++
++namespace ROV_DepthHold {
++struct Output {
++    float altitude_cm = 0;  // Up-positive relative to the native EKF origin
++    bool hold = false;
++    bool captured = false;
++    bool valid = false;
++};
++class Target {
++public:
++    void reset() { _out = Output{}; _moving = false; _reset_seen = false; _reset_ms = 0; }
++    const Output &output() const { return _out; }
++    Output update(float measured_up_cm, float climb_rate_cms,
++                  bool pilot_released, uint32_t reset_ms, float reset_down_m) {
++        if (!std::isfinite(measured_up_cm) || !std::isfinite(climb_rate_cms) ||
++            !std::isfinite(reset_down_m)) { reset(); return _out; }
++        // Shift ONLY an existing reference before capturing a same-tick release.
++        // A positive Down-frame origin shift is a negative Up-centimeter shift.
++        if (_reset_seen && reset_ms != 0 && reset_ms != _reset_ms && _out.valid) {
++            _out.altitude_cm -= reset_down_m * 100.0f;
++            if (!std::isfinite(_out.altitude_cm)) { reset(); return _out; }
++        }
++        _reset_seen = true;
++        _reset_ms = reset_ms;
++        _out.captured = false;
++        // THR_DZ can make climb_rate zero while the trigger is still
++        // physically pressed. Coast with the native zero-velocity trajectory
++        // until the actual neutral edge, then capture that tick's depth.
++        if (!pilot_released || ::fabsf(climb_rate_cms) >= 0.05f) {
++            _moving = true;
++            _out.hold = false;
++            _out.valid = true;
++            return _out;
++        }
++        if (_moving || !_out.valid) {
++            _out.altitude_cm = measured_up_cm;
++            _out.captured = true;
++        }
++        _moving = false;
++        _out.hold = _out.valid = true;
++        return _out;
++    }
++    void limit_target(float minimum_up_cm, float maximum_up_cm) {
++        if (!_out.hold || !std::isfinite(minimum_up_cm) ||
++            !std::isfinite(maximum_up_cm) || minimum_up_cm > maximum_up_cm) { return; }
++        _out.altitude_cm = ::fmaxf(minimum_up_cm, ::fminf(maximum_up_cm, _out.altitude_cm));
++    }
++private:
++    Output _out;
++    bool _moving = false;
++    bool _reset_seen = false;
++    uint32_t _reset_ms = 0;
++};
++} // namespace ROV_DepthHold
+diff --git a/ArduSub/ROV_PilotControl.cpp b/ArduSub/ROV_PilotControl.cpp
+new file mode 100644
+--- /dev/null
++++ b/ArduSub/ROV_PilotControl.cpp
+@@ -0,0 +1,34 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++#include "Sub.h"
++
++void Sub::rov_pilot_enter() {
++    const bool preserve = control_mode == Mode::Number::STABILIZE || control_mode == Mode::Number::ALT_HOLD;
++    g2.rov_pilot.enter(preserve, degrees(ahrs.get_roll_rad()), degrees(ahrs.get_pitch_rad()), degrees(ahrs.get_yaw_rad()));
++}
++
++bool Sub::rov_pilot_input_fresh() const {
++    if (!g2.rov_pilot.enabled()) { return true; }
++    bool failed = failsafe.pilot_input || failsafe.gcs;
++#if AP_SUB_RC_ENABLED
++    failed = failed || failsafe.radio;
++#endif
++    return g2.rov_pilot.pilot_fresh(AP_HAL::millis(), failsafe.last_pilot_input_ms,
++                                  failed);
++}
++
++bool Sub::rov_pilot_attitude(float roll_cd, float pitch_cd) {
++    ROV_PilotKernel::Output out;
++    // Reuse ArduSub's angle mapping/circular limit, including ALT_HOLD's
++    // dynamically permitted tilt, rather than bypassing its depth constraints.
++    const float angle_limit = attitude_control.lean_angle_max_cd() * 0.01f;
++    const bool valid = g2.rov_pilot.update(G_Dt, degrees(ahrs.get_roll_rad()),
++        degrees(ahrs.get_pitch_rad()), degrees(ahrs.get_yaw_rad()),
++        roll_cd * 0.01f / angle_limit,
++        pitch_cd * 0.01f / angle_limit,
++        channel_yaw->get_control_in() / float(ROLL_PITCH_INPUT_MAX),
++        rov_pilot_input_fresh(), angle_limit, out);
++    if (!valid) { return false; }
++    attitude_control.input_euler_angle_roll_pitch_yaw_cd(out.roll * 100.0f, out.pitch * 100.0f, out.yaw * 100.0f, true);
++    last_pilot_heading_rad = radians(out.yaw);
++    return true;
++}
+diff --git a/ArduSub/ROV_PilotHold.cpp b/ArduSub/ROV_PilotHold.cpp
+new file mode 100644
+--- /dev/null
++++ b/ArduSub/ROV_PilotHold.cpp
+@@ -0,0 +1,113 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++#include "ROV_PilotHold.h"
++
++const AP_Param::GroupInfo ROV_PilotHold::var_info[] = {
++    // @Param: EN
++    // @DisplayName: ROV smooth pilot angle control
++    // @Description: Smooth tilt targets, capture yaw on stick release, and capture depth on climb-input release in ALT_HOLD/DEPTH_ONLY. Native feedback brakes inertia. Disabled retains stock behavior.
++    // @Values: 0:Disabled,1:Enabled
++    // @User: Advanced
++    AP_GROUPINFO("EN", 1, ROV_PilotHold, _enable, 0),
++    // @Param: T_RATE
++    // @DisplayName: ROV tilt target maximum slew rate
++    // @Units: deg/s
++    // @Range: 1 90
++    // @User: Advanced
++    AP_GROUPINFO("T_RATE", 2, ROV_PilotHold, _tilt_rate, 30),
++    // @Param: T_ACC
++    // @DisplayName: ROV tilt target maximum acceleration
++    // @Units: deg/s/s
++    // @Range: 10 360
++    // @User: Advanced
++    AP_GROUPINFO("T_ACC", 3, ROV_PilotHold, _tilt_accel, 90),
++    // @Param: Y_RATE
++    // @DisplayName: ROV pilot maximum yaw rate
++    // @Units: deg/s
++    // @Range: 1 120
++    // @User: Advanced
++    AP_GROUPINFO("Y_RATE", 4, ROV_PilotHold, _yaw_rate, 45),
++    // @Param: Y_ACC
++    // @DisplayName: ROV yaw target maximum acceleration
++    // @Units: deg/s/s
++    // @Range: 10 720
++    // @User: Advanced
++    AP_GROUPINFO("Y_ACC", 5, ROV_PilotHold, _yaw_accel, 120),
++    // @Param: Y_LEAD
++    // @DisplayName: ROV maximum yaw target lead during a turn
++    // @Description: Caps target lead while turning; freezes measured heading on the first release sample, not after a settling delay.
++    // @Units: deg
++    // @Range: 1 30
++    // @User: Advanced
++    AP_GROUPINFO("Y_LEAD", 6, ROV_PilotHold, _yaw_lead, 12),
++    // @Param: IN_TMO
++    // @DisplayName: ROV pilot input neutralization timeout
++    // @Description: Neutralize manual demands after this interval without pilot input. Does not replace or disable the existing pilot/GCS failsafe.
++    // @Units: s
++    // @Range: 0.2 1
++    // @User: Advanced
++    AP_GROUPINFO("IN_TMO", 7, ROV_PilotHold, _input_timeout, 0.35f),
++    // @Param: T_ERR
++    // @DisplayName: ROV roll and pitch hold tolerance
++    // @Description: Allowed roll/pitch angle error around the pilot target. Within this band the native rate loop still damps rotation; beyond it the angle loop corrects toward the nearest band edge. Zero restores exact-angle hold.
++    // @Units: deg
++    // @Range: 0 5
++    // @User: Standard
++    AP_GROUPINFO("T_ERR", 8, ROV_PilotHold, _tilt_error, 0.5f),
++    // @Param: LVL_R
++    // @DisplayName: Native roll leveling target
++    // @Description: Absolute native roll angle returned to on stick release. Captured with pitch while disarmed by the ROV level target command. Does not change AHRS calibration. Combined roll/pitch magnitude must not exceed 10 degrees.
++    // @Units: deg
++    // @Range: -10 10
++    // @User: Advanced
++    AP_GROUPINFO("LVL_R", 9, ROV_PilotHold, _level_roll, 0),
++    // @Param: LVL_P
++    // @DisplayName: Native pitch leveling target
++    // @Description: Absolute native pitch leveling target. Combined roll/pitch magnitude must not exceed 10 degrees. Does not change measured attitude or heading.
++    // @Units: deg
++    // @Range: -10 10
++    // @User: Advanced
++    AP_GROUPINFO("LVL_P", 10, ROV_PilotHold, _level_pitch, 0),
++    AP_GROUPEND
++};
++
++ROV_PilotHold::ROV_PilotHold() { AP_Param::setup_object_defaults(this, var_info); }
++
++bool ROV_PilotHold::pilot_fresh(uint32_t now, uint32_t last_input, bool failed) const {
++    if (failed || last_input == 0 || !std::isfinite(_input_timeout.get()) || _input_timeout.get() < 0.2f ||
++        _input_timeout.get() > 1.0f) { return false; }
++    return uint32_t(now - last_input) <= uint32_t(_input_timeout.get() * 1000.0f);
++}
++
++bool ROV_PilotHold::update(float dt, float roll_deg, float pitch_deg, float yaw_deg,
++                         float roll_input, float pitch_input, float yaw_input,
++                         bool fresh, float stock_angle_limit_deg, ROV_PilotKernel::Output &out) {
++    if (!enabled()) { reset(); return false; }
++    ROV_PilotKernel::Config c;
++    c.level_roll = _level_roll.get();
++    c.level_pitch = _level_pitch.get();
++    c.pitch_rate = _tilt_rate.get();
++    c.pitch_accel = _tilt_accel.get();
++    c.pitch_limit = stock_angle_limit_deg;
++    c.yaw_rate = _yaw_rate.get();
++    c.yaw_accel = _yaw_accel.get();
++    c.target_lead = _yaw_lead.get();
++    out = _targets.update(dt, roll_deg, pitch_deg, yaw_deg, roll_input, pitch_input, yaw_input, fresh, c);
++    if (out.valid) {
++        const float configured_error = _tilt_error.get();
++        const float tolerance = std::isfinite(configured_error) && configured_error >= 0.0f &&
++            configured_error <= 5.0f ? configured_error : 0.0f;
++        out.roll = ROV_PilotKernel::tolerant_angle_target(out.roll, roll_deg, tolerance);
++        out.pitch = ROV_PilotKernel::tolerant_angle_target(out.pitch, pitch_deg, tolerance);
++    }
++    return out.valid;
++}
++
++bool ROV_PilotHold::capture_level(float roll, float pitch) {
++    if (!std::isfinite(roll) || !std::isfinite(pitch) || ::hypotf(roll, pitch) > 10.0f) {
++        return false;
++    }
++    _level_roll.set_and_save(roll);
++    _level_pitch.set_and_save(pitch);
++    reset();
++    return true;
++}
+diff --git a/ArduSub/ROV_PilotHold.h b/ArduSub/ROV_PilotHold.h
+new file mode 100644
+--- /dev/null
++++ b/ArduSub/ROV_PilotHold.h
+@@ -0,0 +1,32 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++#pragma once
++#include <AP_Param/AP_Param.h>
++#include "ROV_PilotKernel.h"
++#include "ROV_DepthHold.h"
++#include <cstdint>
++
++class ROV_PilotHold {
++public:
++    ROV_PilotHold();
++    static const AP_Param::GroupInfo var_info[];
++    bool capture_level(float roll, float pitch);
++    bool enabled() const { return _enable.get() == 1; }
++    void reset() { _targets.reset(); }
++    void enter(bool preserve, float roll_deg, float pitch_deg, float yaw_deg) {
++        _targets.enter(preserve && enabled(), roll_deg, pitch_deg, yaw_deg);
++    }
++    bool pilot_fresh(uint32_t now, uint32_t last_input, bool failed) const;
++    bool update(float dt, float roll_deg, float pitch_deg, float yaw_deg,
++                float roll_input, float pitch_input, float yaw_input,
++                bool fresh, float stock_angle_limit_deg, ROV_PilotKernel::Output &out);
++    void shift_yaw(float delta_deg) { _targets.shift_yaw(delta_deg); }
++    const ROV_PilotKernel::Output &output() const { return _targets.output(); }
++    // Shared across ALT_HOLD / DEPTH_ONLY. Attitude resets must NOT erase depth.
++    ROV_DepthHold::Target &depth_target() { return _depth; }
++private:
++    AP_Float _level_roll, _level_pitch;
++    AP_Int8 _enable;
++    AP_Float _tilt_rate, _tilt_accel, _yaw_rate, _yaw_accel, _yaw_lead, _input_timeout, _tilt_error;
++    ROV_PilotKernel::Targets _targets;
++    ROV_DepthHold::Target _depth;
++};
+diff --git a/ArduSub/ROV_PilotKernel.h b/ArduSub/ROV_PilotKernel.h
+new file mode 100644
+--- /dev/null
++++ b/ArduSub/ROV_PilotKernel.h
+@@ -0,0 +1,150 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++// Pilot target generator only. ArduSub retains ownership of all feedback loops.
++#pragma once
++#include <cmath>
++
++namespace ROV_PilotKernel {
++inline float clamp(float v, float lo, float hi) { return v < lo ? lo : v > hi ? hi : v; }
++inline float wrap(float v) {
++    v = ::fmodf(v + 180.0f, 360.0f);
++    return (v < 0 ? v + 360.0f : v) - 180.0f;
++}
++inline float approach(float v, float target, float step) {
++    return v + clamp(target - v, -step, step);
++}
++// Give the native angle/rate controller the closest point in the allowed
++// interval. Inside the interval this removes angle correction while retaining
++// angular-rate damping. The nominal target itself remains fixed.
++inline float tolerant_angle_target(float target, float measured, float tolerance) {
++    if (!std::isfinite(target) || !std::isfinite(measured) ||
++        !std::isfinite(tolerance) || tolerance < 0.0f || tolerance > 5.0f) {
++        return target;
++    }
++    return clamp(measured, target - tolerance, target + tolerance);
++}
++struct Config {
++    float level_roll = 0;
++    float level_pitch = 0;
++    float pitch_rate = 30.0f;
++    float pitch_accel = 90.0f;
++    float pitch_limit = 30.0f;
++    float target_lead = 12.0f;
++    float yaw_rate = 45.0f;
++    float yaw_accel = 120.0f;
++};
++struct Output {
++    float roll = 0;
++    float pitch = 0;
++    float yaw = 0;
++    float pitch_rate = 0;
++    float roll_rate = 0;
++    float yaw_rate = 0;
++    bool valid = false;
++};
++class Targets {
++public:
++    void reset() { _out = Output{}; _yaw_turning = false; }
++    void enter(bool preserve, float roll, float pitch, float yaw) {
++        if (preserve && _out.valid) { return; }
++        reset();
++        if (std::isfinite(roll) && std::isfinite(pitch) && std::isfinite(yaw)) {
++            _out.roll = roll;
++            _out.pitch = pitch;
++            _out.yaw = wrap(yaw);
++            _out.valid = true;
++        }
++    }
++    void shift_yaw(float delta) {
++        if (_out.valid && std::isfinite(delta)) { _out.yaw = wrap(_out.yaw + delta); }
++    }
++    const Output &output() const { return _out; }
++    Output update(float dt, float measured_roll, float measured_pitch, float measured_yaw,
++                  float roll_input, float pitch_input, float yaw_input, bool pilot_fresh, const Config &c) {
++        if (!valid_config(c) || !std::isfinite(dt) || dt <= 0 || dt > 0.1f ||
++            !std::isfinite(measured_roll) || !std::isfinite(measured_pitch) || !std::isfinite(measured_yaw) ||
++            !std::isfinite(roll_input) || !std::isfinite(pitch_input) || !std::isfinite(yaw_input)) {
++            // Never integrate a scheduler gap or bad data into a large target jump.
++            reset();
++            return _out;
++        }
++        if (!_out.valid) { enter(false, measured_roll, measured_pitch, measured_yaw); }
++        if (!pilot_fresh) {
++            roll_input = pitch_input = yaw_input = 0;
++            _out.yaw_rate = 0;
++            if (_yaw_turning) { _out.yaw = wrap(measured_yaw); }
++            _yaw_turning = false;
++        }
++        roll_input = clamp(roll_input, -1, 1);
++        pitch_input = clamp(pitch_input, -1, 1);
++        yaw_input = clamp(yaw_input, -1, 1);
++        const float tilt_input = ::hypotf(roll_input, pitch_input);
++        if (tilt_input > 1.0f) { roll_input /= tilt_input; pitch_input /= tilt_input; }
++        // Angle targets: centered pitch/roll ALWAYS return to level. Do not
++        // capture and hold their last angle when the operator releases a stick.
++        const float tilt_envelope = ::fmaxf(c.pitch_limit, ::hypotf(_out.roll, _out.pitch));
++        float desired_roll = c.level_roll + roll_input * c.pitch_limit;
++        float desired_pitch = c.level_pitch + pitch_input * c.pitch_limit;
++        const float desired_tilt = ::hypotf(desired_roll, desired_pitch);
++        if (desired_tilt > c.pitch_limit) {
++            desired_roll *= c.pitch_limit / desired_tilt;
++            desired_pitch *= c.pitch_limit / desired_tilt;
++        }
++        move_angle(_out.roll, _out.roll_rate, desired_roll, dt, c);
++        move_angle(_out.pitch, _out.pitch_rate, desired_pitch, dt, c);
++        const float tilt = ::hypotf(_out.roll, _out.pitch);
++        if (tilt > tilt_envelope) {
++            _out.roll *= tilt_envelope / tilt;
++            _out.pitch *= tilt_envelope / tilt;
++            _out.roll_rate = _out.pitch_rate = 0;
++        }
++        if (::fabsf(yaw_input) > 1.0e-6f) {
++            _yaw_turning = true;
++            _out.yaw_rate = approach(_out.yaw_rate, yaw_input * c.yaw_rate, c.yaw_accel * dt);
++            _out.yaw = wrap(_out.yaw + _out.yaw_rate * dt);
++        } else {
++            // Freeze the reference on the FIRST release sample, not at the end
++            // of a timed deceleration. Native angle/rate feedback brakes actual
++            // inertia and corrects overshoot back to this fixed heading.
++            if (_yaw_turning) { _out.yaw = wrap(measured_yaw); }
++            _out.yaw_rate = 0;
++            _yaw_turning = false;
++        }
++        // Restrict yaw target lead only during a turn; while holding, never
++        // re-capture a disturbed measured heading, which would silently drift.
++        if (::fabsf(yaw_input) > 1.0e-6f) {
++            _out.yaw = wrap(measured_yaw + clamp(wrap(_out.yaw - measured_yaw), -c.target_lead, c.target_lead));
++        }
++        return _out;
++    }
++private:
++    static void move_angle(float &angle, float &rate, float desired, float dt, const Config &c) {
++        const float error = desired - angle;
++        const float braking_speed = ::sqrtf(2.0f * c.pitch_accel * ::fabsf(error));
++        const float desired_rate = ::copysignf(::fminf(c.pitch_rate, braking_speed), error);
++        rate = approach(rate, desired_rate, c.pitch_accel * dt);
++        const float next = angle + rate * dt;
++        // Crossing a newly moved goal while still moving quickly is NOT an
++        // instruction to instantaneously drop velocity. Decelerate first.
++        const bool reached = error * (desired - next) <= 0 || ::fabsf(error) < 0.001f;
++        if (reached && ::fabsf(rate) <= c.pitch_accel * dt + 0.0001f) {
++            angle = desired;
++            rate = 0;
++        } else {
++            const float bounded = clamp(next, ::fminf(angle, -c.pitch_limit), ::fmaxf(angle, c.pitch_limit));
++            if (::fabsf(bounded - next) > 1.0e-6f) { rate = 0; }
++            angle = bounded;
++        }
++    }
++    static bool valid_config(const Config &c) {
++        return std::isfinite(c.level_roll) && std::isfinite(c.level_pitch) &&
++            ::hypotf(c.level_roll, c.level_pitch) <= 10.0f && std::isfinite(c.pitch_rate) && c.pitch_rate >= 1 && c.pitch_rate <= 90 &&
++            std::isfinite(c.pitch_accel) && c.pitch_accel >= 10 && c.pitch_accel <= 360 &&
++            std::isfinite(c.pitch_limit) && c.pitch_limit >= 10 && c.pitch_limit <= 60 &&
++            std::isfinite(c.target_lead) && c.target_lead >= 1 && c.target_lead <= 30 &&
++            std::isfinite(c.yaw_rate) && c.yaw_rate >= 1 && c.yaw_rate <= 120 &&
++            std::isfinite(c.yaw_accel) && c.yaw_accel >= 10 && c.yaw_accel <= 720;
++    }
++    Output _out;
++    bool _yaw_turning = false;
++};
++} // namespace ROV_PilotKernel
+diff --git a/ArduSub/Sub.cpp b/ArduSub/Sub.cpp
+--- a/ArduSub/Sub.cpp
++++ b/ArduSub/Sub.cpp
+@@ -181,7 +181,7 @@
+     pos_control.set_dt_s(last_loop_time_s);
+ 
+     //don't run rate controller in manual or motordetection modes
+-    if (control_mode != Mode::Number::MANUAL && control_mode != Mode::Number::MOTOR_DETECT) {
++    if (control_mode != Mode::Number::MANUAL && control_mode != Mode::Number::MOTOR_DETECT && control_mode != Mode::Number::DEPTH_ONLY) {
+         // run low level rate controllers that only require IMU data and set loop time
+         attitude_control.rate_controller_run();
+     }
+diff --git a/ArduSub/Sub.h b/ArduSub/Sub.h
+--- a/ArduSub/Sub.h
++++ b/ArduSub/Sub.h
+@@ -70,6 +70,7 @@
+ #include "config.h"
+ #include "GCS_MAVLink_Sub.h"
+ #include "RC_Channel_Sub.h"         // RC Channel Library
++#include "ROV_PilotHold.h"
+ #include "Parameters.h"
+ #include "AP_Arming_Sub.h"
+ #include "GCS_Sub.h"
+@@ -114,6 +115,7 @@
+     friend class ModeStabilize;
+     friend class ModeAcro;
+     friend class ModeAlthold;
++    friend class ModeDepthOnly;
+     friend class ModeSurftrak;
+     friend class ModeGuided;
+     friend class ModePoshold;
+@@ -396,6 +398,9 @@
+     static const AP_Param::Info var_info[];
+     static const struct LogStructure log_structure[];
+ 
++    void rov_pilot_enter();
++    bool rov_pilot_input_fresh() const;
++    bool rov_pilot_attitude(float roll_cd, float pitch_cd);
+     void run_rate_controller();
+     void fifty_hz_loop();
+     void update_batt_compass(void);
+@@ -623,6 +628,7 @@
+     ModeStabilize mode_stabilize;
+     ModeAcro mode_acro;
+     ModeAlthold mode_althold;
++    ModeDepthOnly mode_depth_only;
+     ModeAuto mode_auto;
+     ModeGuided mode_guided;
+     ModePoshold mode_poshold;
+diff --git a/ArduSub/mode.cpp b/ArduSub/mode.cpp
+--- a/ArduSub/mode.cpp
++++ b/ArduSub/mode.cpp
+@@ -35,6 +35,9 @@
+     case Mode::Number::ACRO:
+         ret = &mode_acro;
+         break;
++    case Mode::Number::DEPTH_ONLY:
++        ret = &mode_depth_only;
++        break;
+     case Mode::Number::ALT_HOLD:
+         ret = &mode_althold;
+         break;
+@@ -144,6 +147,7 @@
+ #endif  // HAL_MOUNT_ENABLED
+     }
+     motors.set_max_throttle(1.0f);
++    motors.set_depth_hold_active(false);
+ }
+ 
+ bool Sub::set_mode(const uint8_t new_mode, const ModeReason reason)
+@@ -165,6 +169,7 @@
+         camera_mount.set_mode_to_default();
+ #endif  // HAL_MOUNT_ENABLED
+     motors.set_max_throttle(1.0f);
++    motors.set_depth_hold_active(false);
+ }
+ 
+ // notify_flight_mode - sets notify object based on current flight mode.  Only used for OreoLED notify device
+diff --git a/ArduSub/mode.h b/ArduSub/mode.h
+--- a/ArduSub/mode.h
++++ b/ArduSub/mode.h
+@@ -50,7 +50,8 @@
+         POSHOLD =      16,  // automatic position hold with manual override, with automatic throttle
+         MANUAL =       19,  // Pass-through input with no stabilization
+         MOTOR_DETECT = 20,  // Automatically detect motors orientation
+-        SURFTRAK =     21   // Track distance above seafloor (hold range)
++        SURFTRAK =     21,  // Track distance above seafloor (hold range)
++        DEPTH_ONLY =   22   // Private pinned ROV mode: pressure hold, manual attitude
+         // Mode number 30 reserved for "offboard" for external/lua control.
+     };
+ 
+@@ -214,6 +215,18 @@
+     Mode::Number number() const override { return Mode::Number::ALT_HOLD; }
+ };
+ 
++
++class ModeDepthOnly : public ModeAlthold
++{
++public:
++    using ModeAlthold::ModeAlthold;
++    bool init(bool ignore_checks) override;
++    void run() override;
++protected:
++    const char *name() const override { return "Depth Only"; }
++    const char *name4() const override { return "DPNO"; }
++    Mode::Number number() const override { return Mode::Number::DEPTH_ONLY; }
++};
+ 
+ class ModeSurftrak : public ModeAlthold
+ {
+diff --git a/ArduSub/mode_althold.cpp b/ArduSub/mode_althold.cpp
+--- a/ArduSub/mode_althold.cpp
++++ b/ArduSub/mode_althold.cpp
+@@ -13,9 +13,14 @@
+     position_control->D_set_correction_speed_accel_cm(sub.get_pilot_speed_dn(), g.pilot_speed_up, g.pilot_accel_z);
+ 
+     // initialise position and desired velocity
+-    position_control->D_init_controller();
++    // Preserve the existing depth target when toggling attitude during depth hold.
++    if (sub.control_mode != Mode::Number::ALT_HOLD && sub.control_mode != Mode::Number::DEPTH_ONLY) {
++        position_control->D_init_controller();
++        g2.rov_pilot.depth_target().reset();
++    }
+ 
+     sub.last_pilot_heading_rad = ahrs.get_yaw_rad();
++    sub.rov_pilot_enter();
+ 
+     return true;
+ }
+@@ -44,6 +49,7 @@
+         attitude_control->relax_attitude_controllers();
+         position_control->D_relax_controller(motors.get_throttle_hover());
+         sub.last_pilot_heading_rad = ahrs.get_yaw_rad();
++        g2.rov_pilot.reset();
+         return;
+     }
+ 
+@@ -53,7 +59,8 @@
+     float target_roll, target_pitch;
+ 
+     // Check if set_attitude_target_no_gps is valid
+-    if (tnow - sub.set_attitude_target_no_gps.last_message_ms < 5000) {
++    if (sub.set_attitude_target_no_gps.last_message_ms != 0 && tnow - sub.set_attitude_target_no_gps.last_message_ms < 5000) {
++        g2.rov_pilot.reset();
+         float target_yaw;
+         Quaternion(
+             sub.set_attitude_target_no_gps.packet.q
+@@ -72,48 +79,74 @@
+ 
+     sub.get_pilot_desired_lean_angles(channel_roll->get_control_in(), channel_pitch->get_control_in(), target_roll, target_pitch, attitude_control->get_althold_lean_angle_max_cd());
+ 
+-    // get pilot's desired yaw rate
+-    float yaw_input = channel_yaw->pwm_to_angle_dz_trim(channel_yaw->get_dead_zone() * sub.gain, channel_yaw->get_radio_trim());
+-    float target_yaw_rate = sub.get_pilot_desired_yaw_rate(yaw_input);
++    if (!sub.rov_pilot_attitude(target_roll, target_pitch)) {
++        if (!sub.rov_pilot_input_fresh()) { target_roll = target_pitch = 0.0f; }
++        // get pilot's desired yaw rate
++        float yaw_input = sub.rov_pilot_input_fresh() ? channel_yaw->pwm_to_angle_dz_trim(channel_yaw->get_dead_zone() * sub.gain, channel_yaw->get_radio_trim()) : 0.0f;
++        float target_yaw_rate = sub.get_pilot_desired_yaw_rate(yaw_input);
+ 
+-    // call attitude controller
+-    if (!is_zero(target_yaw_rate)) { // call attitude controller with rate yaw determined by pilot input
+-        attitude_control->input_euler_angle_roll_pitch_euler_rate_yaw_cd(target_roll, target_pitch, target_yaw_rate);
+-        sub.last_pilot_heading_rad = ahrs.get_yaw_rad();
+-        sub.last_pilot_yaw_input_ms = tnow; // time when pilot last changed heading
++        // call attitude controller
++        if (!is_zero(target_yaw_rate)) { // call attitude controller with rate yaw determined by pilot input
++            attitude_control->input_euler_angle_roll_pitch_euler_rate_yaw_cd(target_roll, target_pitch, target_yaw_rate);
++            sub.last_pilot_heading_rad = ahrs.get_yaw_rad();
++            sub.last_pilot_yaw_input_ms = tnow; // time when pilot last changed heading
+ 
+-    } else { // hold current heading
++        } else { // hold current heading
+ 
+-        // this check is required to prevent bounce back after very fast yaw maneuvers
+-        // the inertia of the vehicle causes the heading to move slightly past the point when pilot input actually stopped
+-        if (tnow < sub.last_pilot_yaw_input_ms + 250) { // give 250ms to slow down, then set target heading
+-            target_yaw_rate = 0; // Stop rotation on yaw axis
++            // this check is required to prevent bounce back after very fast yaw maneuvers
++            // the inertia of the vehicle causes the heading to move slightly past the point when pilot input actually stopped
++            if (tnow < sub.last_pilot_yaw_input_ms + 250) { // give 250ms to slow down, then set target heading
++                target_yaw_rate = 0; // Stop rotation on yaw axis
+ 
+-            // call attitude controller with target yaw rate = 0 to decelerate on yaw axis
+-            attitude_control->input_euler_angle_roll_pitch_euler_rate_yaw_cd(target_roll, target_pitch, target_yaw_rate);
+-            sub.last_pilot_heading_rad = ahrs.get_yaw_rad(); // update heading to hold
++                // call attitude controller with target yaw rate = 0 to decelerate on yaw axis
++                attitude_control->input_euler_angle_roll_pitch_euler_rate_yaw_cd(target_roll, target_pitch, target_yaw_rate);
++                sub.last_pilot_heading_rad = ahrs.get_yaw_rad(); // update heading to hold
+ 
+-        } else { // call attitude controller holding absolute bearing
+-            attitude_control->input_euler_angle_roll_pitch_yaw_cd(target_roll, target_pitch, rad_to_cd(sub.last_pilot_heading_rad), true);
++            } else { // call attitude controller holding absolute bearing
++                attitude_control->input_euler_angle_roll_pitch_yaw_cd(target_roll, target_pitch, rad_to_cd(sub.last_pilot_heading_rad), true);
++            }
+         }
+     }
++
+ }
+ 
+ void ModeAlthold::run_post()
+ {
+-    motors.set_forward(channel_forward->norm_input());
+-    motors.set_lateral(channel_lateral->norm_input());
++    motors.set_forward(sub.rov_pilot_input_fresh() ? channel_forward->norm_input() : 0.0f);
++    motors.set_lateral(sub.rov_pilot_input_fresh() ? channel_lateral->norm_input() : 0.0f);
+ }
+ 
+ void ModeAlthold::control_depth() {
++    const bool release_hold = g2.rov_pilot.enabled() &&
++        (sub.control_mode == Mode::Number::ALT_HOLD || sub.control_mode == Mode::Number::DEPTH_ONLY);
++    if (release_hold && !motors.armed()) {
++        // run_pre() returning while disarmed does not exit ModeAlthold::run().
++        // Do not resurrect a target after its controller has been relaxed.
++        g2.rov_pilot.depth_target().reset();
++        motors.set_depth_hold_active(false);
++        return;
++    }
+     // return 0.2f when at the surface to p
+     // scale linearly between 0.2f and 1.0f as we approach the surface
+     float distance_to_surface = (g.surface_depth - inertial_nav.get_position_z_up_cm()) * 0.01f;
+     distance_to_surface = constrain_float(distance_to_surface, 0.0f, 1.0f);
+     motors.set_max_throttle(g.surface_max_throttle + (1.0f - g.surface_max_throttle) * distance_to_surface);
+ 
+-    float target_climb_rate_cms = sub.get_pilot_desired_climb_rate(channel_throttle->get_control_in());
++    const bool pilot_input_fresh = sub.rov_pilot_input_fresh();
++    const float throttle_control = pilot_input_fresh ? channel_throttle->get_control_in() : channel_throttle->get_control_mid();
++    float target_climb_rate_cms = pilot_input_fresh ? sub.get_pilot_desired_climb_rate(throttle_control) : 0.0f;
+     target_climb_rate_cms = constrain_float(target_climb_rate_cms, -sub.get_pilot_speed_dn(), g.pilot_speed_up);
++    // THR_DZ is much wider than the PC trigger's actual neutral. Distinguish
++    // "zero requested climb" from "trigger fully released" for reference
++    // capture, without weakening the existing zero-climb output cap.
++    // A stale pilot stream is treated as released; it may never retain a
++    // previous nonzero climb request. 5 units is 1% of half travel.
++    const bool pilot_released = fabsf(target_climb_rate_cms) < 0.05f &&
++        (!pilot_input_fresh || fabsf(throttle_control - channel_throttle->get_control_mid()) <= 5.0f);
++    // Preserve the previous cap whenever requested climb is zero, including
++    // the narrow interval before the trigger reaches exact neutral.
++    // The allocator reports saturation back to the native depth PID.
++    motors.set_depth_hold_active(fabsf(target_climb_rate_cms) < 0.05f);
+ 
+     // desired_climb_rate returns 0 when within the deadzone.
+     //we allow full control to the pilot, but as soon as there's no input, we handle being at surface/bottom
+@@ -125,6 +158,30 @@
+         }
+     }
+ 
+-    position_control->D_set_pos_target_from_climb_rate_cms(target_climb_rate_cms);
++    if (release_hold) {
++        float reset_down_m = 0.0f;
++        const uint32_t reset_ms = ahrs.getLastPosDownReset(reset_down_m);
++        auto &depth = g2.rov_pilot.depth_target();
++        const auto target = depth.update(inertial_nav.get_position_z_up_cm(),
++                                         target_climb_rate_cms, pilot_released, reset_ms, reset_down_m);
++        if (target.valid && target.hold) {
++            // Safety overrides the release reference near the surface/bottom.
++            // Store the override so departing the boundary cannot revive an
++            // old unsafe reference. Both remain Up-positive centimeters.
++            if (sub.ap.at_surface) {
++                depth.limit_target(-1.0e20f, g.surface_depth);
++            } else if (sub.ap.at_bottom) {
++                depth.limit_target(inertial_nav.get_position_z_up_cm() + 10.0f, 1.0e20f);
++            }
++            // A FIXED reference, not climb(0) which integrates deceleration.
++            // Native jerk/accel shaping and pressure/velocity PID brake inertia.
++            position_control->set_alt_target_with_slew_cm(depth.output().altitude_cm);
++        } else {
++            position_control->D_set_pos_target_from_climb_rate_cms(target.valid ? target_climb_rate_cms : 0.0f);
++        }
++    } else {
++        g2.rov_pilot.depth_target().reset();
++        position_control->D_set_pos_target_from_climb_rate_cms(target_climb_rate_cms);
++    }
+     position_control->D_update_controller();
+ }
+diff --git a/ArduSub/mode_depth_only.cpp b/ArduSub/mode_depth_only.cpp
+new file mode 100644
+--- /dev/null
++++ b/ArduSub/mode_depth_only.cpp
+@@ -0,0 +1,38 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++#include "Sub.h"
++
++bool ModeDepthOnly::init(bool ignore_checks)
++{
++    if (!ModeAlthold::init(ignore_checks)) {
++        return false;
++    }
++    g2.rov_pilot.reset();
++    attitude_control->relax_attitude_controllers();
++    // Angle-demand inputs become direct torque demands. Neutralize the transition.
++    sub.set_neutral_controls();
++    return true;
++}
++
++void ModeDepthOnly::run()
++{
++    if (!motors.armed()) {
++        motors.set_desired_spool_state(AP_Motors::DesiredSpoolState::GROUND_IDLE);
++        attitude_control->set_throttle_out(NEUTRAL_THROTTLE, true, g.throttle_filt);
++        attitude_control->relax_attitude_controllers();
++        position_control->D_relax_controller(motors.get_throttle_hover());
++        g2.rov_pilot.reset();
++        g2.rov_pilot.depth_target().reset();
++        motors.set_depth_hold_active(false);
++        return;
++    }
++    motors.set_desired_spool_state(AP_Motors::DesiredSpoolState::THROTTLE_UNLIMITED);
++    // ArduSub's pressure/vertical velocity loop owns throttle. No angle or rate hold.
++    position_control->D_set_max_speed_accel_cm(sub.get_pilot_speed_dn(), g.pilot_speed_up, g.pilot_accel_z);
++    control_depth();
++    const bool fresh = sub.rov_pilot_input_fresh();
++    motors.set_roll(fresh ? channel_roll->norm_input() : 0.0f);
++    motors.set_pitch(fresh ? channel_pitch->norm_input() : 0.0f);
++    motors.set_yaw(fresh ? channel_yaw->norm_input() * g.acro_yaw_p / ACRO_YAW_P : 0.0f);
++    motors.set_forward(fresh ? channel_forward->norm_input() : 0.0f);
++    motors.set_lateral(fresh ? channel_lateral->norm_input() : 0.0f);
++}
+diff --git a/ArduSub/mode_stabilize.cpp b/ArduSub/mode_stabilize.cpp
+--- a/ArduSub/mode_stabilize.cpp
++++ b/ArduSub/mode_stabilize.cpp
+@@ -5,6 +5,7 @@
+     // set target altitude to zero for reporting
+     position_control->set_pos_desired_U_cm(0);
+     sub.last_pilot_heading_rad = ahrs.get_yaw_rad();
++    sub.rov_pilot_enter();
+ 
+     return true;
+     return true;
+@@ -21,6 +22,7 @@
+         attitude_control->set_throttle_out(NEUTRAL_THROTTLE,true,g.throttle_filt);
+         attitude_control->relax_attitude_controllers();
+         sub.last_pilot_heading_rad = ahrs.get_yaw_rad();
++        g2.rov_pilot.reset();
+         return;
+     }
+ 
+@@ -31,39 +33,41 @@
+     // TODO2: move into mode.h
+     sub.get_pilot_desired_lean_angles(channel_roll->get_control_in(), channel_pitch->get_control_in(), target_roll, target_pitch, attitude_control->lean_angle_max_cd());
+ 
+-    // get pilot's desired yaw rate
+-    float yaw_input = channel_yaw->pwm_to_angle_dz_trim(channel_yaw->get_dead_zone() * sub.gain, channel_yaw->get_radio_trim());
+-    float target_yaw_rate = sub.get_pilot_desired_yaw_rate(yaw_input);
++    if (!sub.rov_pilot_attitude(target_roll, target_pitch)) {
++        if (!sub.rov_pilot_input_fresh()) { target_roll = target_pitch = 0.0f; }
++        // get pilot's desired yaw rate
++        float yaw_input = sub.rov_pilot_input_fresh() ? channel_yaw->pwm_to_angle_dz_trim(channel_yaw->get_dead_zone() * sub.gain, channel_yaw->get_radio_trim()) : 0.0f;
++        float target_yaw_rate = sub.get_pilot_desired_yaw_rate(yaw_input);
+ 
+-    // call attitude controller
+-    // update attitude controller targets
++        // call attitude controller
++        // update attitude controller targets
+ 
+-    if (!is_zero(target_yaw_rate)) { // call attitude controller with rate yaw determined by pilot input
+-        attitude_control->input_euler_angle_roll_pitch_euler_rate_yaw_cd(target_roll, target_pitch, target_yaw_rate);
+-        sub.last_pilot_heading_rad = ahrs.get_yaw_rad();
+-        sub.last_pilot_yaw_input_ms = tnow; // time when pilot last changed heading
++        if (!is_zero(target_yaw_rate)) { // call attitude controller with rate yaw determined by pilot input
++            attitude_control->input_euler_angle_roll_pitch_euler_rate_yaw_cd(target_roll, target_pitch, target_yaw_rate);
++            sub.last_pilot_heading_rad = ahrs.get_yaw_rad();
++            sub.last_pilot_yaw_input_ms = tnow; // time when pilot last changed heading
+ 
+-    } else { // hold current heading
++        } else { // hold current heading
+ 
+-        // this check is required to prevent bounce back after very fast yaw maneuvers
+-        // the inertia of the vehicle causes the heading to move slightly past the point when pilot input actually stopped
+-        if (tnow < sub.last_pilot_yaw_input_ms + 250) { // give 250ms to slow down, then set target heading
+-            target_yaw_rate = 0;  // Stop rotation on yaw axis
++            // this check is required to prevent bounce back after very fast yaw maneuvers
++            // the inertia of the vehicle causes the heading to move slightly past the point when pilot input actually stopped
++            if (tnow < sub.last_pilot_yaw_input_ms + 250) { // give 250ms to slow down, then set target heading
++                target_yaw_rate = 0;  // Stop rotation on yaw axis
+ 
+-            // call attitude controller with target yaw rate = 0 to decelerate on yaw axis
+-            attitude_control->input_euler_angle_roll_pitch_euler_rate_yaw_cd(target_roll, target_pitch, target_yaw_rate);
+-            sub.last_pilot_heading_rad = ahrs.get_yaw_rad(); // update heading to hold
++                // call attitude controller with target yaw rate = 0 to decelerate on yaw axis
++                attitude_control->input_euler_angle_roll_pitch_euler_rate_yaw_cd(target_roll, target_pitch, target_yaw_rate);
++                sub.last_pilot_heading_rad = ahrs.get_yaw_rad(); // update heading to hold
+ 
+-        } else { // call attitude controller holding absolute absolute bearing
+-            attitude_control->input_euler_angle_roll_pitch_yaw_cd(target_roll, target_pitch, rad_to_cd(sub.last_pilot_heading_rad), true);
++            } else { // call attitude controller holding absolute absolute bearing
++                attitude_control->input_euler_angle_roll_pitch_yaw_cd(target_roll, target_pitch, rad_to_cd(sub.last_pilot_heading_rad), true);
++            }
+         }
+     }
+-
+     // output pilot's throttle
+-    attitude_control->set_throttle_out((channel_throttle->norm_input() + 1.0f) / 2.0f, false, g.throttle_filt);
++    attitude_control->set_throttle_out((sub.rov_pilot_input_fresh() ? (channel_throttle->norm_input() + 1.0f) / 2.0f : NEUTRAL_THROTTLE), false, g.throttle_filt);
+ 
+     //control_in is range -1000-1000
+     //radio_in is raw pwm value
+-    motors.set_forward(channel_forward->norm_input());
+-    motors.set_lateral(channel_lateral->norm_input());
++    motors.set_forward(sub.rov_pilot_input_fresh() ? channel_forward->norm_input() : 0.0f);
++    motors.set_lateral(sub.rov_pilot_input_fresh() ? channel_lateral->norm_input() : 0.0f);
+ }
+diff --git a/ArduSub/surface_bottom_detector.cpp b/ArduSub/surface_bottom_detector.cpp
+--- a/ArduSub/surface_bottom_detector.cpp
++++ b/ArduSub/surface_bottom_detector.cpp
+@@ -14,6 +14,7 @@
+ {
+     if (!motors.armed()) { // only update when armed
+         set_surfaced(false);
++        bottom_detector_count = 0;
+         set_bottomed(false);
+         return;
+     }
+@@ -35,7 +36,9 @@
+         }
+ 
+ 
+-        if (motors.limit.throttle_lower && vel_stationary) {
++        // The bounded neutral-stick output reports saturation to the PID,
++        // but that software limit is not physical bottom contact.
++        if (!motors.depth_hold_active() && motors.limit.throttle_lower && vel_stationary) {
+             // bottom criteria met - increment the counter and check if we've triggered
+             if (bottom_detector_count < ((float)BOTTOM_DETECTOR_TRIGGER_SEC)*MAIN_LOOP_RATE) {
+                 bottom_detector_count++;
+@@ -44,12 +47,15 @@
+             }
+ 
+         } else {
++            bottom_detector_count = 0;
+             set_bottomed(false);
+         }
+ 
+         // with no external baro, the only thing we have to go by is a vertical velocity estimate
+     } else if (vel_stationary) {
+         if (motors.limit.throttle_upper) {
++            bottom_detector_count = 0;
++            set_bottomed(false);
+ 
+             // surface criteria met, increment counter and see if we've triggered
+             if (surface_detector_count < ((float)SURFACE_DETECTOR_TRIGGER_SEC)*MAIN_LOOP_RATE) {
+@@ -58,7 +64,7 @@
+                 set_surfaced(true);
+             }
+ 
+-        } else if (motors.limit.throttle_lower) {
++        } else if (!motors.depth_hold_active() && motors.limit.throttle_lower) {
+             // bottom criteria met, increment counter and see if we've triggered
+             if (bottom_detector_count < ((float)BOTTOM_DETECTOR_TRIGGER_SEC)*MAIN_LOOP_RATE) {
+                 bottom_detector_count++;
+@@ -66,12 +72,14 @@
+                 set_bottomed(true);
+             }
+ 
+-        } else { // we're not at the limits of throttle, so reset both detectors
++        } else { // no physical limit candidate; discard partial contact counts
++            bottom_detector_count = 0;
+             set_surfaced(false);
+             set_bottomed(false);
+         }
+ 
+     } else { // we're moving up or down, so reset both detectors
++        bottom_detector_count = 0;
+         set_surfaced(false);
+         set_bottomed(false);
+     }
+diff --git a/libraries/AP_Motors/AP_Motors6DOF.cpp b/libraries/AP_Motors/AP_Motors6DOF.cpp
+--- a/libraries/AP_Motors/AP_Motors6DOF.cpp
++++ b/libraries/AP_Motors/AP_Motors6DOF.cpp
+@@ -20,6 +20,9 @@
+ #include <AP_BattMonitor/AP_BattMonitor.h>
+ #include <AP_HAL/AP_HAL.h>
+ #include "AP_Motors6DOF.h"
++#include "ROV_DeadzonePWM.h"
++#include "ROV_AttitudeAllocation.h"
++#include "ROV_AttitudeLimit.h"
+ 
+ extern const AP_HAL::HAL& hal;
+ 
+@@ -117,6 +120,54 @@
+     // @Values: 1:normal,-1:reverse
+     // @User: Standard
+     AP_GROUPINFO("12_DIRECTION", 13, AP_Motors6DOF, _motor_reverse[11], 1),
++
++    // @Param: DZ_PWM
++    // @DisplayName: ROV post-mix startup PWM offset
++    // @Description: Symmetric startup offset after mixing and motor reversal. Zero disables compensation. Not a measured thrust correction; validate in water before enabling.
++    // @Units: PWM
++    // @Range: 0 100
++    // @Increment: 1
++    // @User: Advanced
++    AP_GROUPINFO("DZ_PWM", 14, AP_Motors6DOF, _startup_deadzone_pwm, 0),
++    // @Param: DZ_IN
++    // @DisplayName: ROV startup compensation input deadband
++    // @Description: Normalized mixed-output magnitude held at neutral when DZ_PWM is enabled. Applies to both pilot and stabilization requests; excessive values impair holding.
++    // @Range: 0.0 0.1
++    // @Increment: 0.001
++    // @User: Advanced
++    AP_GROUPINFO("DZ_IN", 15, AP_Motors6DOF, _startup_deadzone_input, 0.01f),
++
++    // @Param: ATT_PRIO
++    // @DisplayName: Vectored 6DOF attitude priority allocation
++    // @Description: Reserve roll/pitch/yaw authority before translation. May reduce travel or vertical thrust under saturation; report limits to prevent controller windup. Disabled retains stock allocation.
++    // @Values: 0:Disabled,1:Enabled
++    // @User: Advanced
++    AP_GROUPINFO("ATT_PRIO", 16, AP_Motors6DOF, _attitude_priority, 0),
++
++    // @Param: RP_MAX
++    // @DisplayName: ROV roll/pitch correction maximum
++    // @Description: Vectored 6DOF with ATT_PRIO enabled. Hard cap on the combined roll/pitch correction delivered to each vertical thruster. It does not cap pilot heave or yaw. 25 percent is approximately 5 N only for a 2 kgf thruster; validate in water.
++    // @Units: %
++    // @Range: 0 100
++    // @Increment: 1
++    // @User: Advanced
++    AP_GROUPINFO("RP_MAX", 17, AP_Motors6DOF, _roll_pitch_limit_pct, 25),
++
++    // @Param: DH_MAX
++    // @DisplayName: Neutral-stick depth hold vertical output maximum
++    // @Description: Vectored 6DOF with ATT_PRIO enabled. Maximum absolute combined output of each vertical thruster while the depth stick is neutral. Pilot ascent and descent commands are not capped here. If too low to balance buoyancy, depth cannot be held; verify in water.
++    // @Units: %
++    // @Range: 0 100
++    // @Increment: 1
++    // @User: Advanced
++    AP_GROUPINFO("DH_MAX", 18, AP_Motors6DOF, _depth_hold_limit_pct, 35),
++
++    // @Param: H_REV
++    // @DisplayName: ROV lateral and yaw direction correction
++    // @Description: Vectored 6DOF only. Reverses lateral force and yaw torque before allocation for this ROV assembly. Covers manual and automatic heading correction. Forward, heave, pitch, roll, individual motor directions and PWM endpoints are unchanged. Change only while disarmed; verify physical heading feedback before enabling stabilization.
++    // @Values: 0:Original geometry,1:Reverse lateral and yaw
++    // @User: Advanced
++    AP_GROUPINFO("H_REV", 20, AP_Motors6DOF, _horizontal_reverse, 1),
+ 
+     AP_GROUPEND
+ };
+@@ -229,9 +280,9 @@
+ 
+ int16_t AP_Motors6DOF::calc_thrust_to_pwm(float thrust_in) const
+ {
+-    int16_t range_up = get_pwm_output_max() - 1500;
+-    int16_t range_down = 1500 - get_pwm_output_min();
+-    return 1500 + thrust_in * (thrust_in > 0 ? range_up : range_down);
++    return ROV_DeadzonePWM::calculate(thrust_in,
++        get_pwm_output_min(), get_pwm_output_max(),
++        _startup_deadzone_pwm.get(), _startup_deadzone_input.get());
+ }
+ 
+ void AP_Motors6DOF::output_to_motors()
+@@ -288,6 +339,35 @@
+ // ToDo calculate headroom for rpy to be added for stabilization during full throttle/forward/lateral commands
+ void AP_Motors6DOF::output_armed_stabilizing()
+ {
++    // Update the total-current envelope before mixing so the priority allocator
++    // can spend the remaining authority on rotation first and translation second.
++    // MOT_BAT_CURR_MAX <= 0 keeps the native feature disabled.
++#if AP_BATTERY_ENABLED
++    const AP_BattMonitor &battery = AP::battery();
++    float batt_current = 0.0f;
++    if (_batt_current_max <= 0.0f) {
++        _output_limited = 1.0f;
++    } else if (battery.current_amps(batt_current) && std::isfinite(batt_current) &&
++               batt_current >= 0.0f && std::isfinite(_dt_s) && _dt_s > 0.0f && _dt_s <= 0.1f &&
++               std::isfinite(_batt_current_time_constant) && _batt_current_time_constant >= 0.0f) {
++        const float current_delta = batt_current - _batt_current_last;
++        const float predicted_current = batt_current + current_delta * 5.0f;
++        float current_ratio = batt_current / _batt_current_max;
++        if (predicted_current > _batt_current_max * 1.5f) {
++            current_ratio = 2.5f;
++        } else if (batt_current < _batt_current_max && predicted_current > _batt_current_max) {
++            current_ratio = predicted_current / _batt_current_max;
++        }
++        _batt_current_last = batt_current;
++        _output_limited += (_dt_s / (_dt_s + _batt_current_time_constant)) * (1.0f - current_ratio);
++    }
++#else
++    _output_limited = 1.0f;
++#endif
++    _output_limited = constrain_float(_output_limited, 0.0f, 1.0f);
++    const bool priority_6dof = _attitude_priority.get() == 1 &&
++        (sub_frame_t)_active_frame_class == SUB_FRAME_VECTORED_6DOF;
++
+     if ((sub_frame_t)_active_frame_class == SUB_FRAME_VECTORED) {
+         output_armed_stabilizing_vectored();
+     } else if ((sub_frame_t)_active_frame_class == SUB_FRAME_VECTORED_6DOF) {
+@@ -352,39 +432,13 @@
+         }
+     }
+ 
+-#if AP_BATTERY_ENABLED
+-    const AP_BattMonitor &battery = AP::battery();
+-
+-	// Current limiting
+-    float _batt_current;
+-    if (_batt_current_max <= 0.0f || !battery.current_amps(_batt_current)) {
+-        return;
+-    }
+-
+-    float _batt_current_delta = _batt_current - _batt_current_last;
+-
+-    float _current_change_rate = _batt_current_delta / _dt_s;
+-
+-    float predicted_current = _batt_current + (_current_change_rate * _dt_s * 5);
+-
+-    float batt_current_ratio = _batt_current / _batt_current_max;
+-
+-    float predicted_current_ratio = predicted_current / _batt_current_max;
+-    _batt_current_last = _batt_current;
+-
+-    if (predicted_current > _batt_current_max * 1.5f) {
+-        batt_current_ratio = 2.5f;
+-    } else if (_batt_current < _batt_current_max && predicted_current > _batt_current_max) {
+-        batt_current_ratio = predicted_current_ratio;
+-    }
+-    _output_limited += (_dt_s / (_dt_s + _batt_current_time_constant)) * (1 - batt_current_ratio);
+-#endif
+-
+-    _output_limited = constrain_float(_output_limited, 0.0f, 1.0f);
+-
+-    for (uint8_t i = 0; i < AP_MOTORS_MAX_NUM_MOTORS; i++) {
+-        if (motor_enabled[i]) {
+-            _thrust_rpyt_out[i] *= _output_limited;
++    // Priority Vectored-6DOF already allocated directly inside the current
++    // envelope. Other frame/mixer paths retain uniform native current scaling.
++    if (!priority_6dof) {
++        for (uint8_t i = 0; i < AP_MOTORS_MAX_NUM_MOTORS; i++) {
++            if (motor_enabled[i]) {
++                _thrust_rpyt_out[i] *= _output_limited;
++            }
+         }
+     }
+ }
+@@ -491,6 +545,19 @@
+     forward_thrust = _forward_in;
+     lateral_thrust = _lateral_in;
+ 
++    // Correct physical force/torque signs at the common actuator boundary.
++    // Pilot commands and native heading PID both use this mapping exactly once.
++    const int8_t horizontal_reverse = _horizontal_reverse.get();
++    if (horizontal_reverse != 0 && horizontal_reverse != 1) {
++        limit.set_all(true);
++        for (i = 0; i < AP_MOTORS_MAX_NUM_MOTORS; ++i) { _thrust_rpyt_out[i] = 0; }
++        return;
++    }
++    if (horizontal_reverse == 1) {
++        yaw_thrust = -yaw_thrust;
++        lateral_thrust = -lateral_thrust;
++    }
++
+     float rpt_out[AP_MOTORS_MAX_NUM_MOTORS]; // buffer so we don't have to multiply coefficients multiple times.
+     float yfl_out[AP_MOTORS_MAX_NUM_MOTORS]; // 3 linear DOF mix for each motor
+     float rpt_max;
+@@ -510,7 +577,62 @@
+         limit.throttle_upper = true;
+     }
+ 
++    const float requested_throttle = throttle_thrust;
+     throttle_thrust = constrain_float(throttle_thrust, -1.0f, _max_throttle);
++    if (_attitude_priority.get() == 1) {
++        // Near-surface safety can clip before the allocator. Tell depth PID
++        // about that lost authority as well; do not remove the surface guard.
++        limit.throttle_upper = limit.throttle_upper || throttle_thrust < requested_throttle;
++        limit.throttle_lower = limit.throttle_lower || throttle_thrust > requested_throttle;
++    }
++
++    if (_attitude_priority.get() == 1) {
++        float rv[AP_MOTORS_MAX_NUM_MOTORS] = {};
++        float rh[AP_MOTORS_MAX_NUM_MOTORS] = {};
++        float tv[AP_MOTORS_MAX_NUM_MOTORS] = {};
++        float th[AP_MOTORS_MAX_NUM_MOTORS] = {};
++        bool vertical[AP_MOTORS_MAX_NUM_MOTORS] = {};
++        bool horizontal[AP_MOTORS_MAX_NUM_MOTORS] = {};
++        for (i = 0; i < AP_MOTORS_MAX_NUM_MOTORS; ++i) {
++            if (!motor_enabled[i]) { continue; }
++            vertical[i] = !is_zero(_throttle_factor[i]);
++            horizontal[i] = !vertical[i];
++            rv[i] = roll_thrust * _roll_factor[i] + pitch_thrust * _pitch_factor[i];
++            rh[i] = yaw_thrust * _yaw_factor[i];
++            tv[i] = throttle_thrust * _throttle_factor[i];
++            th[i] = forward_thrust * _forward_factor[i] + lateral_thrust * _lateral_factor[i];
++        }
++        const float rp_limit_pct = _roll_pitch_limit_pct.get();
++        const float rp_limit = rp_limit_pct * 0.01f;
++        const auto rp_cap = ROV_AttitudeLimit::cap(rv, vertical, AP_MOTORS_MAX_NUM_MOTORS, rp_limit);
++        const float dh_limit_pct = _depth_hold_limit_pct.get();
++        const float dh_limit = dh_limit_pct * 0.01f;
++        if (!std::isfinite(dh_limit) || dh_limit < 0.0f || dh_limit > 1.0f) {
++            limit.set_all(true);
++            for (i = 0; i < AP_MOTORS_MAX_NUM_MOTORS; ++i) { _thrust_rpyt_out[i] = 0; }
++            return;
++        }
++        const float vertical_envelope = _depth_hold_active ? MIN(_output_limited, dh_limit) : _output_limited;
++        const auto v = ROV_AttitudeAllocation::allocate(rv, tv, vertical, AP_MOTORS_MAX_NUM_MOTORS, vertical_envelope);
++        const auto h = ROV_AttitudeAllocation::allocate(rh, th, horizontal, AP_MOTORS_MAX_NUM_MOTORS, _output_limited);
++        if (!rp_cap.valid || !v.valid || !h.valid) {
++            limit.set_all(true);
++            for (i = 0; i < AP_MOTORS_MAX_NUM_MOTORS; ++i) { _thrust_rpyt_out[i] = 0; }
++            return;
++        }
++        limit.roll = limit.pitch = rp_cap.scale < 0.9999f || v.rotation_scale < 0.9999f;
++        limit.yaw = h.rotation_scale < 0.9999f;
++        if (v.translation_scale < 0.9999f) {
++            limit.throttle_lower = limit.throttle_lower || throttle_thrust < 0;
++            limit.throttle_upper = limit.throttle_upper || throttle_thrust > 0;
++        }
++        for (i = 0; i < AP_MOTORS_MAX_NUM_MOTORS; ++i) {
++            if (motor_enabled[i]) {
++                _thrust_rpyt_out[i] = constrain_float(_motor_reverse[i] * (vertical[i] ? rv[i] : rh[i]), -1.0f, 1.0f);
++            }
++        }
++        return;
++    }
+ 
+     // calculate roll, pitch and Throttle for each motor (only used by vertical thrusters)
+     rpt_max = 1; //Initialized to 1 so that normalization will only occur if value is saturated
+@@ -551,7 +673,9 @@
+      if (motor_number < 0 || motor_number >= AP_MOTORS_MAX_NUM_MOTORS) {
+         return Vector3f(0,0,0);
+     }
+-    return Vector3f(_roll_factor[motor_number], _pitch_factor[motor_number], _yaw_factor[motor_number]);
++    const float yaw_sign = ((sub_frame_t)_active_frame_class == SUB_FRAME_VECTORED_6DOF &&
++                            _horizontal_reverse.get() == 1) ? -1.0f : 1.0f;
++    return Vector3f(_roll_factor[motor_number], _pitch_factor[motor_number], yaw_sign * _yaw_factor[motor_number]);
+ }
+ 
+ bool AP_Motors6DOF::motor_is_enabled(int motor_number) {
+diff --git a/libraries/AP_Motors/AP_Motors6DOF.h b/libraries/AP_Motors/AP_Motors6DOF.h
+--- a/libraries/AP_Motors/AP_Motors6DOF.h
++++ b/libraries/AP_Motors/AP_Motors6DOF.h
+@@ -42,6 +42,8 @@
+     void output_to_motors() override;
+ 
+     void set_max_throttle(float max_throttle) { _max_throttle = max_throttle; }
++    void set_depth_hold_active(bool active) { _depth_hold_active = active; }
++    bool depth_hold_active() const { return _depth_hold_active; }
+ 
+     // returns a vector with roll, pitch, and yaw contributions
+     Vector3f get_motor_angular_factors(int motor_number);
+@@ -68,11 +70,18 @@
+     // Parameters
+     AP_Int8             _motor_reverse[AP_MOTORS_MAX_NUM_MOTORS];
+     AP_Float            _forwardVerticalCouplingFactor;
++    AP_Int16            _startup_deadzone_pwm;
++    AP_Float            _startup_deadzone_input;
++    AP_Int8             _attitude_priority;
++    AP_Float            _roll_pitch_limit_pct;
++    AP_Float            _depth_hold_limit_pct;
++    AP_Int8             _horizontal_reverse;
+ 
+     float               _forward_factor[AP_MOTORS_MAX_NUM_MOTORS]; // each motors contribution to forward/backward
+     float               _lateral_factor[AP_MOTORS_MAX_NUM_MOTORS];  // each motors contribution to lateral (left/right)
+ 
+     float _max_throttle = 1.0f;
++    bool _depth_hold_active = false;
+     // current limiting
+     float _output_limited = 1.0f;
+     float _batt_current_last = 0.0f;
+diff --git a/libraries/AP_Motors/ROV_AttitudeAllocation.h b/libraries/AP_Motors/ROV_AttitudeAllocation.h
+new file mode 100644
+--- /dev/null
++++ b/libraries/AP_Motors/ROV_AttitudeAllocation.h
+@@ -0,0 +1,41 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++#pragma once
++#include <cmath>
++#include <cstddef>
++
++namespace ROV_AttitudeAllocation {
++struct Result { float rotation_scale; float translation_scale; bool valid; };
++// Allocate each disjoint Vectored-6DOF plane independently. Preserve the
++// requested rotational wrench first, then uniformly scale its translation.
++inline Result allocate(float *rotation, const float *translation,
++                       const bool *enabled, std::size_t count, float envelope = 1.0f) {
++    if (!std::isfinite(envelope) || envelope < 0.0f || envelope > 1.0f) {
++        return {0, 0, false};
++    }
++    float maximum = 0.0f;
++    for (std::size_t i = 0; i < count; ++i) {
++        if (!enabled[i]) { continue; }
++        if (!std::isfinite(rotation[i]) || !std::isfinite(translation[i])) {
++            return {0, 0, false};
++        }
++        maximum = ::fmaxf(maximum, ::fabsf(rotation[i]));
++    }
++    const float rotation_scale = maximum > envelope && maximum > 0.0f ? envelope / maximum : 1.0f;
++    float translation_scale = 1.0f;
++    for (std::size_t i = 0; i < count; ++i) {
++        if (!enabled[i]) { continue; }
++        rotation[i] *= rotation_scale;
++        const float linear = translation[i];
++        if (linear > 0) {
++            translation_scale = ::fminf(translation_scale, (envelope - rotation[i]) / linear);
++        } else if (linear < 0) {
++            translation_scale = ::fminf(translation_scale, (-envelope - rotation[i]) / linear);
++        }
++    }
++    translation_scale = ::fmaxf(0.0f, ::fminf(1.0f, translation_scale));
++    for (std::size_t i = 0; i < count; ++i) {
++        if (enabled[i]) { rotation[i] += translation[i] * translation_scale; }
++    }
++    return {rotation_scale, translation_scale, true};
++}
++} // namespace ROV_AttitudeAllocation
+diff --git a/libraries/AP_Motors/ROV_AttitudeLimit.h b/libraries/AP_Motors/ROV_AttitudeLimit.h
+new file mode 100644
+--- /dev/null
++++ b/libraries/AP_Motors/ROV_AttitudeLimit.h
+@@ -0,0 +1,28 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++#pragma once
++#include <cmath>
++#include <cstddef>
++
++namespace ROV_AttitudeLimit {
++struct Result { float scale; bool valid; };
++
++// Uniformly scale the combined roll/pitch contribution so its direction is
++// retained while no enabled vertical thruster receives more than `limit`.
++inline Result cap(float *rotation, const bool *enabled, std::size_t count,
++                  float limit) {
++    if (!std::isfinite(limit) || limit < 0.0f || limit > 1.0f) {
++        return {0.0f, false};
++    }
++    float maximum = 0.0f;
++    for (std::size_t i = 0; i < count; ++i) {
++        if (!enabled[i]) { continue; }
++        if (!std::isfinite(rotation[i])) { return {0.0f, false}; }
++        maximum = ::fmaxf(maximum, ::fabsf(rotation[i]));
++    }
++    const float scale = maximum > limit && maximum > 0.0f ? limit / maximum : 1.0f;
++    for (std::size_t i = 0; i < count; ++i) {
++        if (enabled[i]) { rotation[i] *= scale; }
++    }
++    return {scale, true};
++}
++} // namespace ROV_AttitudeLimit
+diff --git a/libraries/AP_Motors/ROV_DeadzonePWM.h b/libraries/AP_Motors/ROV_DeadzonePWM.h
+new file mode 100644
+--- /dev/null
++++ b/libraries/AP_Motors/ROV_DeadzonePWM.h
+@@ -0,0 +1,40 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++// Stateless post-mix mapping; used only by normal ArduSub motor outputs.
++#pragma once
++
++#include <cmath>
++#include <cstdint>
++
++namespace ROV_DeadzonePWM {
++
++inline int16_t calculate(float thrust, int16_t minimum, int16_t maximum,
++                         int16_t offset_us, float input_deadband)
++{
++    constexpr int16_t neutral = 1500;
++    if (!std::isfinite(thrust) || minimum >= neutral || maximum <= neutral) {
++        return neutral;
++    }
++    thrust = thrust < -1.0f ? -1.0f : thrust > 1.0f ? 1.0f : thrust;
++    const int16_t span = thrust > 0.0f ? maximum - neutral : neutral - minimum;
++    // Disabled means the stock conversion, without a new input deadband.
++    if (offset_us <= 0) {
++        return static_cast<int16_t>(neutral + thrust * span);
++    }
++    if (!std::isfinite(input_deadband) || input_deadband < 0.0f || input_deadband > 0.1f) {
++        return neutral;
++    }
++    const float magnitude = ::fabsf(thrust);
++    if (magnitude <= input_deadband) {
++        return neutral;
++    }
++    // Guard malformed parameter values. Never extend configured endpoints.
++    int16_t offset = offset_us > 100 ? 100 : offset_us;
++    offset = offset > span ? span : offset;
++    const float progress = (magnitude - input_deadband) / (1.0f - input_deadband);
++    // Reserve the offset inside the available span: no early saturation.
++    int16_t excursion = static_cast<int16_t>(::lroundf(offset + (span - offset) * progress));
++    excursion = excursion > span ? span : excursion;
++    return thrust > 0.0f ? neutral + excursion : neutral - excursion;
++}
++
++} // namespace ROV_DeadzonePWM

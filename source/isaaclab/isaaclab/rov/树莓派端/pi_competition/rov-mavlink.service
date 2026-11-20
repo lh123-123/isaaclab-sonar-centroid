@@ -1,0 +1,17 @@
+[Unit]
+Description=ROV Pixhawk to QGroundControl MAVLink bridge
+After=network.target
+
+[Service]
+Type=simple
+User=liang
+Group=dialout
+ExecStart=/usr/bin/python3 /home/liang/underwater_robot/rov_mavlink_bridge.py --serial /dev/serial/by-id/usb-ArduPilot_Pixhawk1_3B0042000450325635393420-if00 --baud 115200 --gcs-ip 192.168.1.4 --udp-port 14550
+Restart=always
+RestartSec=2
+KillSignal=SIGTERM
+TimeoutStopSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

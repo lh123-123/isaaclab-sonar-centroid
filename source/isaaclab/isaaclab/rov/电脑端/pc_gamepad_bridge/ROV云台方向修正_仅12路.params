@@ -1,0 +1,5 @@
+# Gimbal pitch direction only. No motor, endpoint, gain or PID changes.
+# Recorded SERVO12_REVERSED was 0; set 1 for the reported reversed up/down.
+# Disarm and disconnect servo power before import. Verify channel 12 is mount_tilt.
+# Then test a short preset step with mechanical clearance; no firmware flash needed.
+1	1	SERVO12_REVERSED	1	2

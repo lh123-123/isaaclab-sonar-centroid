@@ -7,7 +7,9 @@
 #              the episode's first textured frame (replaces the leaky drift integral)
 #              + visodom broadcast (x, y) m/sigma — integrated consecutive-flow displacement
 #                (vision-only odometry; counts past the template-match window).
-# Asymmetric actor/critic (CustomSACPolicy): actor on image, critic on 17-D ego state
+# Asymmetric actor/critic (CustomSACPolicy): actor on image, critic on ego state
+# (17-D through arm K; 18-D from arm M — appended visodom validity at index 17, so every
+# earlier index keeps its meaning and older tooling reading st[..., 8] still works)
 #              (anchor offset du/dv, sim=(ncc+1)/2, anchor yaw error, visodom x/y appended).
 #
 # NOTE: obs changed 2026-11-13 (image 9→11 ch, state 15→17) and the GT position left the
@@ -34,6 +36,12 @@ train_freq: 1
 gradient_steps: 8         # = num_envs → 1 update per env sample; 2M steps → 2M updates (~3x v0's 665k)
 ent_coef: "auto"          # auto-tune temperature
 target_entropy: "auto"
+# Floor under the auto-tuned temperature. Arms F/G/H all decayed to 0.006-0.009 by 130-200 k
+# and each of them collapsed in that window (critic_loss 0.06 -> 0.65 / 2.8 / 3.05), which
+# reads as exploration dying and the policy sharpening into a bad basin. Clamping
+# log_ent_coef (see EntCoefFloorCallback in train.py) keeps a minimum of exploration without
+# giving up the auto-tuning that works well in the first 100 k. 0.0 disables the floor.
+ent_coef_floor: 0.01
 target_update_interval: 16
 
 # Feature normalization

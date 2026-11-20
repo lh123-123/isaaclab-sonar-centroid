@@ -1,0 +1,17 @@
+{
+  "source": "v4l2",
+  "device": "/dev/v4l/by-id/usb-Generic_USB_camera_200901010001-video-index0",
+  "legacy_url": "http://192.168.1.3:8080/stream.mjpg",
+  "pc_ip": "192.168.1.4",
+  "port": 5600,
+  "width": 1920,
+  "height": 1080,
+  "fps": 30,
+  "bitrate_kbps": 8000,
+  "encoder_threads": 2,
+  "rotation_degrees": 180,
+  "enhancement_mode": "mild",
+  "focus_profile": "water",
+  "water_focus_value": 224,
+  "history_note": "USB/UVC MJPEG; autofocus works but does not report live lens position. After changing to the clear acrylic dome, a full 0..1023 step-1 underwater scan and alternating 192/224/229 comparison on 2026-10-11 selected 224 for the current static pool scene. Previous preset was 192. Recheck at actual competition target distance; mild enhancement is reversible."
+}

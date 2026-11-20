@@ -1,0 +1,17 @@
+# OFFLINE PREPARATION ONLY - do not import before the combined firmware is built/flashed/verified.
+# Requires prepared_control_20261004/ardusub_rov_control.patch, not the old deadzone-only firmware.
+# Vehicle-Id Component-Id Name Value Type
+# Existing hardware PID, depth tuning, mappings, reversal and servo endpoints are NOT changed.
+# Tilt stick centered: return level. Yaw centered: stop turn and hold heading.
+1	1	ROV_EN	1	2
+1	1	ROV_T_RATE	30	9
+1	1	ROV_T_ACC	90	9
+1	1	ROV_Y_RATE	45	9
+1	1	ROV_Y_ACC	120	9
+1	1	ROV_Y_LEAD	12	9
+1	1	ROV_IN_TMO	0.35	9
+# Attitude-first allocation only for FRAME_CONFIG=2 Vectored6DOF.
+1	1	MOT_ATT_PRIO	1	2
+# Symmetric post-mix startup compensation; water testing still required.
+1	1	MOT_DZ_PWM	50	4
+1	1	MOT_DZ_IN	0.01	9

@@ -1,0 +1,6 @@
+# Restore stock attitude targets/allocation/PWM mapping without changing hardware PID/calibration.
+# Only for the combined custom firmware. Does NOT restore the old firmware binary.
+# Vehicle-Id Component-Id Name Value Type
+1	1	ROV_EN	0	2
+1	1	MOT_ATT_PRIO	0	2
+1	1	MOT_DZ_PWM	0	4

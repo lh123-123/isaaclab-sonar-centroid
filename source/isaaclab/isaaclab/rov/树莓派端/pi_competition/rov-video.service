@@ -1,0 +1,21 @@
+[Unit]
+Description=ROV USB camera to QGC RTP H264
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=30
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=liang
+SupplementaryGroups=video
+WorkingDirectory=/home/liang/underwater_robot
+ExecStart=/usr/bin/python3 /home/liang/underwater_robot/rov_video_stream.py --run
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=5
+Nice=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

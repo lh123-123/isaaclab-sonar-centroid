@@ -1,0 +1,135 @@
+---
+name: "跨机传输约定（pc ↔ xhh）"
+tags: ["file-transfer", "cross-machine", "ssh", "scp", "rsync", "tailscale", "windows", "peer"]
+description: 跨机文件传输与远程执行约定（实验机 pc ↔ 笔记本 xhh）：peer 命令、目录语义、通道选择、Windows 侧坑与安全红线。涉及传文件/同步/拉日志/远程跑命令时使用。
+alwaysApply: true
+---
+
+# 跨机传输约定（pc ↔ xhh）
+
+## 1. 拓扑与身份
+
+| | 实验机 `pc` | 笔记本 `xhh` |
+|---|---|---|
+| 系统 | Linux (Ubuntu 22.04) | Windows |
+| Tailscale | `100.64.207.21` | `100.83.202.52` |
+| 登录用户 | `lh` | `26055` |
+| SSH 别名 | `peer` / `windows` → `100.83.202.52` | `peer` → `100.64.207.21` |
+| sshd | `100.64.207.21:22`（仅公钥、`AllowUsers lh`） | `22`（原生 OpenSSH，默认 shell 是 cmd） |
+| 文件服务 | dufs `100.64.207.21:5111` | dufs `100.83.202.52:5111` |
+| rsync | 有 | **无** |
+
+两端在同一个 tailnet（账号 `lh123-123@`），**所有传输只走 Tailscale，不经公网、不开端口映射**。
+
+## 2. 目录语义（两端一致）
+
+| 路径 | 语义 |
+|---|---|
+| `~/xfer/in/` | **收件箱**：对端发来的文件落这里，找新文件先看它 |
+| `~/xfer/out/` | **发件箱**：本机要发给对端的文件先放这里 |
+| `~/xfer/tmp/` | 中转、解包、临时文件 |
+| `~/xfer/bin/` | 分发用二进制（`dufs`、`croc`） |
+| `~/xfer/` 根 | 同时是 dufs 的服务根，所以放这里的东西对端一定拿得到 |
+
+**不要**把传输文件放到 IsaacLab 仓库目录里（污染 `git status`、容易被误提交）。
+
+本文件唯一来源：`/home/lh/IsaacLab/.cursor/rules/cross-machine-transfer.mdc`。`~/xfer/cross-machine-transfer.mdc` 是指向它的软链（保留在 dufs 根下，方便发给对端，同时又能被 Cursor 当规则加载）。**不要**再维护第二份物理副本 —— 之前两份拷贝漂移过，§9 的"已验证"状态就是这么过期的。
+
+## 3. 命令速查（`peer`）
+
+pc 侧是 bash 脚本 `~/.local/bin/peer`；xhh 侧是同语义的 PowerShell 版。两边命令一致，agent 优先用 `peer`，不要手搓 scp/ssh 长命令。
+
+| 命令 | 作用 | 通道 |
+|---|---|---|
+| `peer check` | 体检：主机名、对方用户、有无 rsync、当前传输方式 | ssh |
+| `peer rls [路径]` | 列对端目录（Windows 自动退到 powershell 列表） | ssh |
+| `peer get <远端路径> [本地目录]` | 下载，默认落 `~/xfer/in/` | scp |
+| `peer put <本地路径> [远端路径]` | 上传，默认落对端 `xfer/in/` | scp |
+| `peer run '<命令>'` | 在对端执行 | ssh |
+| `peer push / pull` | rsync 增量同步 | 仅 Linux 对端 |
+| `peer mount / umount` | sshfs 挂载对端家目录到 `~/remote/laptop` | ssh |
+| `peer authorize '<公钥行>'` | 把公钥写进本机 `authorized_keys`（去重、修权限、打印指纹） | 本地 |
+| `peer serve` | 前台起 dufs | 本地 |
+| `peer path` | 打印本机约定目录 | 本地 |
+
+环境变量：
+
+- `PEER_ALIAS`（默认 `peer`；临时查别的机器用 `PEER_ALIAS=windows peer check`）
+- `PEER_TRANSPORT=ssh|http`（默认 `ssh`；ssh 挂了才切 `http`）
+- `PEER_HTTP`（默认 `http://<对端IP>:5111`）、`XFER_PORT`（默认 5111）、`MOUNT_POINT`
+
+## 4. 通道选择
+
+1. **默认走 ssh + scp**：`peer get` / `peer put`。单文件、目录、几 GB 都够。
+2. **需要增量/断点续传**：`peer push/pull`（rsync）。注意 **xhh 没有 rsync**，此刻对 Windows 对端只能用 `get/put`。
+3. **ssh 不通时**：`PEER_TRANSPORT=http peer get/put/rls`，需要对端 dufs 在跑且本机 `~/.config/xfer/peer-token` 有对端 token。注意 HTTP 分支的 `peer put` 默认落**对端 `out/`**（与 ssh 分支的 `in/` 不一致），要进收件箱必须显式写目标 `in/<文件名>`。
+4. **没有 Tailscale 的应急**：`croc`（`CROC_SECRET` 环境变量做非交互）。v11 的 `--code` 默认禁用、`--classic` 会弹 `y/N`，**不要**在自动化里用交互式路径。
+
+## 5. Windows 侧（xhh）的坑
+
+- **默认 shell 是 cmd**：没有 `ls`、`rm`、`;`、`&&`。要连多条命令用 `&`，要 Linux 语法显式调 `powershell -NoProfile -Command "..."`。`peer rls` 已内置这个兜底。
+- **输出是 CRLF**：解析对数输出的命令一律加 `| tr -d '\r'`。
+- **路径用正斜杠**：`C:/Users/26055/xfer/in`；scp 的相对路径以 `C:\Users\26055` 为根。
+- **管理员账户的公钥位置不同**：读 `C:\ProgramData\ssh\administrators_authorized_keys`，**不是** `%USERPROFILE%\.ssh\authorized_keys`。
+- **PowerShell 里生成无口令 key**：`ssh-keygen` 的 `-N ''` 会被 PowerShell 吞掉，用 `-N '""'`，或者干脆跳过 `-N`、passphrase 提示直接回车两次。
+- **不要在 pc 的 bash 里跑 PowerShell 语法**：`$env:USERPROFILE`、`Get-Content`、`Set-Service` 都会静默变异或报错（曾因此生成了名为 `:USERPROFILE.sshid_xfer` 的垃圾密钥）。
+
+## 6. 安全红线
+
+- dufs **只绑 Tailscale IP**（+ `127.0.0.1`），不得改成 `0.0.0.0`；`-A` 已开增删改，靠 token + 网段双重限制。
+- token 放 `~/.config/xfer/token`（600）；对端 token 放 `~/.config/xfer/peer-token`（600）。**不要在命令输出、日志、对话里回显**。
+- **私钥永不外发**，需要授权时只发 `.pub` 那一行。
+- sshd 仅监听 tailnet IP、`PasswordAuthentication no`、`PermitRootLogin no`、`AllowUsers lh`。
+- 换钥匙流程：对端发新 `.pub` → 本机 `peer authorize '<行>'` → 再从 `authorized_keys` 精确删掉旧指纹那行 → `peer check` 复验。
+
+## 7. Agent 行为准则
+
+1. 任何跨机操作前先 `peer check`，确认对端可达再动手。
+2. 传输优先用 `peer get/put`，不要手写 `scp -P/-o` 一长串（引号与路径容易错）。
+3. 要在本地"读"的远端文件，先 `peer get` 到 `~/xfer/in/` 再 `Read`；不要假设能直接读到远端路径。
+4. 对端发来的东西只往 `in/`、自己发的只往 `out/`，语义别混。
+5. 每次 ssh/scp 都带超时（`timeout 20 peer check`），Windows 对端首次连接尤其要留余量。
+6. 传完核对：ssh 通道看 `peer rls` 的 `Length`，HTTP 通道看 `?hash` 的 sha256。
+7. `peer get/put` 会**覆盖**同名文件，写之前先 `rls` 看目标是否存在。
+8. 失败按序排查：`peer check` → `nc -z <对端IP> 22` → `ssh -v peer` → 判断是 sshd 没起 / 公钥没授权 / token 缺失。
+9. 不要为了省事在对端 `sudo` 交互式命令——agent 会卡在密码提示上；需要 sudo 的操作交给用户。
+
+## 8. 排错速查
+
+| 现象 | 处理 |
+|---|---|
+| `ssh: connect to host ... port 22: Connection timed out` | 对端 sshd 没起或防火墙拦；Windows 侧跑 `Get-Service sshd` |
+| `Permission denied (publickey)` | 公钥没授权：对端执行 `peer authorize '<本机 .pub 行>'` |
+| `peer: 缺 ~/.config/xfer/peer-token` | HTTP 回退没配；把对端 dufs token 写进该文件 |
+| `curl: (7) Failed to connect` | 对端 dufs 没起：`systemctl --user status xfer-dufs` |
+| HTTP `401` | token 不匹配，对照两端 `~/.config/xfer/token` |
+| cmd 报 `'ls' 不是内部或外部命令` | 对端是 Windows；用 `peer rls`（已内置 powershell 兜底） |
+| `peer push/pull` 报 rsync 不存在 | 对端无 rsync；改用 `get/put` |
+| sshfs 挂载失败 | 本机缺 `sshfs`/`fuse3`；Windows 对端权限映射不可靠，改用 `get/put`（`pull` 是 rsync，Windows 对端用不了） |
+
+## 9. 现状（2026-11-20 16:0x 实测，以本节为准）
+
+pc 侧（本机核对）：
+
+- `hostname` = `pc`，Tailscale `100.64.207.21`；`rsync`、`sshfs`、`croc`、`dufs` 均在位
+- dufs `systemctl --user` `active`，`-A --allow-hash`，只监听 `127.0.0.1:5111` + `100.64.207.21:5111`
+- `~/.ssh/authorized_keys` 两行：`lh@pc`（`SHA256:D0LTJfo4…`）+ `lh@xhh`（`SHA256:BHVvf2wi…`）
+- `~/.config/xfer/token` 在（600）；**`~/.config/xfer/peer-token` 不存在** → HTTP 回退不可用
+- `~/.ssh/config` 里只有 `peer` 一条（`HostName 100.83.202.52`、`User lh`、`id_xfer`）；`windows` 是 MagicDNS 名，无独立配置段
+
+pc → xhh（17:2x 实测，**已打通**）：
+
+- `timeout 25 peer check` → `host: xhh / user: xhh\26055 / rsync: 无 / transport: ssh`（**公钥认证已通**）
+- `peer put` 实测成功：`v7方案定稿_K150k交付版_20261120.md` → `peer:xfer/in/`，`peer rls xfer/in` 复核 11749 bytes 与本地一致
+- 判因回顾：早间 `Permission denied (publickey)` 是 `lh@pc`（`SHA256:D0LTJfo4…`）未授权；现已授权，§9 旧记录作废
+- Windows `peer rls` 输出是 GBK 码页，中文文件名会显示为乱码（`dir` 侧问题），**不影响传输与长度核对**
+- Windows 管理员账户只认 `C:\ProgramData\ssh\administrators_authorized_keys`，写 `%USERPROFILE%\.ssh\authorized_keys` 无效 —— 这是上次"以为授权了其实没有"的最可能原因
+
+xhh → pc：早间记录 scp 通（`ROV_数据缺口采集清单.xlsx` 于 13:49 落到 `~/xfer/out/`），本次未复验。
+
+待办（按序）：
+
+1. xhh 侧把 `pc` 的 `~/.ssh/id_xfer.pub` 整行授权进去（`peer authorize '<行>'` 或手工写 `administrators_authorized_keys`），回 pc 跑 `timeout 20 peer check` 复验，通了再把上面改回"已验证"
+2. HTTP 回退：xhh 上 dufs 起在 `100.83.202.52:5111`，把它的 token 写进 pc `~/.config/xfer/peer-token`（600）
+3. xhh 旧私钥曾泄露：轮换后 `peer authorize` 新公钥，并从 `authorized_keys` 精确删掉旧指纹那行
+4. `~/xfer/laptop-setup.md` 里明文写着 pc 的 dufs token，且就在 dufs 根下（对外可读）—— 该文档已按 §6 自述"用完删掉"，**建议轮换 token 并把这个文件移出 `~/xfer` 根**

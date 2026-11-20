@@ -1,0 +1,23 @@
+{
+  "heartbeats": 31,
+  "neutral_output_samples": 75,
+  "params": {
+    "MOT_DZ_PWM": 50.0,
+    "MOT_DZ_IN": 0.009999999776482582,
+    "MOT_PWM_MIN": 1100.0,
+    "MOT_PWM_MAX": 1900.0,
+    "FRAME_CONFIG": 2.0,
+    "MOT_H_REV": 1.0,
+    "MOT_BAT_CURR_MAX": 15.0,
+    "MOT_BAT_CURR_TC": 0.5,
+    "ROV_LVL_R": 0.0,
+    "ROV_LVL_P": 0.0,
+    "ATC_ANG_RLL_P": 2.0,
+    "ATC_ANG_PIT_P": 2.0,
+    "MOT_RP_MAX": 25.0,
+    "MOT_DH_MAX": 35.0,
+    "ROV_T_ERR": 0.5
+  },
+  "messages": [],
+  "duration_seconds": 30.002711094000006
+}

@@ -1,0 +1,5 @@
+# ONLY for the custom ArduSub build with ardusub_deadzone.patch applied.
+# Not for stock firmware. Never import while armed or with thruster power on.
+# Reference values, not measured startup thresholds; verify PARAM_VALUE after reboot.
+1	1	MOT_DZ_PWM	50	4
+1	1	MOT_DZ_IN	0.01	9

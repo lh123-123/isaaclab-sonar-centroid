@@ -1,0 +1,502 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Isaac-AUV-Tracking · v7 代码地图 (Canvas)</title>
+<style>
+  :root{
+    --bg:#060b14;--panel:rgba(16,28,48,.72);--border:rgba(64,160,200,.18);--border-strong:rgba(64,190,220,.4);
+    --txt:#dbe7f4;--txt-dim:#8ba3bd;--txt-faint:#5c7188;--cyan:#3fd0e0;--teal:#26c6a6;--blue:#4d8ff5;
+    --violet:#9a7bff;--amber:#f5b14d;--rose:#ff6b8a;--green:#56d67b;--mono:"SFMono-Regular","JetBrains Mono",Menlo,Consolas,monospace;
+    --sans:"Inter",-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%}
+  body{font-family:var(--sans);background:radial-gradient(1200px 700px at 10% -8%,rgba(38,120,180,.20),transparent 60%),radial-gradient(1000px 600px at 95% 0%,rgba(38,198,166,.13),transparent 55%),radial-gradient(900px 800px at 50% 120%,rgba(77,143,245,.12),transparent 60%),var(--bg);color:var(--txt);line-height:1.5;min-height:100vh;overflow-x:hidden}
+  code,.mono{font-family:var(--mono)}
+  header.top{position:sticky;top:0;z-index:60;backdrop-filter:blur(14px);background:linear-gradient(180deg,rgba(6,11,20,.94),rgba(6,11,20,.7));border-bottom:1px solid var(--border)}
+  .top-inner{max-width:1600px;margin:0 auto;padding:12px 22px;display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+  .brand{display:flex;align-items:center;gap:11px;font-weight:700;font-size:15px}
+  .brand .dot{width:11px;height:11px;border-radius:50%;background:radial-gradient(circle at 30% 30%,#7ff0ff,var(--cyan));box-shadow:0 0 14px var(--cyan)}
+  .brand small{color:var(--txt-dim);font-weight:500;font-size:12px}
+  .toolbar{margin-left:auto;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+  .toolbar input{background:#0a1526;border:1px solid var(--border);border-radius:9px;padding:8px 12px;color:var(--txt);font-size:12.5px;font-family:var(--mono);outline:none;width:220px}
+  .toolbar input:focus{border-color:var(--border-strong)}
+  .btn{background:#0c1a2e;border:1px solid var(--border);border-radius:9px;color:var(--txt-dim);font-size:12.5px;padding:7px 12px;cursor:pointer;transition:all .15s;user-select:none}
+  .btn:hover{color:var(--txt);border-color:var(--border-strong);background:rgba(40,120,160,.15)}
+  .btn.on{color:#06121e;background:var(--cyan);border-color:var(--cyan);font-weight:700}
+
+  .wrap{max-width:1600px;margin:0 auto;padding:18px 22px 60px;display:grid;grid-template-columns:1fr 340px;gap:16px}
+  @media(max-width:1100px){.wrap{grid-template-columns:1fr}}
+
+  .legend{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:10px;grid-column:1/-1}
+  .legend .chip{display:inline-flex;align-items:center;gap:7px;font-size:12px;color:var(--txt-dim);padding:5px 10px;border:1px solid var(--border);border-radius:20px;cursor:pointer;transition:all .15s;user-select:none;background:rgba(10,21,38,.4)}
+  .legend .chip:hover{border-color:var(--border-strong)}
+  .legend .chip.off{opacity:.35;text-decoration:line-through}
+  .legend .chip i{width:11px;height:11px;border-radius:3px;display:inline-block}
+
+  .stage{position:relative;background:#070e1a;border:1px solid var(--border);border-radius:16px;overflow:hidden;height:74vh;min-height:520px;box-shadow:0 20px 60px -30px #000 inset}
+  #cv{display:block;width:100%;height:100%;cursor:grab}
+  #cv.drag{cursor:grabbing}
+  .hint{position:absolute;left:14px;bottom:12px;font-size:11.5px;color:var(--txt-faint);pointer-events:none}
+  .zoomctl{position:absolute;right:14px;bottom:12px;display:flex;flex-direction:column;gap:6px}
+  .zoomctl .btn{padding:6px 10px;text-align:center;min-width:38px}
+  .tooltip{position:absolute;pointer-events:none;max-width:300px;background:rgba(9,18,32,.97);border:1px solid var(--border-strong);border-radius:10px;padding:9px 12px;font-size:12px;color:var(--txt);box-shadow:0 10px 30px -10px #000;opacity:0;transition:opacity .1s;z-index:30}
+  .tooltip b{color:var(--cyan);font-family:var(--mono);font-size:12px;display:block;margin-bottom:3px;word-break:break-all}
+  .tooltip span{color:var(--txt-dim)}
+
+  aside.detail{background:var(--panel);border:1px solid var(--border);border-radius:16px;padding:20px;align-self:start;position:sticky;top:80px;max-height:74vh;overflow:auto}
+  aside.detail h3{font-size:13px;color:var(--txt-faint);text-transform:uppercase;letter-spacing:1px;margin-bottom:14px}
+  aside.detail .empty{color:var(--txt-faint);font-size:13.5px;line-height:1.8}
+  .d-grp{display:inline-block;font-size:11px;font-family:var(--mono);padding:2px 9px;border-radius:6px;margin-bottom:10px}
+  .d-title{font-family:var(--mono);font-size:14px;color:#eaf6ff;word-break:break-all;margin-bottom:6px;line-height:1.4}
+  .d-role{font-size:13px;color:var(--teal);margin-bottom:12px;font-weight:600}
+  .d-body{font-size:13.5px;color:var(--txt-dim);line-height:1.7;margin-bottom:16px}
+  .d-sec{font-size:11px;color:var(--txt-faint);text-transform:uppercase;letter-spacing:.8px;margin:14px 0 7px}
+  .d-chips{display:flex;flex-wrap:wrap;gap:6px}
+  .d-chip{font-family:var(--mono);font-size:11.5px;color:var(--txt-dim);background:#0a1526;border:1px solid var(--border);border-radius:7px;padding:4px 9px;cursor:pointer;word-break:break-all}
+  .d-chip:hover{color:var(--cyan);border-color:var(--border-strong)}
+</style>
+</head>
+<body>
+
+<header class="top">
+  <div class="top-inner">
+    <div class="brand"><span class="dot"></span> AUV Tracking <small>· v7 代码地图 · 悬停/点击文件看职责</small></div>
+    <div class="toolbar">
+      <input id="q" type="text" placeholder="搜索文件/关键词…" oninput="onSearch()" />
+      <button class="btn" onclick="resetView()">重置视图</button>
+    </div>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="legend" id="legend"></div>
+
+  <div class="stage" id="stage">
+    <canvas id="cv"></canvas>
+    <div class="hint">拖拽平移 · 滚轮缩放 · 双击节点聚焦 · 悬停看简介 · 点击看详情</div>
+    <div class="zoomctl">
+      <button class="btn" onclick="zoomBy(1.2)">＋</button>
+      <button class="btn" onclick="zoomBy(1/1.2)">－</button>
+      <button class="btn" onclick="resetView()">⟲</button>
+    </div>
+    <div class="tooltip" id="tip"></div>
+  </div>
+
+  <aside class="detail">
+    <h3>文件详情</h3>
+    <div id="detail">
+      <div class="empty">
+        在左侧画布中<b>点击任意文件节点</b>，这里会显示它负责的任务、关键类/函数，以及它依赖谁、被谁使用。<br><br>
+        悬停可快速预览；双击节点可聚焦；用顶部搜索或图例筛选高亮。
+      </div>
+    </div>
+  </aside>
+</div>
+
+<script>
+(function(){
+  // ---------------- data ----------------
+  const GROUPS = {
+    train : {name:'训练 / 脚本',       color:'#56d67b'},
+    config: {name:'注册 / 配置',        color:'#f5b14d'},
+    env   : {name:'Direct 环境 (v7)',   color:'#4d8ff5'},
+    base  : {name:'追踪基类',           color:'#6f8cff'},
+    manager:{name:'Manager-based (v7)', color:'#ff6b8a'},
+    agent : {name:'策略 / 网络',        color:'#3fd0e0'},
+    dyn   : {name:'动力学 / 控制',      color:'#9a7bff'},
+    asset : {name:'资产 / USD',         color:'#26c6a6'},
+  };
+
+  const W=310, H=74;
+  const nodes = [
+    // Scripts / train  (col 0)
+    {id:'train', g:'train', x:40, y:50,  title:'train.py', role:'SB3 训练入口',
+     detail:'Stable-Baselines3 训练入口脚本。解析 --task / --agent / --algorithm / --num_envs / --flow_method，用 gym.make(任务id) 构建环境，再调用 SAC(…).learn() 训练并周期保存 checkpoint。'},
+    {id:'sb3', g:'train', x:40, y:160, title:'isaaclab_rl/sb3.py', role:'Isaac→SB3 环境包装',
+     detail:'把 Isaac Lab 环境封装成 SB3 需要的 VecEnv（Dict 观测、自动 reset、转录写 TB）。train.py 通过它把环境交给 SB3 算法。'},
+    {id:'bench', g:'train', x:40, y:270, title:'bench_auv_v7_flow_hover_gsrov.py', role:'吞吐基准',
+     detail:'v7 GS-ROV 吞吐基准：构建环境、跑固定步数、打印 FPS 与每步耗时，用于评估渲染/光流开销。'},
+    {id:'calib', g:'train', x:40, y:380, title:'calibrate_v7_sigma_flow.py', role:'标定 σ_flow',
+     detail:'在零光流与随机光流下采集 flow_rms(64 网格像素) 分布，输出推荐的 σ_flow，用来设定奖励里光流项的高斯宽度。'},
+    {id:'debug', g:'train', x:40, y:490, title:'debug_auv_v7_flow_hover_gsrov.py', role:'单环境调试',
+     detail:'单环境调试 v7：渲染纹理平面与光流，打印观测/纹理掩码/奖励，验证相机与光流流水线是否正确。'},
+
+    // Config / registry (col 1)
+    {id:'reg',  g:'config', x:380, y:110, title:'.../isaac_auv_tracking/__init__.py', role:'Gym 任务注册表',
+     detail:'注册 id=Isaac-AUV-Tracking-Direct-v7-flow-hover(-gsrov)：entry_point=环境类、env_cfg_entry_point=配置类、sb3_cfg_entry_point=超参数 yaml。所有训练/播放都从这里按 id 解析出「环境类+配置+yaml」。'},
+    {id:'yaml', g:'config', x:380, y:220, title:'sb3_sac_v7_flow_hover_cfg.yaml', role:'SAC 超参数',
+     detail:'v7 的全部 SAC 超参数：lr=3e-4、buffer=500k、batch=256、tau/gamma、grad_steps=4、net_arch pi/qf=[256,256]、policy=CustomSACPolicy、features_extractor_class=MidCNNExtractor、flow_method=farneback、seed 等。'},
+
+    // Direct env (col 2 top)
+    {id:'envv7', g:'env', x:720, y:50, title:'auv_tracking_v7_flow_hover_gsrov_env.py', role:'v7 主环境 (Direct) ★',
+     detail:'v7 核心实现（DirectRLEnv 子类）。全局光流零化悬停。负责：搭建场景（立方体代理刚体/前视相机/4×4 纹理平面/池壁/参考球）、Farneback 或 RAFT 光流、纹理掩码与 flow_rms、7 通道图像+9 维状态观测、奖励、终止、重置、动作[surge,sway,yaw]→PID。所有 v7 训练都跑它。'},
+    {id:'base', g:'base', x:720, y:270, title:'auv_tracking_env.py', role:'AUV 追踪基类',
+     detail:'AUVTrackingEnv / AUVTrackingEnvCfg 基类。提供刚体+相机装配、PID/推进器/浮力装配、洋流 set/get、目标运动、KF/声纳、以及 v0–v6 的奖励与终止逻辑。v7 继承它复用物理与 PID 装配。'},
+
+    // Manager-based (col 2 bottom)
+    {id:'mcfg', g:'manager', x:720, y:430, title:'v7_flow_hover/v7_flow_hover_env_cfg.py', role:'Manager 配置',
+     detail:'Manager-based 声明式配置：scene / observations / actions / rewards / terminations / events，含 GS-ROV 物理常数与按 dt 修正的奖励权重。是 Direct 版行为等价移植的配置层。'},
+    {id:'menv', g:'manager', x:720, y:540, title:'v7_flow_hover/v7_flow_hover_env.py', role:'Manager 环境类',
+     detail:'Manager-based 环境类：命令式生成相机/纹理平面/参考球等 USD，维护光流与纹理缓冲，读取 TiledCamera 帧，供 MDP 观测量使用。'},
+    {id:'mdyn', g:'manager', x:720, y:650, title:'v7_flow_hover/dynamics.py', role:'GSROVPlant 物理内核',
+     detail:'GSROVPlant：把 PID + 推进器 + 浮力/拖曳 的共享物理封装成可被动作项调用的内核，是 Manager 版的动作→物理桥梁。'},
+    {id:'mmdp', g:'manager', x:720, y:760, title:'v7_flow_hover/mdp/*', role:'MDP 各项',
+     detail:'管理式 MDP 项：actions.py(VelocityPIDAction)、observations.py(image/ego_state)、rewards.py(flow_nulling/alive/depth/att/action_rate)、terminations.py。等价于 Direct 版里散落在环境中的对应函数。'},
+
+    // Agents (col 3)
+    {id:'policy', g:'agent', x:1060, y:50, title:'custom_sac_policy.py', role:'SAC 策略 (非对称)',
+     detail:'CustomSACPolicy：Actor 用图像编码器、Critic 只看 9 维状态（非对称）。make_critic 返回 StateCritic(双 Q)。文件还含 Hybrid / ImageState / Gated 变体，v7 使用 CustomSACPolicy。'},
+    {id:'cnn', g:'agent', x:1060, y:160, title:'cam_encoder.py', role:'MidCNNExtractor',
+     detail:'MidCNNExtractor：5 层卷积 7→32→64→64→128→128，保持 8×8 特征图；头部 GAP(128)⊕SpatialSoftmax(2×128)=384 →Linear256→LayerNorm→Tanh。GAP 给「有多强」，Softmax 给「在哪」(方位)。'},
+    {id:'raft', g:'agent', x:1060, y:270, title:'raft_flow.py', role:'RAFT 光流 (可选)',
+     detail:'RAFT-Small 稠密光流(GPU)。当 flow_method="raft" 时被 v7 环境调用；默认用 Farneback(CPU/OpenCL)。'},
+    {id:'cb', g:'agent', x:1060, y:380, title:'gate_log_callback.py', role:'SB3 日志回调',
+     detail:'EpisodeRewardLogCallback：回合结束刷新 TensorBoard；CriticGateLogCallback：记录 gated critic 的门函数 σ(g(state))。'},
+
+    // Dynamics (col 4)
+    {id:'pid', g:'dyn', x:1400, y:50, title:'batch_pid.py', role:'批量 PID 控制器',
+     detail:'BatchPIDController：cmd_vel[surge,sway,yaw]+深度/姿态 PID → 8 通道 PWM。warpauv6 与 gsrov8 两套分配；gsrov8 用几何伪逆，把水平组与垂直组解耦。'},
+    {id:'thr', g:'dyn', x:1400, y:160, title:'thruster_dynamics.py', role:'推进器模型/几何',
+     detail:'GSROV_THRUSTERS 八推进器位置与朝向、GSROV_ACTION_TO_MAIN 通道映射、DynamicsFirstOrder 一阶滞后、推力曲线 T=T_max·u·|u|。'},
+    {id:'hydro', g:'dyn', x:1400, y:270, title:'rigid_body_hydrodynamics.py', role:'浮力 / 拖曳',
+     detail:'计算浮力(基于 COM→COB 偏移的恢复力矩)与粘性拖曳(基于相对流速)产生的力与力矩。'},
+    {id:'ocean', g:'dyn', x:1400, y:380, title:'ocean_current.py', role:'洋流场',
+     detail:'洋流场构建器：uniform / vortex / sine_wave / random 四种 + 时间调制 + 速度裁剪。v7 用 uniform medium(~0.4 m/s)。'},
+    {id:'alloc', g:'dyn', x:1400, y:490, title:'residual_rl/thruster_allocation.py', role:'推力分配矩阵',
+     detail:'build_allocation_from_geometry / allocate_thrusters：由推进器几何构造分配矩阵与伪逆，把目标 wrench 分解到各推进器。被 PID 调用。'},
+
+    // Assets (col 5)
+    {id:'gsrov', g:'asset', x:1740, y:110, title:'assets/gsrov.py', role:'GS-ROV 资产',
+     detail:'GS-ROV 资产定义：USD 路径、默认 mass=13.15、gsrov_robot_cfg() 工厂（use_real_usd=True 时加载真机 CAD 壳，否则用立方体代理）。'},
+    {id:'prep', g:'asset', x:1740, y:220, title:'rov/tools/prepare_gsrov_usd.py', role:'CAD→训练 USD',
+     detail:'把 CAD 导出的 GS-ROV USD 处理成可训练版本：居中到 COM、烘焙 mass/inertia/COM、加碰撞体。产物即 assets/gsrov.py 加载的 USD。'},
+  ];
+
+  const edges = [
+    ['train','sb3'],['sb3','envv7'],['bench','envv7'],['calib','envv7'],['debug','envv7'],
+    ['reg','envv7'],['reg','yaml'],
+    ['envv7','base'],['envv7','ocean'],['envv7','gsrov'],['envv7','raft'],
+    ['base','pid'],['base','thr'],['base','hydro'],['base','ocean'],['base','alloc'],
+    ['pid','alloc'],
+    ['yaml','policy'],['yaml','cnn'],['policy','cnn'],['cb','policy'],
+    ['gsrov','prep'],
+    ['menv','mcfg'],['menv','mdyn'],['menv','mmdp'],['mcfg','mmdp'],['mmdp','mdyn'],
+    ['mdyn','pid'],['mdyn','thr'],['mdyn','hydro'],
+    ['envv7old','base'],
+  ];
+
+  const byId = {}; nodes.forEach(n=>byId[n.id]=n);
+  const out = {}, inc = {};
+  nodes.forEach(n=>{out[n.id]=[];inc[n.id]=[];});
+  edges.forEach(([a,b])=>{ if(out[a]&&byId[b])out[a].push(b); if(inc[b]&&byId[a])inc[b].push(a); });
+
+  // ---------------- state ----------------
+  const cv = document.getElementById('cv');
+  const ctx = cv.getContext('2d');
+  const stage = document.getElementById('stage');
+  const tip = document.getElementById('tip');
+  const detailEl = document.getElementById('detail');
+
+  const view = {scale:1, ox:0, oy:0};
+  let dpr = window.devicePixelRatio || 1;
+  let Wcss = 0, Hcss = 0;
+  let hoverId = null, selectedId = null, query = '';
+  const hiddenGroups = new Set();
+
+  function resize(){
+    const r = stage.getBoundingClientRect();
+    Wcss = r.width; Hcss = r.height;
+    dpr = window.devicePixelRatio || 1;
+    cv.width = Math.round(Wcss*dpr);
+    cv.height = Math.round(Hcss*dpr);
+    draw();
+  }
+
+  // ---------------- view helpers ----------------
+  const WORLD = {w: 1740+W+40, h: 760+H+40};
+  function fitView(){
+    const sx = Wcss/(WORLD.w+40), sy = Hcss/(WORLD.h+40);
+    const s = Math.min(sx, sy);
+    view.scale = s;
+    view.ox = (Wcss - WORLD.w*s)/2 + 10*s;
+    view.oy = (Hcss - WORLD.h*s)/2 + 10*s;
+  }
+  function resetView(){ fitView(); draw(); }
+  function zoomBy(f){
+    // zoom about center
+    const cx = Wcss/2, cy = Hcss/2;
+    applyZoom(f, cx, cy);
+  }
+  function applyZoom(f, cx, cy){
+    const ns = Math.max(0.25, Math.min(3.5, view.scale*f));
+    const k = ns/view.scale;
+    view.ox = cx - (cx - view.ox)*k;
+    view.oy = cy - (cy - view.oy)*k;
+    view.scale = ns;
+    draw();
+  }
+  function toWorld(mx,my){ return { x:(mx-view.ox)/view.scale, y:(my-view.oy)/view.scale }; }
+
+  function matches(n){
+    if(query){ const q=query.toLowerCase();
+      return (n.title+' '+n.role+' '+n.detail).toLowerCase().includes(q);
+    }
+    return true;
+  }
+
+  // ---------------- draw ----------------
+  function roundRect(x,y,w,h,r){ctx.beginPath();ctx.moveTo(x+r,y);ctx.arcTo(x+w,y,x+w,y+h,r);ctx.arcTo(x+w,y+h,x,y+h,r);ctx.arcTo(x,y+h,x,y,r);ctx.arcTo(x,y,x+w,y,r);ctx.closePath();}
+
+  function borderPoint(cx,cy,w,h,tx,ty){
+    const dx=tx-cx, dy=ty-cy;
+    let s = Infinity;
+    if(Math.abs(dx)>1e-6) s=Math.min(s,(w/2)/Math.abs(dx));
+    if(Math.abs(dy)>1e-6) s=Math.min(s,(h/2)/Math.abs(dy));
+    if(!isFinite(s)) s=0;
+    return {x:cx+dx*s, y:cy+dy*s};
+  }
+
+  function nodeVisible(n){
+    if(hiddenGroups.has(n.g)) return false;
+    return true;
+  }
+
+  function draw(){
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,Wcss,Hcss);
+    // dot grid
+    ctx.save();
+    ctx.fillStyle='rgba(64,160,200,0.06)';
+    const gs=28*view.scale;
+    if(gs>8){
+      const x0=((view.ox%gs)+gs)%gs, y0=((view.oy%gs)+gs)%gs;
+      for(let x=x0;x<Wcss;x+=gs)for(let y=y0;y<Hcss;y+=gs){ctx.fillRect(x,y,1.4,1.4);}
+    }
+    ctx.restore();
+
+    ctx.setTransform(dpr*view.scale,0,0,dpr*view.scale, dpr*view.ox, dpr*view.oy);
+
+    // edges
+    edges.forEach(([a,b])=>{
+      const A=byId[a], B=byId[b]; if(!A||!B) return;
+      if(!nodeVisible(A)||!nodeVisible(B)) return;
+      const acx=A.x+W/2, acy=A.y+H/2, bcx=B.x+W/2, bcy=B.y+H/2;
+      const p1=borderPoint(acx,acy,W,H,bcx,bcy);
+      const p2=borderPoint(bcx,bcy,W,H,acx,acy);
+      const active = (hoverId&&(hoverId===a||hoverId===b)) || (selectedId&&(selectedId===a||selectedId===b));
+      let dim = query && !(matches(A)&&matches(B));
+      const col = GROUPS[B.g].color;
+      ctx.save();
+      ctx.globalAlpha = active?0.95:(dim?0.06:0.28);
+      ctx.strokeStyle = active?col:'#5f7488';
+      ctx.lineWidth = active?2.2:1.2;
+      // slight curve
+      const mx=(p1.x+p2.x)/2, my=(p1.y+p2.y)/2;
+      const dx=p2.x-p1.x, dy=p2.y-p1.y, len=Math.hypot(dx,dy)||1;
+      const off=Math.min(40,len*0.12), nx=-dy/len, ny=dx/len;
+      const cxq=mx+nx*off, cyq=my+ny*off;
+      ctx.beginPath(); ctx.moveTo(p1.x,p1.y); ctx.quadraticCurveTo(cxq,cyq,p2.x,p2.y); ctx.stroke();
+      // arrow head at p2 (toward B)
+      const ang=Math.atan2(p2.y-cyq,p2.x-cxq);
+      ctx.fillStyle=active?col:'#5f7488';
+      const ah=active?7:5;
+      ctx.beginPath();
+      ctx.moveTo(p2.x,p2.y);
+      ctx.lineTo(p2.x-ah*Math.cos(ang-0.42),p2.y-ah*Math.sin(ang-0.42));
+      ctx.lineTo(p2.x-ah*Math.cos(ang+0.42),p2.y-ah*Math.sin(ang+0.42));
+      ctx.closePath(); ctx.fill();
+      ctx.restore();
+    });
+
+    // nodes
+    nodes.forEach(n=>{
+      if(!nodeVisible(n)) return;
+      const g=GROUPS[n.g];
+      const m=matches(n);
+      const isHover = hoverId===n.id, isSel=selectedId===n.id;
+      const dim = query && !m;
+      ctx.save();
+      ctx.globalAlpha = dim?0.18:1;
+      // shadow/glow
+      if(isHover||isSel){
+        ctx.shadowColor=g.color; ctx.shadowBlur=18;
+      }
+      roundRect(n.x,n.y,W,H,11);
+      ctx.fillStyle = isSel? g.color+'33' : (isHover? g.color+'22' : '#0b1728');
+      ctx.fill();
+      ctx.shadowBlur=0;
+      ctx.lineWidth = isSel?2.6:(isHover?2.2:1.3);
+      ctx.strokeStyle = g.color;
+      ctx.stroke();
+      // left accent bar
+      ctx.save(); roundRect(n.x,n.y,W,H,11); ctx.clip();
+      ctx.fillStyle=g.color; ctx.fillRect(n.x,n.y,4,H); ctx.restore();
+
+      // title (wrap to 2 lines)
+      ctx.fillStyle='#eaf6ff'; ctx.font='600 12px '+monoFont();
+      ctx.textBaseline='top'; ctx.textAlign='left';
+      const lines = wrap(n.title, W-22, 12);
+      let ty=n.y+9;
+      lines.slice(0,2).forEach((ln,i)=>{ ctx.fillText(ln, n.x+13, ty); ty+=15; });
+      // role
+      ctx.fillStyle = g.color; ctx.font='11.5px '+monoFont();
+      ctx.fillText(n.role, n.x+13, n.y+H-19);
+      ctx.restore();
+    });
+
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+  }
+
+  function monoFont(){ return '"JetBrains Mono",Menlo,Consolas,monospace'; }
+  function wrap(text, maxW, fontPx){
+    // crude char-based wrap using measureText
+    ctx.save(); ctx.font='600 '+fontPx+'px '+monoFont();
+    const words = text.split('');
+    const lines=[]; let cur='';
+    for(const ch of words){
+      if(ctx.measureText(cur+ch).width > maxW && cur){
+        lines.push(cur); cur=ch;
+      } else cur+=ch;
+    }
+    if(cur) lines.push(cur);
+    ctx.restore();
+    return lines;
+  }
+
+  // ---------------- hit test & events ----------------
+  function hitTest(mx,my){
+    const p=toWorld(mx,my);
+    for(let i=nodes.length-1;i>=0;i--){
+      const n=nodes[i];
+      if(!nodeVisible(n)) continue;
+      if(p.x>=n.x&&p.x<=n.x+W&&p.y>=n.y&&p.y<=n.y+H) return n;
+    }
+    return null;
+  }
+
+  let dragging=false, dragMoved=false, lastX=0,lastY=0, downId=null;
+
+  cv.addEventListener('pointerdown',e=>{
+    const r=cv.getBoundingClientRect();
+    const mx=e.clientX-r.left, my=e.clientY-r.top;
+    downId = hitTest(mx,my);
+    dragging=true; dragMoved=false; lastX=mx; lastY=my; cv.classList.add('drag');
+    cv.setPointerCapture(e.pointerId);
+  });
+  cv.addEventListener('pointermove',e=>{
+    const r=cv.getBoundingClientRect();
+    const mx=e.clientX-r.left, my=e.clientY-r.top;
+    if(dragging){
+      const dx=mx-lastX, dy=my-lastY;
+      if(Math.abs(dx)+Math.abs(dy)>3) dragMoved=true;
+      view.ox+=dx; view.oy+=dy; lastX=mx; lastY=my;
+      draw();
+      return;
+    }
+    const n=hitTest(mx,my);
+    if((n?n.id:null)!==hoverId){
+      hoverId = n?n.id:null;
+      draw();
+    }
+    if(n){
+      tip.style.opacity='1';
+      tip.innerHTML = `<b>${escapeHtml(n.title)}</b><span>${escapeHtml(n.role)}</span>`;
+      let tx=mx+16, ty=my+16;
+      if(tx+300>Wcss) tx=mx-300-16;
+      if(ty+90>Hcss) ty=my-90-16;
+      tip.style.left=tx+'px'; tip.style.top=ty+'px';
+      cv.style.cursor='pointer';
+    } else {
+      tip.style.opacity='0';
+      cv.style.cursor= dragging?'grabbing':'grab';
+    }
+  });
+  cv.addEventListener('pointerup',e=>{
+    dragging=false; cv.classList.remove('drag');
+    if(!dragMoved && downId){ select(downId.id); }
+    downId=null;
+  });
+  cv.addEventListener('pointerleave',()=>{ tip.style.opacity='0'; hoverId=null; draw(); });
+  cv.addEventListener('dblclick',e=>{
+    const r=cv.getBoundingClientRect();
+    const n=hitTest(e.clientX-r.left, e.clientY-r.top);
+    if(n){ focusNode(n); }
+  });
+  cv.addEventListener('wheel',e=>{
+    e.preventDefault();
+    const r=cv.getBoundingClientRect();
+    const cx=e.clientX-r.left, cy=e.clientY-r.top;
+    applyZoom(e.deltaY<0?1.12:1/1.12, cx, cy);
+  },{passive:false});
+
+  function focusNode(n){
+    const targetScale = Math.max(view.scale, 1.1);
+    view.scale = targetScale;
+    view.ox = Wcss/2 - (n.x+W/2)*targetScale;
+    view.oy = Hcss/2 - (n.y+H/2)*targetScale;
+    draw();
+  }
+
+  function select(id){
+    selectedId=id; draw();
+    const n=byId[id];
+    const g=GROUPS[n.g];
+    const dep = out[id].map(x=>byId[x].title);
+    const use = inc[id].map(x=>byId[x].title);
+    let html = `<div class="d-grp" style="color:${g.color};background:${g.color}1a;border:1px solid ${g.color}55">${g.name}</div>`;
+    html += `<div class="d-title">${escapeHtml(n.title)}</div>`;
+    html += `<div class="d-role">${escapeHtml(n.role)}</div>`;
+    html += `<div class="d-body">${escapeHtml(n.detail)}</div>`;
+    if(dep.length){
+      html += `<div class="d-sec">依赖 / 调用 (→)</div><div class="d-chips">`+
+        dep.map(t=>`<span class="d-chip" onclick="jumpTo('${escapeAttr(t)}')">${escapeHtml(t)}</span>`).join('')+`</div>`;
+    }
+    if(use.length){
+      html += `<div class="d-sec">被谁使用 (←)</div><div class="d-chips">`+
+        use.map(t=>`<span class="d-chip" onclick="jumpTo('${escapeAttr(t)}')">${escapeHtml(t)}</span>`).join('')+`</div>`;
+    }
+    detailEl.innerHTML = html;
+  }
+
+  window.jumpTo = function(title){
+    const n = nodes.find(x=>x.title===title);
+    if(n){ select(n.id); focusNode(n); }
+  };
+
+  function onSearch(){
+    query = document.getElementById('q').value.trim();
+    draw();
+  }
+  window.onSearch = onSearch;
+
+  // legend
+  (function buildLegend(){
+    const el=document.getElementById('legend');
+    Object.entries(GROUPS).forEach(([k,g])=>{
+      const chip=document.createElement('span');
+      chip.className='chip'; chip.dataset.k=k;
+      chip.innerHTML=`<i style="background:${g.color}"></i>${g.name}`;
+      chip.onclick=()=>{
+        if(hiddenGroups.has(k)){hiddenGroups.delete(k);chip.classList.remove('off');}
+        else{hiddenGroups.add(k);chip.classList.add('off');}
+        draw();
+      };
+      el.appendChild(chip);
+    });
+  })();
+
+  function escapeHtml(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+  function escapeAttr(s){return String(s).replace(/'/g,"\\'");}
+
+  window.resetView=resetView; window.zoomBy=zoomBy;
+
+  window.addEventListener('resize',()=>{resize();});
+  // init
+  resize(); fitView(); draw();
+})();
+</script>
+</body>
+</html>

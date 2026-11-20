@@ -1,0 +1,8 @@
+{
+  "qgc_path": "E:/Tools/QGroundControl/bin/QGroundControl.exe",
+  "pi_ip": "192.168.1.3",
+  "control_port": 14550,
+  "telemetry_port": 14551,
+  "target_system": 1,
+  "rate_hz": 25
+}

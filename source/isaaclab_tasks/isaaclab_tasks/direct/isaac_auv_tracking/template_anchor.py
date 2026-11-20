@@ -30,8 +30,8 @@ def update_template_anchor(
     flow_w: int,
     crop_h: int,
     crop_w: int,
-    f_px: float,
-    plane_distance: float,
+    f_px: float | torch.Tensor,
+    plane_distance: float | torch.Tensor,
     local_x: torch.Tensor,
     yaw: torch.Tensor,
 ) -> None:
@@ -46,6 +46,10 @@ def update_template_anchor(
       anchor_disp_m (N,)    |offset| in metres on the fronto-parallel plane.
       anchor_yaw (N,)       heading at capture.
     On the capture step offset = 0 and ncc = 1.
+
+    ``f_px`` and ``plane_distance`` accept a scalar or a per-env (N,) tensor. They are the
+    estimator's calibration PRIOR, not the true camera: two units in one batch may believe
+    different things about their own intrinsics and standoff (see ``dr_visodom_*``).
     """
     fh, fw = int(flow_h), int(flow_w)
     ch, cw = int(crop_h), int(crop_w)
@@ -94,5 +98,15 @@ def update_template_anchor(
     if bool(valid.any()):
         # d = |px| · Z / f_px. Z is the env-local forward distance to the plane
         # (origins are spaced tens of metres apart, so world x would be wrong).
-        z_plane = (float(plane_distance) - local_x).clamp(min=0.3)
-        anchor_disp_m[valid] = anchor_off_px[valid].norm(dim=-1) / float(f_px) * z_plane[valid]
+        # Both may be per-env: they carry the calibration the estimator BELIEVES, which
+        # is how a wrong intrinsics / unknown standoff enters the metric output.
+        dev = anchor_off_px.device
+        pd = torch.as_tensor(plane_distance, device=dev, dtype=torch.float32)
+        fp = torch.as_tensor(f_px, device=dev, dtype=torch.float32)
+        z_plane = (pd - local_x).clamp(min=0.3)
+        d_px = anchor_off_px[valid].norm(dim=-1)
+        if z_plane.dim():
+            z_plane = z_plane[valid]
+        if fp.dim():
+            fp = fp[valid]
+        anchor_disp_m[valid] = d_px / fp * z_plane

@@ -1,0 +1,5 @@
+# Requires prepared_gentle_attitude_20261008 firmware.
+# Roll/pitch outer angle gain reduced; combined correction capped at 25%.
+1	1	ATC_ANG_RLL_P	2	9
+1	1	ATC_ANG_PIT_P	2	9
+1	1	MOT_RP_MAX	25	9

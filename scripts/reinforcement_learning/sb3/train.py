@@ -45,6 +45,20 @@ parser.add_argument(
     help="AUV-Tracking Direct-v0 KF measurement: geometric GT (fast) or OceanSim sonar.",
 )
 parser.add_argument("--rew_speed", type=float, default=None, help="Override rew_scale_speed (v2 speed match).")
+parser.add_argument(
+    "--action_delay_max",
+    type=int,
+    default=None,
+    help="Override train_action_delay_max_steps: sample the actuator-side dead time per episode "
+    "as a uniform integer in [0, N] control steps (1 step = 66.7 ms). 0 disables it.",
+)
+parser.add_argument(
+    "--action_delay_fixed",
+    type=int,
+    default=None,
+    help="Override train_action_delay_fixed_steps: one constant dead time of N control steps "
+    "for every episode and every env (-1 disables). Takes priority over --action_delay_max.",
+)
 parser.add_argument("--rew_ref", type=float, default=None, help="Override rew_scale_ref (v2 reference distance).")
 parser.add_argument("--rew_ref_sigma", type=float, default=None, help="Override rew_ref_sigma (v2 ref gaussian width).")
 parser.add_argument("--flow_method", type=str, default=None, choices=["farneback", "raft"],
@@ -116,7 +130,7 @@ from typing import Any
 
 import omni
 from stable_baselines3 import PPO, SAC
-from stable_baselines3.common.callbacks import CheckpointCallback, LogEveryNTimesteps
+from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback, LogEveryNTimesteps
 
 from isaaclab_tasks.direct.isaac_auv_tracking.agents.gate_log_callback import (
     CriticGateLogCallback,
@@ -124,6 +138,40 @@ from isaaclab_tasks.direct.isaac_auv_tracking.agents.gate_log_callback import (
 )
 from stable_baselines3.common.noise import NormalActionNoise
 from stable_baselines3.common.vec_env import VecNormalize
+
+
+class EntCoefFloorCallback(BaseCallback):
+    """Keep SAC's auto-tuned temperature above a floor.
+
+    SB3 parameterises the temperature as log(alpha) inside ``log_ent_coef``, so the floor is
+    enforced by clamping that parameter and leaving the auto-tuner free above it. Fixing
+    ent_coef outright would disable the tuner, which is what works well in the first 100 k;
+    arms F/G/H only collapsed after alpha decayed to 0.006-0.009, so a floor targets exactly
+    that window.
+    """
+
+    def __init__(self, floor: float, verbose: int = 0):
+        super().__init__(verbose)
+        self.floor = float(max(floor, 0.0))
+        self._log_floor = float(np.log(self.floor)) if self.floor > 0.0 else None
+        self.hits = 0
+
+    def _on_step(self) -> bool:
+        if self._log_floor is None:
+            return True
+        log_ent = getattr(self.model, "log_ent_coef", None)
+        if log_ent is None:
+            return True
+        current = float(log_ent.detach().cpu().item())
+        if current < self._log_floor:
+            log_ent.data.fill_(self._log_floor)
+            self.hits += 1
+            if self.hits % 5000 == 1:
+                print(
+                    f"[INFO] ent_coef floor clamped: {self.hits} time(s), floor={self.floor:.4f}",
+                    flush=True,
+                )
+        return True
 
 
 def _resolve_sb3_class(spec: Any) -> Any:
@@ -190,6 +238,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         env_cfg.kf_measurement = args_cli.kf_measurement
     if args_cli.rew_speed is not None and hasattr(env_cfg, "rew_scale_speed"):
         env_cfg.rew_scale_speed = args_cli.rew_speed
+    if args_cli.action_delay_max is not None and hasattr(env_cfg, "train_action_delay_max_steps"):
+        env_cfg.train_action_delay_max_steps = int(args_cli.action_delay_max)
+    if args_cli.action_delay_fixed is not None and hasattr(env_cfg, "train_action_delay_fixed_steps"):
+        env_cfg.train_action_delay_fixed_steps = int(args_cli.action_delay_fixed)
     if args_cli.rew_ref is not None and hasattr(env_cfg, "rew_scale_ref"):
         env_cfg.rew_scale_ref = args_cli.rew_ref
     if args_cli.rew_ref_sigma is not None and hasattr(env_cfg, "rew_ref_sigma"):
@@ -276,6 +328,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # Use per-action shape (act_dim,) so it broadcasts to (num_envs, act_dim) — never bake in num_envs.
     use_action_noise = bool(agent_cfg.pop("use_action_noise", True))
     noise_std = float(agent_cfg.pop("action_noise_std", 0.05))
+    # Custom key, must leave agent_cfg before SAC() sees it. 0.0 = disabled.
+    ent_coef_floor = float(agent_cfg.pop("ent_coef_floor", 0.0))
     act_shape = tuple(int(x) for x in env.action_space.shape)
     act_dim = int(act_shape[-1]) if act_shape else 1
 
@@ -307,8 +361,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # Without dividing by num_envs, e.g. 3e6//20=1.5e5 with 32 envs ⇒ first ckpt at 4.8e6
     # (never reached) — so a crash leaves no model.zip.
     num_envs = int(env.num_envs)
-    # Save often enough for short smoke runs while retaining a 5% cadence for long runs.
-    ckpt_transitions = max(1_000, int(n_timesteps // 20))  # ~every 5% of the run
+    # Save often enough for short smoke runs while retaining a 2.5% cadence for long runs.
+    # Was n_timesteps // 20 (5% => 50 k steps here). Arm G's tripwire fired at 197 k, so the
+    # best state it ever reached (173 k, disp_spawn 28.9 mm) was never on disk and only the
+    # 150 k checkpoint survived. 2.5% halves that exposure.
+    ckpt_transitions = max(1_000, int(n_timesteps // 40))
     ckpt_every = max(1, ckpt_transitions // num_envs)
     print(
         f"[INFO] Checkpoint every {ckpt_every} VecEnv steps "
@@ -320,6 +377,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         LogEveryNTimesteps(n_steps=args_cli.log_interval),
         CriticGateLogCallback(),
         EpisodeRewardLogCallback(),
+        EntCoefFloorCallback(ent_coef_floor),
     ]
 
     # train the agent

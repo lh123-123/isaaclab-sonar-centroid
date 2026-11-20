@@ -1,0 +1,976 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Isaac-AUV-Tracking · v7 Flow-Hover (GS-ROV) · 系统总览</title>
+<style>
+  :root {
+    --bg: #060b14;
+    --bg2: #0a1424;
+    --panel: rgba(16, 28, 48, 0.72);
+    --panel-solid: #0e1a2e;
+    --border: rgba(64, 160, 200, 0.18);
+    --border-strong: rgba(64, 190, 220, 0.4);
+    --txt: #dbe7f4;
+    --txt-dim: #8ba3bd;
+    --txt-faint: #5c7188;
+    --cyan: #3fd0e0;
+    --teal: #26c6a6;
+    --blue: #4d8ff5;
+    --violet: #9a7bff;
+    --amber: #f5b14d;
+    --rose: #ff6b8a;
+    --green: #56d67b;
+    --mono: "SFMono-Regular", "JetBrains Mono", Menlo, Consolas, monospace;
+    --sans: "Inter", -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html { scroll-behavior: smooth; }
+  body {
+    font-family: var(--sans);
+    background:
+      radial-gradient(1200px 700px at 12% -8%, rgba(38, 120, 180, 0.22), transparent 60%),
+      radial-gradient(1000px 600px at 95% 0%, rgba(38, 198, 166, 0.14), transparent 55%),
+      radial-gradient(900px 800px at 50% 120%, rgba(77, 143, 245, 0.12), transparent 60%),
+      var(--bg);
+    color: var(--txt);
+    line-height: 1.6;
+    min-height: 100vh;
+    -webkit-font-smoothing: antialiased;
+  }
+  a { color: var(--cyan); text-decoration: none; }
+  code, .mono { font-family: var(--mono); }
+
+  /* ---- Top bar ---- */
+  header.top {
+    position: sticky; top: 0; z-index: 50;
+    backdrop-filter: blur(14px);
+    background: linear-gradient(180deg, rgba(6, 11, 20, 0.92), rgba(6, 11, 20, 0.66));
+    border-bottom: 1px solid var(--border);
+  }
+  .top-inner {
+    max-width: 1280px; margin: 0 auto; padding: 14px 28px;
+    display: flex; align-items: center; gap: 18px; flex-wrap: wrap;
+  }
+  .brand { display: flex; align-items: center; gap: 12px; font-weight: 700; letter-spacing: .3px; }
+  .brand .dot {
+    width: 12px; height: 12px; border-radius: 50%;
+    background: radial-gradient(circle at 30% 30%, #7ff0ff, var(--cyan));
+    box-shadow: 0 0 14px var(--cyan);
+  }
+  .brand small { color: var(--txt-dim); font-weight: 500; font-size: 12px; }
+  nav.toc { margin-left: auto; display: flex; gap: 6px; flex-wrap: wrap; }
+  nav.toc a {
+    font-size: 12.5px; color: var(--txt-dim); padding: 6px 11px; border-radius: 8px;
+    border: 1px solid transparent; transition: all .18s;
+    white-space: nowrap;
+  }
+  nav.toc a:hover { color: var(--txt); border-color: var(--border); background: rgba(40,120,160,.12); }
+
+  main { max-width: 1280px; margin: 0 auto; padding: 40px 28px 120px; }
+
+  /* ---- Hero ---- */
+  .hero { margin-bottom: 44px; }
+  .hero .kicker {
+    display: inline-flex; align-items: center; gap: 8px;
+    font-size: 12px; letter-spacing: 2px; text-transform: uppercase;
+    color: var(--teal); font-weight: 700; margin-bottom: 16px;
+    padding: 6px 14px; border: 1px solid var(--border-strong); border-radius: 999px;
+    background: rgba(38,198,166,.08);
+  }
+  .hero h1 {
+    font-size: clamp(30px, 4.4vw, 52px); line-height: 1.08; font-weight: 800; letter-spacing: -1px;
+    background: linear-gradient(120deg, #eaf6ff 0%, #7fe6ff 40%, #3fd0e0 70%, #26c6a6 100%);
+    -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent;
+    margin-bottom: 14px;
+  }
+  .hero p.lead { color: var(--txt-dim); font-size: 17px; max-width: 860px; }
+
+  .stat-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px,1fr)); gap: 14px; margin-top: 28px; }
+  .stat {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 14px;
+    padding: 16px 18px; position: relative; overflow: hidden;
+  }
+  .stat::before {
+    content: ""; position: absolute; inset: 0 auto 0 0; width: 3px;
+    background: linear-gradient(180deg, var(--cyan), var(--teal));
+  }
+  .stat .v { font-size: 24px; font-weight: 800; color: #eaf6ff; font-family: var(--mono); }
+  .stat .l { font-size: 12px; color: var(--txt-dim); margin-top: 2px; letter-spacing: .4px; }
+
+  /* ---- Sections ---- */
+  section { margin: 56px 0; scroll-margin-top: 80px; }
+  .sec-head { display: flex; align-items: baseline; gap: 14px; margin-bottom: 22px; }
+  .sec-head .num {
+    font-family: var(--mono); font-size: 13px; color: var(--cyan); font-weight: 700;
+    padding: 3px 9px; border: 1px solid var(--border-strong); border-radius: 7px;
+    background: rgba(63,208,224,.08);
+  }
+  .sec-head h2 { font-size: 26px; font-weight: 800; letter-spacing: -.4px; }
+
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+  .grid3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; }
+  @media (max-width: 900px) { .grid2, .grid3 { grid-template-columns: 1fr; } }
+
+  .card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 16px;
+    padding: 22px; position: relative;
+    box-shadow: 0 10px 40px -24px rgba(0,0,0,.9);
+  }
+  .card.span2 { grid-column: span 2; }
+  @media (max-width: 900px){ .card.span2 { grid-column: span 1; } }
+  .card h3 {
+    font-size: 15px; font-weight: 700; color: #eaf6ff; margin-bottom: 14px;
+    display: flex; align-items: center; gap: 9px; letter-spacing: .2px;
+  }
+  .card h3 .ic {
+    width: 26px; height: 26px; border-radius: 8px; display: grid; place-items: center;
+    background: rgba(63,208,224,.12); border: 1px solid var(--border); font-size: 14px;
+  }
+  .card p { color: var(--txt-dim); font-size: 14px; }
+  .card p + p { margin-top: 10px; }
+
+  /* ---- Tables ---- */
+  table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+  th, td { text-align: left; padding: 9px 10px; border-bottom: 1px solid rgba(64,160,200,.10); }
+  th { color: var(--txt-faint); font-weight: 600; font-size: 11.5px; text-transform: uppercase; letter-spacing: .8px; }
+  td.k { color: var(--txt-dim); white-space: nowrap; }
+  td.v { color: #eaf6ff; font-family: var(--mono); font-size: 12.8px; }
+  td.note { color: var(--txt-faint); font-size: 12px; }
+  tr:last-child td { border-bottom: none; }
+  .tag {
+    display: inline-block; font-family: var(--mono); font-size: 11px; padding: 1px 7px;
+    border-radius: 6px; background: rgba(63,208,224,.1); border: 1px solid var(--border);
+    color: var(--cyan);
+  }
+  .tag.g { color: var(--green); background: rgba(86,214,123,.1); border-color: rgba(86,214,123,.3);}
+  .tag.a { color: var(--amber); background: rgba(245,177,77,.1); border-color: rgba(245,177,77,.3);}
+  .tag.r { color: var(--rose); background: rgba(255,107,138,.1); border-color: rgba(255,107,138,.3);}
+  .tag.v { color: var(--violet); background: rgba(154,123,255,.1); border-color: rgba(154,123,255,.3);}
+
+  /* ---- Formula ---- */
+  .formula {
+    font-family: var(--mono); font-size: 13.5px; color: #cfefff;
+    background: #08111f; border: 1px solid var(--border); border-left: 3px solid var(--cyan);
+    border-radius: 10px; padding: 14px 16px; overflow-x: auto; line-height: 1.9; white-space: pre;
+  }
+  .formula .c { color: var(--txt-faint); }
+  .formula .hi { color: var(--amber); }
+
+  /* ---- Canvas ---- */
+  .canvas-wrap { position: relative; border-radius: 14px; overflow: hidden; background: #060d18; border: 1px solid var(--border); }
+  canvas { display: block; width: 100%; height: auto; }
+
+  .legend { display: flex; flex-wrap: wrap; gap: 16px; margin-top: 14px; font-size: 12.5px; color: var(--txt-dim); }
+  .legend span { display: inline-flex; align-items: center; gap: 7px; }
+  .legend i { width: 12px; height: 12px; border-radius: 3px; display: inline-block; }
+
+  /* ---- Pills / channel list ---- */
+  .chans { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px,1fr)); gap: 10px; }
+  .chan {
+    border-radius: 10px; padding: 12px; border: 1px solid var(--border); background: #0a1526;
+    font-size: 12.5px;
+  }
+  .chan .sw { height: 30px; border-radius: 6px; margin-bottom: 8px; }
+  .chan b { display: block; color: #eaf6ff; font-family: var(--mono); font-size: 12.5px; }
+  .chan small { color: var(--txt-faint); }
+
+  ul.clean { list-style: none; }
+  ul.clean li { padding: 7px 0 7px 24px; position: relative; color: var(--txt-dim); font-size: 14px; border-bottom: 1px dashed rgba(64,160,200,.1); }
+  ul.clean li:last-child { border-bottom: none; }
+  ul.clean li::before { content: "▸"; position: absolute; left: 4px; color: var(--teal); }
+  ul.clean li b { color: #eaf6ff; font-family: var(--mono); font-weight: 600; }
+
+  footer { text-align: center; color: var(--txt-faint); font-size: 12.5px; padding: 40px 0 0; border-top: 1px solid var(--border); margin-top: 60px; }
+  .flow-note { font-size: 12px; color: var(--txt-faint); margin-top: 10px; }
+</style>
+</head>
+<body>
+
+<header class="top">
+  <div class="top-inner">
+    <div class="brand"><span class="dot"></span> AUV Tracking <small>· Direct-v7 Flow-Hover · GS-ROV</small></div>
+    <nav class="toc">
+      <a href="#overview">任务概述</a>
+      <a href="#network">网络结构</a>
+      <a href="#hyper">超参数</a>
+      <a href="#dynamics">动力学</a>
+      <a href="#camera">相机</a>
+      <a href="#flow">光流</a>
+      <a href="#reward">奖励</a>
+      <a href="#termination">终止</a>
+      <a href="#ocean">洋流</a>
+      <a href="#env">环境</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+
+  <!-- HERO -->
+  <div class="hero">
+    <span class="kicker">● 远端服务器训练配置 · RTX 3090 24GB / 62GB RAM</span>
+    <h1>光流零化悬停<br>Optical-Flow Nulling Station Keeping</h1>
+    <p class="lead">
+      基于 <b>GS-ROV 8 推进器真实刚体</b> 的水下机器人定点悬停任务。没有目标物体：
+      机器人通过把<b>整幅图像光流驱动到零</b>来保持位置，从而在洋流中逆流锁定站位。
+      非对称 Actor-Critic：Actor 看 RGB+光流图像，Critic 只看 9 维自运动状态。
+    </p>
+    <div class="stat-row">
+      <div class="stat"><div class="v">15 Hz</div><div class="l">策略频率 (decim 8 @ 1/120)</div></div>
+      <div class="stat"><div class="v">3-D</div><div class="l">动作 [surge, sway, yaw]</div></div>
+      <div class="stat"><div class="v">7×64×64</div><div class="l">图像观测通道</div></div>
+      <div class="stat"><div class="v">2M</div><div class="l">训练步数 (SAC)</div></div>
+      <div class="stat"><div class="v">8</div><div class="l">并行环境数</div></div>
+    </div>
+  </div>
+
+  <!-- 1. OVERVIEW -->
+  <section id="overview">
+    <div class="sec-head"><span class="num">01</span><h2>任务概述 · Task Overview</h2></div>
+    <div class="grid2">
+      <div class="card">
+        <h3><span class="ic">◎</span>环境标识</h3>
+        <table>
+          <tr><td class="k">Gym ID</td><td class="v">Isaac-AUV-Tracking-Direct-v7-flow-hover</td></tr>
+          <tr><td class="k">核心实现</td><td class="v">AUVTrackingV7FlowHoverGsrovEnv</td></tr>
+          <tr><td class="k">任务类型</td><td class="v">Station-keeping / Hover</td></tr>
+          <tr><td class="k">控制目标</td><td class="v">whole-image flow → 0</td></tr>
+          <tr><td class="k">环境布局</td><td class="v">4×4×4 m 水池，ROV @ 原点</td></tr>
+          <tr><td class="k">物理步长</td><td class="v">dt = 1/120 s</td></tr>
+        </table>
+      </div>
+      <div class="card">
+        <h3><span class="ic">◈</span>观测 / 动作空间</h3>
+        <table>
+          <tr><td class="k">观测类型</td><td class="v">Dict{ image, state }</td></tr>
+          <tr><td class="k">image</td><td class="v">(7, 64, 64) float32 ∈ [-1,1]</td></tr>
+          <tr><td class="k">state</td><td class="v">(9,) 自运动状态</td></tr>
+          <tr><td class="k">动作空间</td><td class="v">Box[-1,1] × 3</td></tr>
+          <tr><td class="k">动作缩放</td><td class="v">×0.5 m/s / 0.5 rad/s</td></tr>
+          <tr><td class="k">回合长度</td><td class="v">40 s ≈ 600 策略步</td></tr>
+        </table>
+      </div>
+      <div class="card span2">
+        <h3><span class="ic">✎</span>任务定义</h3>
+        <p>
+          v7 用一台朝前、<b>正立无 180° 翻转</b>的相机观察前方 4×4 m 的<b>纹理平面</b>（固定在地面坐标系）。
+          图像光流为零 ⇔ 相机相对地面静止，所以「驱动光流到零」等价于「在地面系定点悬停」。
+        </p>
+        <p>
+          在有洋流时，光流观测（du/dv）告诉策略水流方向，而奖励被重塑为「静止（锁定地面）得高奖励、随流漂移不得分」。
+          于是策略学会持续<b>逆流推进</b>直到净位移消失——完全由光流线索驱动的「顶流悬停」目标。
+        </p>
+        <p class="flow-note">注：v7 统一由 GS-ROV 8 推进器版本（auv_tracking_v7_flow_hover_gsrov_env.py）承接训练，旧 WarpAUV/RAFT 实现已删除。</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- 2. NETWORK -->
+  <section id="network">
+    <div class="sec-head"><span class="num">02</span><h2>网络结构 · Actor / Critic</h2></div>
+    <div class="card span2" style="margin-bottom:20px">
+      <h3><span class="ic">⧉</span>非对称结构数据流</h3>
+      <div class="canvas-wrap"><canvas id="archCanvas" width="1200" height="420" data-w="1200" data-h="420"></canvas></div>
+      <div class="legend">
+        <span><i style="background:#4d8ff5"></i>图像分支 (Actor)</span>
+        <span><i style="background:#9a7bff"></i>状态分支 (Critic)</span>
+        <span><i style="background:#26c6a6"></i>特征 / 输出</span>
+        <span><i style="background:#f5b14d"></i>动作</span>
+      </div>
+    </div>
+    <div class="grid2">
+      <div class="card">
+        <h3><span class="ic">A</span>Actor — MidCNNExtractor + π</h3>
+        <table>
+          <tr><td class="k">输入</td><td class="v">image (7,64,64)</td></tr>
+          <tr><td class="k">第一层卷积</td><td class="v">Conv2d(7→32, k5,s2)</td></tr>
+          <tr><td class="k">Conv 堆叠</td><td class="v">32→64→64→128→128</td></tr>
+          <tr><td class="k">下采样</td><td class="v">64→32→16→16→8→8</td></tr>
+          <tr><td class="k">头部</td><td class="v">GAP(128) ⊕ Softmax(2×128)=384</td></tr>
+          <tr><td class="k">Trunk</td><td class="v">Linear→256 · LayerNorm · Tanh</td></tr>
+          <tr><td class="k">策略 MLP (pi)</td><td class="v">[256, 256]</td></tr>
+          <tr><td class="k">输出</td><td class="v">tanh-Gaussian, 3-D 动作</td></tr>
+        </table>
+      </div>
+      <div class="card">
+        <h3><span class="ic">C</span>Critic — StateCritic (Q)</h3>
+        <table>
+          <tr><td class="k">输入</td><td class="v">state (9) ⊕ action (3)</td></tr>
+          <tr><td class="k">回路数</td><td class="v">2 个独立 Q 网络 (n_critics=2)</td></tr>
+          <tr><td class="k">MLP (qf)</td><td class="v">[256, 256]</td></tr>
+          <tr><td class="k">输出</td><td class="v">Q(s,a) 标量</td></tr>
+          <tr><td class="k">图像输入</td><td class="v">✕ 不使用（只看状态）</td></tr>
+          <tr><td class="k">特征共享</td><td class="v">share_features_extractor = False</td></tr>
+        </table>
+        <p style="margin-top:12px">非对称设计的理由：Critic 拿干净的 9 维真值状态做稳定的价值估计，Actor 被迫只从像素+光流中提取制导信息（"往哪走 / 左还是右"）。</p>
+      </div>
+      <div class="card span2">
+        <h3><span class="ic">⟡</span>空间 Softmax 头（为何不全局平均池化）</h3>
+        <p>
+          CNN 最后一层保持 <b>8×8 空间图</b>。头部发射 <code>concat(GAP, spatial-softmax)</code>：
+        </p>
+        <ul class="clean">
+          <li><b>GAP (C)</b> → "有没有东西、有多大"（外观 / 视距），平移不变。</li>
+          <li><b>soft-argmax (2C)</b> → "它在哪"（方位），平移等变——把证据移动一格，预测坐标随之移动。</li>
+        </ul>
+        <p class="flow-note">实测：纯 GAP 在合成图上横扫 blob 相对输出变化 ≈0.0000（完全左右镜像对称，方位信息丢失）；加 soft-argmax 后跨度达 1.43。约 0.3M 参数 / ~30M MACs，远轻于 ResNet18（11.2M / 161M）。</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- 3. HYPERPARAMS -->
+  <section id="hyper">
+    <div class="sec-head"><span class="num">03</span><h2>RL 超参数 · SAC</h2></div>
+    <div class="grid2">
+      <div class="card">
+        <h3><span class="ic">⚙</span>核心 SAC 参数</h3>
+        <table>
+          <tr><td class="k">算法</td><td class="v">SAC (Stable-Baselines3)</td></tr>
+          <tr><td class="k">seed</td><td class="v">66</td></tr>
+          <tr><td class="k">n_timesteps</td><td class="v">2,000,000</td></tr>
+          <tr><td class="k">learning_rate</td><td class="v">3.0e-4</td></tr>
+          <tr><td class="k">buffer_size</td><td class="v">500,000</td></tr>
+          <tr><td class="k">learning_starts</td><td class="v">10,000</td></tr>
+          <tr><td class="k">batch_size</td><td class="v">256</td></tr>
+          <tr><td class="k">gamma (γ)</td><td class="v">0.99</td></tr>
+          <tr><td class="k">tau (τ)</td><td class="v">0.005</td></tr>
+        </table>
+      </div>
+      <div class="card">
+        <h3><span class="ic">↻</span>更新与探索</h3>
+        <table>
+          <tr><td class="k">train_freq</td><td class="v">1</td></tr>
+          <tr><td class="k">gradient_steps</td><td class="v">4</td></tr>
+          <tr><td class="k">target_update_interval</td><td class="v">16</td></tr>
+          <tr><td class="k">ent_coef</td><td class="v">"auto"</td></tr>
+          <tr><td class="k">target_entropy</td><td class="v">"auto"</td></tr>
+          <tr><td class="k">normalize_input / value</td><td class="v">false / false</td></tr>
+          <tr><td class="k">action_noise</td><td class="v">true, std = 0.1</td></tr>
+          <tr><td class="k">device</td><td class="v">cuda:0</td></tr>
+          <tr><td class="k">num_envs</td><td class="v">8 (并行 rollout)</td></tr>
+        </table>
+      </div>
+      <div class="card span2">
+        <h3><span class="ic">◫</span>策略配置 (policy_kwargs)</h3>
+        <div class="formula">policy_kwargs:
+  share_features_extractor: false
+  net_arch:
+    pi: [256, 256]        <span class="c"># Actor MLP</span>
+    qf: [256, 256]        <span class="c"># Critic MLP ×2</span>
+  features_extractor_class: MidCNNExtractor
+  features_extractor_kwargs:
+    features_dim: 256
+
+n_steps: 1                <span class="c"># 每 rollout 采 1 步</span>
+policy: CustomSACPolicy   <span class="c"># 非对称 Actor(图像)/Critic(状态)</span></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 4. DYNAMICS -->
+  <section id="dynamics">
+    <div class="sec-head"><span class="num">04</span><h2>AUV/ROV 动力学 · GS-ROV 8-Thruster</h2></div>
+    <div class="grid2" style="margin-bottom:20px">
+      <div class="card">
+        <h3><span class="ic">⚖</span>刚体与流体物理</h3>
+        <table>
+          <tr><td class="k">质量 mass</td><td class="v">13.15 kg</td></tr>
+          <tr><td class="k">排水体积 volume</td><td class="v">0.01295 m³ (~12.95 L)</td></tr>
+          <tr><td class="k">惯性矩 diag</td><td class="v">(0.297, 0.440, 0.545) kg·m²</td></tr>
+          <tr><td class="k">COM→COB 偏移</td><td class="v">(0.040, 0.0, 0.11) m</td></tr>
+          <tr><td class="k">自由浮动配平</td><td class="v">-20.0° 俯仰 (抬头)</td></tr>
+          <tr><td class="k">水密度 ρ</td><td class="v">997 kg/m³</td></tr>
+          <tr><td class="k">粘性系数 β</td><td class="v">0.001306</td></tr>
+          <tr><td class="k">浮力剩余</td><td class="v">~0.2 kgf（近中性）</td></tr>
+        </table>
+      </div>
+      <div class="card">
+        <h3><span class="ic">⇈</span>推进器推力模型</h3>
+        <table>
+          <tr><td class="k">布局</td><td class="v">gsrov8 (4 垂直 + 4 水平)</td></tr>
+          <tr><td class="k">推力曲线</td><td class="v">T = T_max · u·|u|</td></tr>
+          <tr><td class="k">正向额定</td><td class="v">19.613 N (2.0 kgf)</td></tr>
+          <tr><td class="k">反向额定</td><td class="v">17.652 N (1.8 kgf)</td></tr>
+          <tr><td class="k">额定电压</td><td class="v">24 V (6S)</td></tr>
+          <tr><td class="k">死区 deadband</td><td class="v">0.05</td></tr>
+          <tr><td class="k">一阶滞后 τ</td><td class="v">0.05 s (默认关闭)</td></tr>
+          <tr><td class="k">PWM 脉宽</td><td class="v">1000–2000 µs, 中位 1500</td></tr>
+        </table>
+      </div>
+    </div>
+
+    <div class="card span2" style="margin-bottom:20px">
+      <h3><span class="ic">⊕</span>推进器几何布局（COM 坐标系）</h3>
+      <div class="canvas-wrap"><canvas id="thrusterCanvas" width="1200" height="460" data-w="1200" data-h="460"></canvas></div>
+      <div class="legend">
+        <span><i style="background:#3fd0e0"></i>垂直推进器 V1–V4 (+Z)</span>
+        <span><i style="background:#f5b14d"></i>水平推进器 H1–H4 (XY 面 45° 斜置)</span>
+        <span><i style="background:#26c6a6"></i>X 轴（前向 +X）</span>
+      </div>
+    </div>
+
+    <div class="grid2">
+      <div class="card">
+        <h3><span class="ic">⟐</span>推力分配 (PID → PWM)</h3>
+        <p>水平组 (H1–H4) 承担 surge/sway/yaw，垂直组 (V1–V4) 承担 heave/roll/pitch，两组几乎完全解耦，用几何矩阵伪逆分配。</p>
+        <table style="margin-top:10px">
+          <tr><td class="k">kp_lin / ki / kd</td><td class="v">2.8 / 0.4 / 0.08</td></tr>
+          <tr><td class="k">kp_ang / yaw_damp</td><td class="v">0.1 / 0.2</td></tr>
+          <tr><td class="k">kp_depth / kd_depth</td><td class="v">5.0 / 3.0</td></tr>
+          <tr><td class="k">kp_att / kd_att</td><td class="v">1.5 / 0.4</td></tr>
+          <tr><td class="k">max_heave_wrench</td><td class="v">3.0</td></tr>
+          <tr><td class="k">depth_deadband</td><td class="v">0.06</td></tr>
+        </table>
+      </div>
+      <div class="card">
+        <h3><span class="ic">∑</span>受力合成</h3>
+        <div class="formula">F  = F_thruster + F_buoyancy + F_drag
+τ  = τ_thruster + τ_buoyancy + τ_drag
+
+<span class="c"># 拖曳按相对流速计算：</span>
+v_rel = v_body − v_ocean_current
+<span class="c"># 浮力按 COM→COB 偏移产生恢复力矩</span>
+<span class="c"># 推力按 T_max·u·|u| 后投影到推力轴</span></div>
+        <p style="margin-top:12px">每个物理子步都执行：洋流 → PID → 推力/力矩 → 外力写入刚体。</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- 5. CAMERA -->
+  <section id="camera">
+    <div class="sec-head"><span class="num">05</span><h2>相机规格 · Camera</h2></div>
+    <div class="grid2">
+      <div class="card">
+        <h3><span class="ic">◉</span>内参</h3>
+        <table>
+          <tr><td class="k">HFOV 水平视场</td><td class="v">81.65°</td></tr>
+          <tr><td class="k">VFOV 垂直视场</td><td class="v">51.84°</td></tr>
+          <tr><td class="k">光圈 aperture</td><td class="v">20.955 mm</td></tr>
+          <tr><td class="k">焦距 focal</td><td class="v">12.13 mm</td></tr>
+          <tr><td class="k">传感器比例</td><td class="v">16 : 9</td></tr>
+          <tr><td class="k">裁剪范围</td><td class="v">0.01 – 200 m</td></tr>
+        </table>
+      </div>
+      <div class="card">
+        <h3><span class="ic">▤</span>分辨率与安装</h3>
+        <table>
+          <tr><td class="k">渲染分辨率</td><td class="v">1280 × 720</td></tr>
+          <tr><td class="k">策略输入</td><td class="v">64 × 64 (area 下采样)</td></tr>
+          <tr><td class="k">主相机 Prim</td><td class="v">ForwardCamera0</td></tr>
+          <tr><td class="k">位置</td><td class="v">立方体前表面中心 (0.28,0,0)</td></tr>
+          <tr><td class="k">朝向</td><td class="v">+X，图像正立（无翻转）</td></tr>
+          <tr><td class="k">帧堆栈</td><td class="v">frame_stack = 1</td></tr>
+          <tr><td class="k">更新节奏</td><td class="v">render_interval = 8（每策略步一次）</td></tr>
+        </table>
+      </div>
+      <div class="card span2">
+        <h3><span class="ic">▣</span>观测通道（7 通道）</h3>
+        <div class="chans">
+          <div class="chan"><div class="sw" style="background:linear-gradient(90deg,#ff6b6b,#56d67b,#4d8ff5)"></div><b>RGB ×3</b><small>渲染帧 /255</small></div>
+          <div class="chan"><div class="sw" style="background:linear-gradient(90deg,#1a3350,#3fd0e0)"></div><b>du</b><small>光流 x（归一化）</small></div>
+          <div class="chan"><div class="sw" style="background:linear-gradient(90deg,#1a3350,#9a7bff)"></div><b>dv</b><small>光流 y（归一化）</small></div>
+          <div class="chan"><div class="sw" style="background:linear-gradient(90deg,#111,#f5b14d)"></div><b>|u| 幅度</b><small>√(du²+dv²)</small></div>
+          <div class="chan"><div class="sw" style="background:linear-gradient(90deg,#0a0a0a,#eaf6ff)"></div><b>texture mask</b><small>纹理梯度掩码</small></div>
+        </div>
+        <p class="flow-note">另有一台纯 USD 观察相机 ViewCamera0（同姿态同内参、全分辨率、不接入观测），零成本用于视口观察/录像。</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- 6. OPTICAL FLOW -->
+  <section id="flow">
+    <div class="sec-head"><span class="num">06</span><h2>光流配置 · Optical Flow</h2></div>
+    <div class="grid2">
+      <div class="card">
+        <h3><span class="ic">➤</span>估计器</h3>
+        <table>
+          <tr><td class="k">默认方法</td><td class="v">farneback (CPU/OpenCL)</td></tr>
+          <tr><td class="k">可选方法</td><td class="v">raft (GPU, torchvision)</td></tr>
+          <tr><td class="k">pyr_scale</td><td class="v">0.5</td></tr>
+          <tr><td class="k">levels</td><td class="v">3</td></tr>
+          <tr><td class="k">winsize</td><td class="v">21</td></tr>
+          <tr><td class="k">iterations</td><td class="v">2</td></tr>
+          <tr><td class="k">poly_n / poly_sigma</td><td class="v">5 / 1.2</td></tr>
+        </table>
+      </div>
+      <div class="card">
+        <h3><span class="ic">◱</span>分辨率与归一化</h3>
+        <table>
+          <tr><td class="k">光流计算分辨率</td><td class="v">320 × 176</td></tr>
+          <tr><td class="k">输出分辨率</td><td class="v">64 × 64 (area 插值)</td></tr>
+          <tr><td class="k">归一化</td><td class="v">du/320, dv/176 → clamp[-1,1]</td></tr>
+          <tr><td class="k">加速</td><td class="v">OpenCV OpenCL (UMat)</td></tr>
+          <tr><td class="k">相对算量</td><td class="v">较 1280×720 少 ~17.8×</td></tr>
+        </table>
+        <p class="flow-note">在 320×176 上估流再 area 插值到 64×64，相比全分辨率快 ~16×，质量损失可忽略（RMS 差 &lt;1 px）。</p>
+      </div>
+      <div class="card span2">
+        <h3><span class="ic">▦</span>纹理掩码与流 RMS</h3>
+        <div class="formula"><span class="c"># 纹理掩码：灰度梯度幅值阈值 + 最大池化下采样</span>
+grad = |∇gray|,  hot = (grad > 8.0)
+mask = adaptive_max_pool2d(hot, 64×64)
+present = (texture_count ≥ 20)
+
+<span class="c"># 流 RMS：在纹理像素上统计（纹理不足则用全图）</span>
+rms = sqrt( Σ(|flow|²·mask) / Σ mask )
+flow_rms_n = clamp(rms / 64, 0, 1)      <span class="c"># 送奖励与状态</span>
+
+<span class="c"># 纹理丢失连续 50 步 → 终止</span></div>
+        <p class="flow-note">OpenCL 下 Farneback 在 RTX 3090 上较纯 CPU 快 ~3.5×，与 CPU 结果差 &lt;1e-3 px。</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- 7. REWARD -->
+  <section id="reward">
+    <div class="sec-head"><span class="num">07</span><h2>奖励设计 · Reward Design</h2></div>
+    <div class="card span2" style="margin-bottom:20px">
+      <h3><span class="ic">★</span>奖励权重与高斯整形</h3>
+      <div class="canvas-wrap"><canvas id="rewardCanvas" width="1200" height="380" data-w="1200" data-h="380"></canvas></div>
+      <div class="legend">
+        <span><i style="background:#3fd0e0"></i>flow_term (光流零化)</span>
+        <span><i style="background:#56d67b"></i>depth_term (深度保持)</span>
+        <span><i style="background:#9a7bff"></i>att_term (姿态保持)</span>
+        <span><i style="background:#f5b14d"></i>动作平滑惩罚</span>
+      </div>
+    </div>
+    <div class="grid2">
+      <div class="card">
+        <h3><span class="ic">f</span>奖励公式</h3>
+        <div class="formula">r = 1.0 · flow_term
+  + 0.3 · alive
+  + 0.1 · depth_term
+  + 0.1 · att_term
+  − 0.01 · smooth
+
+flow_term  = present · exp(−flow_rms_n² / σ_flow²)
+depth_term = exp(−depth_err² / σ_depth²)
+att_term   = exp(−att_err² / σ_att²)
+smooth     = Σ (aₜ − aₜ₋₁)²   <span class="c"># 3 维</span>
+alive      = present</div>
+      </div>
+      <div class="card">
+        <h3><span class="ic">σ</span>参数与语义</h3>
+        <table>
+          <tr><td class="k">rew_flow</td><td class="v">1.0 <span class="tag">主项</span></td></tr>
+          <tr><td class="k">rew_alive</td><td class="v">0.3</td></tr>
+          <tr><td class="k">rew_depth</td><td class="v">0.1</td></tr>
+          <tr><td class="k">rew_att</td><td class="v">0.1</td></tr>
+          <tr><td class="k">rew_action</td><td class="v">0.01</td></tr>
+          <tr><td class="k">σ_flow</td><td class="v">0.05</td></tr>
+          <tr><td class="k">σ_depth</td><td class="v">1.5 m</td></tr>
+          <tr><td class="k">σ_att</td><td class="v">0.3 rad</td></tr>
+        </table>
+        <p class="flow-note">姿态误差相对自由浮动配平（-20° 抬头）测量，而非水平——保持自然配平才是物理上正确的「无漂移」姿态。σ_flow=0.05 由实测流 RMS 标定（≈0.047）。</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- 8. TERMINATION -->
+  <section id="termination">
+    <div class="sec-head"><span class="num">08</span><h2>终止条件 · Termination</h2></div>
+    <div class="card">
+      <h3><span class="ic">⏹</span>终止 / 截断规则</h3>
+      <table>
+        <tr><th>条件</th><th>阈值</th><th>类型</th></tr>
+        <tr><td class="k">纹理丢失连续步数</td><td class="v">≥ 50 步</td><td><span class="tag r">terminate</span></td></tr>
+        <tr><td class="k">深度偏差 |z − z0|</td><td class="v">&gt; 1.5 m</td><td><span class="tag r">terminate</span></td></tr>
+        <tr><td class="k">姿态误差 (相对配平)</td><td class="v">&gt; 0.3 rad</td><td><span class="tag r">terminate</span></td></tr>
+        <tr><td class="k">碰撞 (_compute_is_col)</td><td class="v">恒为 False（开阔水池）</td><td><span class="tag">stub</span></td></tr>
+        <tr><td class="k">回合长度</td><td class="v">≥ max_episode_length − 1</td><td><span class="tag a">truncate</span></td></tr>
+      </table>
+      <p class="flow-note" style="margin-top:14px">奖励在 <code>_get_dones</code> 内计算（此时光流/纹理已更新），缓存至 <code>_cached_rew</code> 后由 <code>_get_rewards</code> 返回。</p>
+    </div>
+  </section>
+
+  <!-- 9. OCEAN CURRENT -->
+  <section id="ocean">
+    <div class="sec-head"><span class="num">09</span><h2>洋流配置 · Ocean Current</h2></div>
+    <div class="grid2">
+      <div class="card">
+        <h3><span class="ic">≈</span>流场参数</h3>
+        <table>
+          <tr><td class="k">enabled</td><td class="v">true</td></tr>
+          <tr><td class="k">type</td><td class="v">uniform</td></tr>
+          <tr><td class="k">level</td><td class="v">medium (~0.4 m/s)</td></tr>
+          <tr><td class="k">方向 direction</td><td class="v">[1.0, 0.3, 0.0]</td></tr>
+          <tr><td class="k">时间调制</td><td class="v">true</td></tr>
+          <tr><td class="k">调制周期</td><td class="v">12.0 s</td></tr>
+          <tr><td class="k">调制幅度</td><td class="v">0.6 → 0.4 ± 0.24 m/s</td></tr>
+          <tr><td class="k">速度范围</td><td class="v">≈ 0.16 – 0.64 m/s</td></tr>
+          <tr><td class="k">clip_speed</td><td class="v">5.0 m/s</td></tr>
+          <tr><td class="k">affect_target</td><td class="v">false</td></tr>
+        </table>
+      </div>
+      <div class="card">
+        <h3><span class="ic">v</span>均匀流场公式</h3>
+        <div class="formula"><span class="c"># uniform + 时间调制</span>
+v = strength · normalize(direction)
+  · (1 + A·sin(2πt / T))
+
+strength = 0.4          <span class="c"># medium</span>
+A = 0.6, T = 12.0 s
+
+<span class="c"># 可视化等级 LEVEL_STRENGTH</span>
+off 0.0 | mild 0.15 | medium 0.4 | strong 0.8</div>
+        <p class="flow-note">中等强度 + 慢时变近似真实洋流。v7 必须<b>逆流锁定地面位置</b>，光流观测提供流向线索，奖励促使策略顶流悬停。</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- 10. ENVIRONMENT -->
+  <section id="env">
+    <div class="sec-head"><span class="num">10</span><h2>环境设置 · Environment</h2></div>
+    <div class="grid2">
+      <div class="card">
+        <h3><span class="ic">▢</span>场景几何</h3>
+        <table>
+          <tr><td class="k">水池尺寸</td><td class="v">4 × 4 × 4 m</td></tr>
+          <tr><td class="k">ROV 起始</td><td class="v">(0, 0, 0) 池中心</td></tr>
+          <tr><td class="k">起始深度</td><td class="v">0.0（z∈[-2,2] 中心）</td></tr>
+          <tr><td class="k">纹理平面</td><td class="v">4×4 @ x=+2.0 m</td></tr>
+          <tr><td class="k">池壁遮挡</td><td class="v">左/右/底/后（顶部开放）</td></tr>
+          <tr><td class="k">参考球</td><td class="v">4 绿球 r=0.1, 0.5×0.5 m 方</td></tr>
+          <tr><td class="k">参考球位置</td><td class="v">x=1.5 m, 角点 ±0.25 (y/z)</td></tr>
+        </table>
+      </div>
+      <div class="card">
+        <h3><span class="ic">▧</span>仿真设置</h3>
+        <table>
+          <tr><td class="k">物理 dt</td><td class="v">1/120 s</td></tr>
+          <tr><td class="k">decimation</td><td class="v">8 → 15 Hz 策略</td></tr>
+          <tr><td class="k">render_interval</td><td class="v">8</td></tr>
+          <tr><td class="k">episode_length_s</td><td class="v">40.0 s</td></tr>
+          <tr><td class="k">num_envs</td><td class="v">8 (训练) / 64 (bench)</td></tr>
+          <tr><td class="k">env_spacing</td><td class="v">45.0 m</td></tr>
+          <tr><td class="k">代理刚体</td><td class="v">立方体 0.56×0.43×0.30 m</td></tr>
+          <tr><td class="k">use_real_usd</td><td class="v">False（cuboid proxy）</td></tr>
+          <tr><td class="k">USD 姿态同步</td><td class="v">cam_sync_usd_pose = True</td></tr>
+        </table>
+      </div>
+      <div class="card span2">
+        <h3><span class="ic">◐</span>光照与相机同步</h3>
+        <p>
+          穹顶光 <code>DomeLight intensity=2000</code>，色 (0.75,0.75,0.75)。相机位姿通过 <code>XFormPrim.set_world_poses</code>
+          与刚体同步（仅在 render 迭代上），确保 FlowPlane 的光流与物理状态一致。代理立方体质量设为 13.15 kg 以与流体动力学模型一致。
+        </p>
+        <div class="formula">decimation = 8
+sim.dt     = 1/120
+policy Hz  = 1 / (dt · decimation) = 15 Hz
+episode    = 40 s × 15 Hz = 600 steps</div>
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    Isaac-AUV-Tracking · Direct-v7 Flow-Hover (GS-ROV) · 远端服务器训练配置总览<br>
+    数据源：auv_tracking_v7_flow_hover_gsrov_env.py · sb3_sac_v7_flow_hover_cfg.yaml · batch_pid.py · thruster_dynamics.py · cam_encoder.py
+  </footer>
+
+</main>
+
+<script>
+(function () {
+  const CY = '#3fd0e0', TE = '#26c6a6', BL = '#4d8ff5', VI = '#9a7bff', AM = '#f5b14d', RO = '#ff6b8a', GR = '#56d67b';
+  const TXT = '#dbe7f4', DIM = '#8ba3bd', FAINT = '#5c7188';
+
+  function fitCanvas(cv) {
+    const dpr = window.devicePixelRatio || 1;
+    const w = parseInt(cv.dataset.w || cv.getAttribute('width'), 10);
+    const h = parseInt(cv.dataset.h || cv.getAttribute('height'), 10);
+    cv.style.width = '100%';
+    cv.style.height = 'auto';
+    cv.style.aspectRatio = w + ' / ' + h;
+    cv.width = w * dpr;
+    cv.height = h * dpr;
+    const ctx = cv.getContext('2d');
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+
+  function roundRect(ctx, x, y, w, h, r) {
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+  }
+
+  function box(ctx, x, y, w, h, color, label, sub, filled) {
+    ctx.save();
+    roundRect(ctx, x, y, w, h, 10);
+    if (filled) {
+      ctx.fillStyle = color + '22';
+      ctx.fill();
+    }
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1.6;
+    ctx.stroke();
+    ctx.fillStyle = TXT;
+    ctx.font = '600 13px "Segoe UI", sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(label, x + w / 2, y + h / 2 - (sub ? 8 : 0));
+    if (sub) {
+      ctx.fillStyle = DIM;
+      ctx.font = '11px "JetBrains Mono", monospace';
+      ctx.fillText(sub, x + w / 2, y + h / 2 + 10);
+    }
+    ctx.restore();
+  }
+
+  function arrow(ctx, x1, y1, x2, y2, color) {
+    ctx.save();
+    ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = 1.6;
+    ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
+    const a = Math.atan2(y2 - y1, x2 - x1), s = 7;
+    ctx.beginPath();
+    ctx.moveTo(x2, y2);
+    ctx.lineTo(x2 - s * Math.cos(a - 0.4), y2 - s * Math.sin(a - 0.4));
+    ctx.lineTo(x2 - s * Math.cos(a + 0.4), y2 - s * Math.sin(a + 0.4));
+    ctx.closePath(); ctx.fill();
+    ctx.restore();
+  }
+
+  function drawArch() {
+    const cv = document.getElementById('archCanvas');
+    if (!cv) return;
+    fitCanvas(cv);
+    const ctx = cv.getContext('2d');
+    ctx.clearRect(0, 0, 1200, 420);
+
+    // background grid faint
+    ctx.strokeStyle = 'rgba(64,160,200,0.05)'; ctx.lineWidth = 1;
+    for (let x = 0; x < 1200; x += 40) { ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, 420); ctx.stroke(); }
+    for (let y = 0; y < 420; y += 40) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(1200, y); ctx.stroke(); }
+
+    // Actor branch (top)
+    box(ctx, 40, 70, 150, 62, BL, 'Image', '7×64×64');
+    box(ctx, 240, 70, 190, 62, BL, 'MidCNNExtractor', 'Conv 32→128');
+    box(ctx, 480, 70, 170, 62, TE, 'GAP ⊕ Softmax', '384-d');
+    box(ctx, 700, 70, 150, 62, TE, 'Trunk → 256', 'Tanh');
+    box(ctx, 900, 70, 130, 62, AM, 'Actor π', '[256,256]');
+    box(ctx, 1060, 70, 110, 62, AM, 'Action', '3-D');
+
+    arrow(ctx, 190, 101, 240, 101, BL);
+    arrow(ctx, 430, 101, 480, 101, BL);
+    arrow(ctx, 650, 101, 700, 101, TE);
+    arrow(ctx, 850, 101, 900, 101, TE);
+    arrow(ctx, 1030, 101, 1060, 101, AM);
+
+    // Critic branch (bottom)
+    box(ctx, 40, 280, 150, 62, VI, 'State', '9-D 自运动');
+    box(ctx, 580, 280, 150, 62, AM, 'Action (copy)', '3-D');
+    box(ctx, 240, 280, 190, 62, VI, 'StateCritic ×2', 'MLP [256,256]');
+    box(ctx, 480, 280, 130, 62, TE, 'Q1 / Q2', 'value');
+
+    arrow(ctx, 190, 311, 240, 311, VI);
+    arrow(ctx, 1030, 132, 655, 280, AM); // action copy down
+    ctx.save();
+    ctx.setLineDash([5, 4]);
+    arrow(ctx, 430, 311, 480, 311, VI);
+    ctx.restore();
+    // action into critic
+    arrow(ctx, 580, 311, 480, 311, AM);
+
+    // labels
+    ctx.fillStyle = FAINT; ctx.font = '12px sans-serif'; ctx.textAlign = 'left';
+    ctx.fillText('ACTOR — 图像驱动（行为）', 40, 40);
+    ctx.fillText('CRITIC — 状态驱动（价值，不看图像）', 40, 250);
+    ctx.fillStyle = RO; ctx.font = '600 12px monospace';
+    ctx.fillText('非对称 Actor/Critic', 900, 250);
+  }
+
+  function drawThrusters() {
+    const cv = document.getElementById('thrusterCanvas');
+    if (!cv) return;
+    fitCanvas(cv);
+    const ctx = cv.getContext('2d');
+    ctx.clearRect(0, 0, 1200, 460);
+
+    // ---- Top view (left) ----
+    const ox = 320, oy = 230, scale = 620; // meters->px
+    // body outline
+    ctx.save();
+    ctx.strokeStyle = 'rgba(64,160,200,0.35)'; ctx.lineWidth = 1.5;
+    roundRect(ctx, ox - 0.562/2*scale, oy - 0.429/2*scale, 0.562*scale, 0.429*scale, 10); ctx.stroke();
+    ctx.fillStyle = 'rgba(77,143,245,0.06)'; ctx.fill();
+    ctx.restore();
+    // axes
+    arrow(ctx, ox - 40, oy, ox + 0.562/2*scale + 30, oy, TE); // +X fore
+    arrow(ctx, ox, oy + 40, ox, oy - 0.429/2*scale - 25, DIM); // +Y
+    ctx.fillStyle = TE; ctx.font = '600 12px monospace'; ctx.textAlign = 'left';
+    ctx.fillText('+X 前', ox + 0.562/2*scale + 20, oy - 8);
+    ctx.fillStyle = DIM; ctx.fillText('+Y', ox + 6, oy - 0.429/2*scale - 20);
+
+    // thruster data (x,y,z) meters from COM ; V vertical, H horizontal
+    const T = [
+      {n:'V1', x:-0.11689, y: 0.16213, z: 0.06277, t:'V'},
+      {n:'V2', x:-0.11689, y:-0.16315, z: 0.06277, t:'V'},
+      {n:'V3', x: 0.11461, y:-0.16315, z: 0.06277, t:'V'},
+      {n:'V4', x: 0.11461, y: 0.16213, z: 0.06277, t:'V'},
+      {n:'H1', x: 0.23041, y:-0.14957, z:-0.00123, t:'H'},
+      {n:'H2', x:-0.24170, y: 0.14856, z:-0.00123, t:'H'},
+      {n:'H3', x: 0.23041, y: 0.14855, z:-0.00123, t:'H'},
+      {n:'H4', x:-0.24170, y:-0.14958, z:-0.00123, t:'H'},
+    ];
+    // top view draw (x -> screen x, y -> screen -y)
+    T.forEach(t => {
+      const px = ox + t.x * scale;
+      const py = oy - t.y * scale;
+      const col = t.t === 'V' ? CY : AM;
+      ctx.save();
+      ctx.beginPath(); ctx.arc(px, py, 9, 0, Math.PI * 2);
+      ctx.fillStyle = col + '33'; ctx.fill();
+      ctx.strokeStyle = col; ctx.lineWidth = 2; ctx.stroke();
+      // direction marker
+      if (t.t === 'H') {
+        // canted arrows (approx) along +X rotated
+        let dx = 1, dy = 0;
+        const cant = (t.n === 'H1' || t.n === 'H2') ? 1 : -1;
+        const ang = cant * Math.PI/4;
+        dx = Math.cos(ang); dy = Math.sin(ang);
+        arrow(ctx, px - dx*14, py + dy*14, px + dx*14, py - dy*14, AM);
+      }
+      ctx.fillStyle = TXT; ctx.font = '600 11px monospace'; ctx.textAlign = 'center';
+      ctx.fillText(t.n, px, py - 15);
+      ctx.restore();
+    });
+    ctx.fillStyle = TXT; ctx.font = '700 14px sans-serif'; ctx.textAlign = 'center';
+    ctx.fillText('俯视图 · Top View (X–Y)', ox, 60);
+
+    // ---- Side view (right) ----
+    const sx = 900, sy = 230, s2 = 620;
+    ctx.save();
+    ctx.strokeStyle = 'rgba(64,160,200,0.35)'; ctx.lineWidth = 1.5;
+    roundRect(ctx, sx - 0.562/2*s2, sy - 0.295/2*s2, 0.562*s2, 0.295*s2, 10); ctx.stroke();
+    ctx.fillStyle = 'rgba(77,143,245,0.06)'; ctx.fill();
+    ctx.restore();
+    arrow(ctx, sx - 30, sy, sx + 0.562/2*s2 + 20, sy, TE); // +X
+    arrow(ctx, sx, sy + 30, sx, sy - 0.295/2*s2 - 15, DIM); // +Z up
+    ctx.fillStyle = TE; ctx.font = '600 12px monospace'; ctx.textAlign = 'left';
+    ctx.fillText('+X', sx + 0.562/2*s2 + 12, sy - 6);
+    ctx.fillStyle = DIM; ctx.fillText('+Z', sx + 6, sy - 0.295/2*s2 - 12);
+
+    T.forEach(t => {
+      if (t.t !== 'V') return;
+      const px = sx + t.x * s2;
+      const pz = sy - t.z * s2;
+      const col = CY;
+      ctx.beginPath(); ctx.arc(px, pz, 8, 0, Math.PI * 2);
+      ctx.fillStyle = col + '33'; ctx.fill();
+      ctx.strokeStyle = col; ctx.lineWidth = 2; ctx.stroke();
+      arrow(ctx, px, pz + 12, px, pz - 12, CY);
+      ctx.fillStyle = TXT; ctx.font = '600 10px monospace'; ctx.textAlign = 'center';
+      ctx.fillText(t.n, px, pz - 12);
+    });
+    ctx.fillStyle = TXT; ctx.font = '700 14px sans-serif'; ctx.textAlign = 'center';
+    ctx.fillText('侧视图 · Side View (X–Z)', sx, 60);
+
+    // trim note
+    ctx.fillStyle = VI; ctx.font = '600 12px monospace'; ctx.textAlign = 'center';
+    ctx.fillText('自由配平 -20° 抬头 (COM→COB 前偏)', 600, 430);
+  }
+
+  function drawReward() {
+    const cv = document.getElementById('rewardCanvas');
+    if (!cv) return;
+    fitCanvas(cv);
+    const ctx = cv.getContext('2d');
+    ctx.clearRect(0, 0, 1200, 380);
+
+    // ---- Left: weight bars ----
+    const bx = 60, by = 70, bw = 420, bh = 250;
+    const terms = [
+      {n:'flow', w:1.0, c:CY},
+      {n:'alive', w:0.3, c:GR},
+      {n:'depth', w:0.1, c:VI},
+      {n:'att', w:0.1, c:'#c58bff'},
+      {n:'−smooth', w:0.01, c:AM},
+    ];
+    ctx.fillStyle = TXT; ctx.font = '700 14px sans-serif'; ctx.textAlign = 'left';
+    ctx.fillText('奖励项权重', bx, 45);
+    const maxW = 1.0;
+    const barH = 30, gap = 14;
+    terms.forEach((t, i) => {
+      const y = by + i * (barH + gap);
+      const w = Math.max(6, (t.w / maxW) * (bw - 120));
+      ctx.fillStyle = 'rgba(255,255,255,0.03)';
+      roundRect(ctx, bx + 80, y, bw - 120, barH, 6); ctx.fill();
+      ctx.fillStyle = t.c + '55';
+      roundRect(ctx, bx + 80, y, w, barH, 6); ctx.fill();
+      ctx.strokeStyle = t.c; ctx.lineWidth = 1.4;
+      roundRect(ctx, bx + 80, y, w, barH, 6); ctx.stroke();
+      ctx.fillStyle = TXT; ctx.font = '600 13px monospace'; ctx.textAlign = 'left';
+      ctx.fillText(t.n, bx, y + 20);
+      ctx.fillStyle = t.c; ctx.textAlign = 'right';
+      ctx.fillText('×' + t.w, bx + 80 + w - 10, y + 20);
+    });
+
+    // ---- Right: gaussian shaping curves ----
+    const gx = 560, gy = 70, gw = 580, gh = 250;
+    ctx.fillStyle = TXT; ctx.font = '700 14px sans-serif'; ctx.textAlign = 'left';
+    ctx.fillText('高斯整形项 (误差 → 奖励)', gx, 45);
+    // axes
+    ctx.strokeStyle = 'rgba(64,160,200,0.3)'; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(gx, gy + gh); ctx.lineTo(gx + gw, gy + gh); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(gx, gy); ctx.lineTo(gx, gy + gh); ctx.stroke();
+    ctx.fillStyle = FAINT; ctx.font = '11px monospace'; ctx.textAlign = 'center';
+    ctx.fillText('归一化误差 →', gx + gw/2, gy + gh + 22);
+    ctx.save(); ctx.translate(gx - 16, gy + gh/2); ctx.rotate(-Math.PI/2);
+    ctx.fillText('reward', 0, 0); ctx.restore();
+    ctx.textAlign = 'right'; ctx.fillText('0', gx - 4, gy + gh + 4);
+    ctx.textAlign = 'left'; ctx.fillText('1', gx - 4, gy + 8);
+
+    function curve(color, sigmaFrac, label) {
+      ctx.beginPath();
+      let started = false;
+      for (let i = 0; i <= gw; i++) {
+        const xnorm = (i / gw) * 2 - 1; // -1..1
+        const e = xnorm; // normalized error
+        const r = Math.exp(-(e*e) / (sigmaFrac*sigmaFrac));
+        const px = gx + i;
+        const py = gy + gh - r * gh;
+        if (!started) { ctx.moveTo(px, py); started = true; } else ctx.lineTo(px, py);
+      }
+      ctx.strokeStyle = color; ctx.lineWidth = 2.4; ctx.stroke();
+    }
+    // flow: sigma 0.05 relative to full flow range 0..1 -> very sharp near 0
+    // show as function over error 0..1 mapped; use sigma fractions relative to axis
+    curve(CY, 0.12, 'flow (σ=0.05)');
+    curve(VI, 0.45, 'att (σ=0.3rad)');
+    curve(GR, 0.6, 'depth (σ=1.5m)');
+
+    // legend inline
+    const lg = [['flow σ=0.05', CY], ['depth σ=1.5', GR], ['att σ=0.3', VI]];
+    ctx.font = '11px monospace'; ctx.textAlign = 'left';
+    lg.forEach((l, i) => {
+      ctx.fillStyle = l[1];
+      ctx.fillRect(gx + 10 + i*150, gy + 8, 12, 4);
+      ctx.fillStyle = DIM;
+      ctx.fillText(l[0], gx + 28 + i*150, gy + 14);
+    });
+  }
+
+  function renderAll() {
+    drawArch();
+    drawThrusters();
+    drawReward();
+  }
+
+  window.addEventListener('load', renderAll);
+  window.addEventListener('resize', () => {
+    // reset logical cache so fitCanvas recomputes for new dpr
+    ['archCanvas','thrusterCanvas','rewardCanvas'].forEach(id => {
+      const cv = document.getElementById(id);
+      if (cv) cv._logical = null;
+    });
+    renderAll();
+  });
+})();
+</script>
+</body>
+</html>

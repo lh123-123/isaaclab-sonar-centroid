@@ -1,0 +1,110 @@
+diff --git a/libraries/AP_Motors/AP_Motors6DOF.cpp b/libraries/AP_Motors/AP_Motors6DOF.cpp
+--- a/libraries/AP_Motors/AP_Motors6DOF.cpp
++++ b/libraries/AP_Motors/AP_Motors6DOF.cpp
+@@ -19,7 +19,8 @@
+ 
+ #include <AP_BattMonitor/AP_BattMonitor.h>
+ #include <AP_HAL/AP_HAL.h>
+-#include "AP_Motors6DOF.h"
++#include "AP_Motors6DOF.h"
++#include "ROV_DeadzonePWM.h"
+ 
+ extern const AP_HAL::HAL& hal;
+ 
+@@ -118,7 +119,23 @@
+     // @User: Standard
+     AP_GROUPINFO("12_DIRECTION", 13, AP_Motors6DOF, _motor_reverse[11], 1),
+ 
+-    AP_GROUPEND
++    // @Param: DZ_PWM
++    // @DisplayName: ROV post-mix startup PWM offset
++    // @Description: Symmetric startup offset after mixing and motor reversal. Zero disables compensation. Not a measured thrust correction; validate in water before enabling.
++    // @Units: PWM
++    // @Range: 0 100
++    // @Increment: 1
++    // @User: Advanced
++    AP_GROUPINFO("DZ_PWM", 14, AP_Motors6DOF, _startup_deadzone_pwm, 0),
++    // @Param: DZ_IN
++    // @DisplayName: ROV startup compensation input deadband
++    // @Description: Normalized mixed-output magnitude held at neutral when DZ_PWM is enabled. Applies to both pilot and stabilization requests; excessive values impair holding.
++    // @Range: 0.0 0.1
++    // @Increment: 0.001
++    // @User: Advanced
++    AP_GROUPINFO("DZ_IN", 15, AP_Motors6DOF, _startup_deadzone_input, 0.01f),
++
++    AP_GROUPEND
+ };
+ 
+ void AP_Motors6DOF::setup_motors(motor_frame_class frame_class, motor_frame_type frame_type)
+@@ -229,9 +246,9 @@
+ 
+ int16_t AP_Motors6DOF::calc_thrust_to_pwm(float thrust_in) const
+ {
+-    int16_t range_up = get_pwm_output_max() - 1500;
+-    int16_t range_down = 1500 - get_pwm_output_min();
+-    return 1500 + thrust_in * (thrust_in > 0 ? range_up : range_down);
++    return ROV_DeadzonePWM::calculate(thrust_in,
++                                      get_pwm_output_min(), get_pwm_output_max(),
++                                      _startup_deadzone_pwm.get(), _startup_deadzone_input.get());
+ }
+ 
+ void AP_Motors6DOF::output_to_motors()
+diff --git a/libraries/AP_Motors/AP_Motors6DOF.h b/libraries/AP_Motors/AP_Motors6DOF.h
+--- a/libraries/AP_Motors/AP_Motors6DOF.h
++++ b/libraries/AP_Motors/AP_Motors6DOF.h
+@@ -67,7 +67,9 @@
+ 
+     // Parameters
+     AP_Int8             _motor_reverse[AP_MOTORS_MAX_NUM_MOTORS];
+-    AP_Float            _forwardVerticalCouplingFactor;
++    AP_Float            _forwardVerticalCouplingFactor;
++    AP_Int16            _startup_deadzone_pwm;
++    AP_Float            _startup_deadzone_input;
+ 
+     float               _forward_factor[AP_MOTORS_MAX_NUM_MOTORS]; // each motors contribution to forward/backward
+     float               _lateral_factor[AP_MOTORS_MAX_NUM_MOTORS];  // each motors contribution to lateral (left/right)
+diff --git a/libraries/AP_Motors/ROV_DeadzonePWM.h b/libraries/AP_Motors/ROV_DeadzonePWM.h
+new file mode 100644
+--- /dev/null
++++ b/libraries/AP_Motors/ROV_DeadzonePWM.h
+@@ -0,0 +1,40 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++// Stateless post-mix mapping; used only by normal ArduSub motor outputs.
++#pragma once
++
++#include <cmath>
++#include <cstdint>
++
++namespace ROV_DeadzonePWM {
++
++inline int16_t calculate(float thrust, int16_t minimum, int16_t maximum,
++                         int16_t offset_us, float input_deadband)
++{
++    constexpr int16_t neutral = 1500;
++    if (!std::isfinite(thrust) || minimum >= neutral || maximum <= neutral) {
++        return neutral;
++    }
++    thrust = thrust < -1.0f ? -1.0f : thrust > 1.0f ? 1.0f : thrust;
++    const int16_t span = thrust > 0.0f ? maximum - neutral : neutral - minimum;
++    // Disabled means the stock conversion, without a new input deadband.
++    if (offset_us <= 0) {
++        return static_cast<int16_t>(neutral + thrust * span);
++    }
++    if (!std::isfinite(input_deadband) || input_deadband < 0.0f || input_deadband > 0.1f) {
++        return neutral;
++    }
++    const float magnitude = ::fabsf(thrust);
++    if (magnitude <= input_deadband) {
++        return neutral;
++    }
++    // Guard malformed parameter values. Never extend configured endpoints.
++    int16_t offset = offset_us > 100 ? 100 : offset_us;
++    offset = offset > span ? span : offset;
++    const float progress = (magnitude - input_deadband) / (1.0f - input_deadband);
++    // Reserve the offset inside the available span: no early saturation.
++    int16_t excursion = static_cast<int16_t>(::lroundf(offset + (span - offset) * progress));
++    excursion = excursion > span ? span : excursion;
++    return thrust > 0.0f ? neutral + excursion : neutral - excursion;
++}
++
++} // namespace ROV_DeadzonePWM

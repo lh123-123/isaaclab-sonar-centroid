@@ -12,7 +12,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/lib/ensure_single_isaac_process.sh"
 ensure_single_isaac_process || exit 1
 
-./isaaclab.sh -p scripts/eval_sonar_flow_hover.py \
+./isaaclab.sh -p v7/scripts/eval/eval_sonar_flow_hover.py \
     --task Isaac-SonarFlowHover-Template-Eval-Direct-v0 \
     --num_envs 1 \
     --max_steps 200 \

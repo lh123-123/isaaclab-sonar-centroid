@@ -1,0 +1,9 @@
+HTTP/1.0 200 OK
+Cache-Control: no-store
+Connection: keep-alive
+Content-Type: multipart/x-mixed-replace; boundary=rovframe
+Date: Wed, 05 Aug 2026 18:47:29 GMT
+Keep-Alive: timeout=4
+Proxy-Connection: keep-alive
+Server: BaseHTTP/0.6 Python/3.7.3
+

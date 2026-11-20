@@ -74,3 +74,15 @@ tests/
 visp/
 source/isaaclab_tasks/isaaclab_tasks/direct/allegro_hand/isaac-auv-env/
 source/isaaclab_tasks/isaaclab_tasks/direct/isaac-auv-env/
+
+# v7 heavy artifacts: weights, big data drops, vendored reference repos, diag renders
+v7/checkpoints/
+v7/logs/
+models/auv_tracking/
+data_downloads/
+drltrakc/
+diag_farneback/
+auv_tracking_sac_nan_probe/
+**/.venv/
+*.STEP
+*.apj

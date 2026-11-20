@@ -1,0 +1,270 @@
+{
+  "profile_name": "ROV比赛简洁版-八爪鱼5",
+  "axis": {
+    "stick_deadzone": 0.04,
+    "trigger_deadzone": 0.03,
+    "vertical_scale": 1.0,
+    "axis_snap_inner_deg": 8.0,
+    "axis_snap_outer_deg": 18.0,
+    "yaw_response_exponent": 0.75
+  },
+  "thruster_startup": {
+    "reference_offset_us": 50
+  },
+  "motion_smoothing": {
+    "enabled": true,
+    "rise_per_s": 4.0,
+    "fall_per_s": 8.0
+  },
+  "motion_gain": {
+    "levels": [
+      0.4,
+      1.0
+    ],
+    "initial": 0.4,
+    "cycle_button": 4,
+    "reset_button": 9
+  },
+  "vertical_gain": {
+    "levels": [
+      0.4,
+      1.0
+    ],
+    "initial": 0.4,
+    "cycle_button": 6
+  },
+  "gimbal": {
+    "presets_deg": [
+      -80,
+      -45,
+      -20,
+      0,
+      20
+    ],
+    "initial_deg": 0,
+    "up_button": 11,
+    "down_button": 12,
+    "quick_button": 13,
+    "quick_angle_deg": -40.0
+  },
+  "flight_mode": {
+    "depth_toggle_button": 2,
+    "stabilize_button": 3
+  },
+  "button_forward_indices": [
+    0,
+    1
+  ],
+  "servos": {
+    "slow_rate_us_per_s": 100.0,
+    "command_rate_hz": 50.0,
+    "gripper": {
+      "channel": 9,
+      "min_pwm": 610,
+      "max_pwm": 1350,
+      "initial_pwm": 1050,
+      "open_pwm": 1350,
+      "closed_pwm": 610,
+      "toggle_button": 10,
+      "decrease_button": 18,
+      "increase_button": 17,
+      "slow_rate_us_per_s": 270.0
+    },
+    "angle": {
+      "channel": 10,
+      "min_pwm": 500,
+      "max_pwm": 2500,
+      "initial_pwm": 1500,
+      "reset_button": 14,
+      "reset_pwm": 1200,
+      "decrease_button": 15,
+      "increase_button": 16,
+      "slow_rate_us_per_s": 350.0
+    },
+    "rotation": {
+      "channel": 11,
+      "min_pwm": 1000,
+      "max_pwm": 2060,
+      "initial_pwm": 1500,
+      "decrease_button": 19,
+      "increase_button": 20,
+      "slow_rate_us_per_s": 350.0
+    }
+  },
+  "buttons": {
+    "0": {
+      "name": "A",
+      "action": "解锁",
+      "status": "需 --allow-arm"
+    },
+    "1": {
+      "name": "B",
+      "action": "立即上锁",
+      "status": "启用"
+    },
+    "2": {
+      "name": "X",
+      "action": "定深开/关",
+      "status": "以飞控回传为准"
+    },
+    "3": {
+      "name": "Y",
+      "action": "姿态稳定开/关",
+      "status": "独立切换，保留定深状态"
+    },
+    "4": {
+      "name": "左菜单（View）",
+      "action": "循环摇杆档位",
+      "status": "40↔100%"
+    },
+    "5": {
+      "name": "Home",
+      "action": "系统键",
+      "status": "不用"
+    },
+    "6": {
+      "name": "右菜单（Menu）",
+      "action": "循环升潜档位",
+      "status": "40↔100%"
+    },
+    "7": {
+      "name": "L3",
+      "action": "预留",
+      "status": "不用"
+    },
+    "8": {
+      "name": "R3",
+      "action": "预留",
+      "status": "不用"
+    },
+    "9": {
+      "name": "LB",
+      "action": "两组档位恢复默认",
+      "status": "默认可设置并保存"
+    },
+    "10": {
+      "name": "RB",
+      "action": "夹爪快速切换",
+      "status": "界面显示下一次动作"
+    },
+    "11": {
+      "name": "十字上",
+      "action": "云台抬高一档",
+      "status": "离散角度"
+    },
+    "12": {
+      "name": "十字下",
+      "action": "云台压低一档",
+      "status": "离散角度"
+    },
+    "13": {
+      "name": "十字左",
+      "action": "云台快捷角度 -40°",
+      "status": "可在状态窗设置"
+    },
+    "14": {
+      "name": "十字右",
+      "action": "夹爪上下复位 1200µs",
+      "status": "可在状态窗设置"
+    },
+    "15": {
+      "name": "M1",
+      "action": "夹爪角度慢上",
+      "status": "按住连续"
+    },
+    "16": {
+      "name": "M2",
+      "action": "夹爪角度慢下",
+      "status": "按住连续"
+    },
+    "17": {
+      "name": "M3",
+      "action": "夹爪慢开",
+      "status": "按住连续"
+    },
+    "18": {
+      "name": "M4",
+      "action": "夹爪慢合",
+      "status": "按住连续"
+    },
+    "19": {
+      "name": "LM",
+      "action": "末端慢速逆时针",
+      "status": "按住连续"
+    },
+    "20": {
+      "name": "RM",
+      "action": "末端慢速顺时针",
+      "status": "按住连续"
+    }
+  },
+  "pixhawk_button_parameters": {
+    "MOT_PWM_MIN": 1000,
+    "MOT_PWM_MAX": 2000,
+    "JS_GAIN_DEFAULT": 1.0,
+    "JS_GAIN_STEPS": 1,
+    "JS_GAIN_MAX": 1.0,
+    "JS_THR_GAIN": 1.0,
+    "MOT_1_DIRECTION": 1,
+    "MOT_2_DIRECTION": -1,
+    "MOT_3_DIRECTION": -1,
+    "MOT_4_DIRECTION": 1,
+    "MOT_5_DIRECTION": 1,
+    "MOT_6_DIRECTION": -1,
+    "MOT_7_DIRECTION": -1,
+    "MOT_8_DIRECTION": 1,
+    "SERVO1_MIN": 1000,
+    "SERVO1_TRIM": 1500,
+    "SERVO1_MAX": 2000,
+    "SERVO2_MIN": 1000,
+    "SERVO2_TRIM": 1500,
+    "SERVO2_MAX": 2000,
+    "SERVO3_MIN": 1000,
+    "SERVO3_TRIM": 1500,
+    "SERVO3_MAX": 2000,
+    "SERVO4_MIN": 1000,
+    "SERVO4_TRIM": 1500,
+    "SERVO4_MAX": 2000,
+    "SERVO5_MIN": 1000,
+    "SERVO5_TRIM": 1500,
+    "SERVO5_MAX": 2000,
+    "SERVO6_MIN": 1000,
+    "SERVO6_TRIM": 1500,
+    "SERVO6_MAX": 2000,
+    "SERVO7_MIN": 1000,
+    "SERVO7_TRIM": 1500,
+    "SERVO7_MAX": 2000,
+    "SERVO8_MIN": 1000,
+    "SERVO8_TRIM": 1500,
+    "SERVO8_MAX": 2000,
+    "SERVO1_FUNCTION": 34,
+    "SERVO2_FUNCTION": 33,
+    "SERVO3_FUNCTION": 36,
+    "SERVO4_FUNCTION": 35,
+    "SERVO5_FUNCTION": 38,
+    "SERVO6_FUNCTION": 37,
+    "SERVO7_FUNCTION": 40,
+    "SERVO8_FUNCTION": 39,
+    "BTN0_FUNCTION": 3,
+    "BTN1_FUNCTION": 4,
+    "BTN2_FUNCTION": 0,
+    "BTN3_FUNCTION": 0,
+    "BTN7_FUNCTION": 0,
+    "BTN8_FUNCTION": 0,
+    "BTN9_FUNCTION": 0,
+    "BTN10_FUNCTION": 0,
+    "BTN11_FUNCTION": 0,
+    "BTN12_FUNCTION": 0,
+    "BTN13_FUNCTION": 0,
+    "BTN14_FUNCTION": 0,
+    "BTN15_FUNCTION": 0,
+    "BTN16_FUNCTION": 0,
+    "BTN17_FUNCTION": 0,
+    "BTN18_FUNCTION": 0,
+    "BTN19_FUNCTION": 0,
+    "BTN20_FUNCTION": 0,
+    "SERVO9_FUNCTION": 0,
+    "SERVO10_FUNCTION": 0,
+    "SERVO11_FUNCTION": 0
+  }
+}
